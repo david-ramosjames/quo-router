@@ -113,6 +113,8 @@ app.post("/webhooks/quo/messages", async (req, res) => {
 
   try {
     const payload = req.body || {};
+    console.log("[messages] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
+
     const from = safe(extractField(payload, "data.from", "from", "object.from"));
     const body = safe(extractField(payload, "data.body", "body", "object.body", "data.message", "message"));
 
@@ -131,6 +133,8 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
   try {
     const payload = req.body || {};
+    console.log("[calls] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
+
     const from = safe(extractField(payload, "data.from", "from", "object.from"));
     const voicemailUrl = extractField(payload, "data.voicemailUrl", "voicemailUrl", "object.voicemailUrl");
 
@@ -151,6 +155,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
   res.status(200).json({ received: true });
 
   try {
+    console.log("[call-summary] RAW PAYLOAD:", JSON.stringify(req.body, null, 2));
     const payload = req.body || {};
     const from = safe(extractField(payload, "data.from", "from", "object.from"));
     const summary = safe(extractField(payload, "data.summary", "summary", "object.summary"));
