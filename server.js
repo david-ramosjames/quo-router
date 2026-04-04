@@ -11,6 +11,15 @@ const SLACK_HUMAN_CALLS_WEBHOOK_URL = process.env.SLACK_HUMAN_CALLS_WEBHOOK_URL;
 const SLACK_SONA_CALLS_WEBHOOK_URL = process.env.SLACK_SONA_CALLS_WEBHOOK_URL;
 const SLACK_LEAD_CALLS_WEBHOOK_URL = process.env.SLACK_LEAD_CALLS_WEBHOOK_URL;
 
+// --- Phone line mapping ---
+const PHONE_LINES = {
+  "+15125373369": "RJL Main Line",
+  "+19563137771": "RGV Number",
+  "+15126010647": "Intake",
+  "+15125005266": "RJL Outbound",
+  "+15126300907": "RJL Transfers",
+};
+
 // --- In-memory call cache ---
 // call.completed fires before call.summary.completed, so we cache from/to/line info
 // keyed by callId, auto-expires after 10 minutes
@@ -41,6 +50,12 @@ function safe(val) {
   if (val === null || val === undefined) return "N/A";
   if (Array.isArray(val)) return val.join(" ") || "N/A";
   return String(val).trim() || "N/A";
+}
+
+function formatPhone(number) {
+  const num = safe(number);
+  const lineName = PHONE_LINES[num];
+  return lineName ? `${lineName} (${num})` : num;
 }
 
 function extractField(payload, ...paths) {
@@ -154,10 +169,11 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     const contactName = obj.contactName || obj.contact?.name || obj.contact?.displayName || payload.data?.contactName || null;
     const body = safe(extractField(payload, "data.object.body", "data.body", "body", "data.object.message", "data.message"));
 
-    const fromLine = contactName ? `${contactName} (${from})` : from;
-    const text = `💬 New Text Message\nFrom: ${fromLine}\nTo: ${to}\nMessage: ${body}`;
+    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const toDisplay = formatPhone(to);
+    const text = `💬 New Text Message\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}`;
 
-    console.log(`[messages] From: ${fromLine} → To: ${to}`);
+    console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay}`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
     console.log("[messages] Sent to #text-messages");
   } catch (err) {
@@ -196,8 +212,9 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       return;
     }
 
-    const fromLine = contactName ? `${contactName} (${from})` : from;
-    let text = `📞 Missed Call / Voicemail\nFrom: ${fromLine}\nTo: ${to}`;
+    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const toDisplay = formatPhone(to);
+    let text = `📞 Missed Call / Voicemail\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
@@ -235,19 +252,20 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const sona = isSonaCall(payload);
     const lead = isLeadCall(payload);
 
-    // Build the "From" display line: show contact name if available
-    const fromLine = contactName ? `${contactName} (${from})` : from;
+    // Build display lines
+    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const toDisplay = formatPhone(to);
 
-    console.log(`[call-summary] From: ${fromLine} | To: ${to} | Sona: ${sona} | Lead: ${lead}`);
+    console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${lead}`);
 
     // 1. Always post to base channel
     const linkLine = deepLink ? `\nLink: ${deepLink}` : "";
     if (sona) {
-      const text = `🤖 Sona Call Completed\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      const text = `📞 Human Call Completed\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `📞 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
@@ -255,7 +273,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     // 2. If lead, ALSO send to #lead-calls
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
-      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}${linkLine}`;
+      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}${linkLine}`;
       await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, leadText);
       console.log("[call-summary] ALSO sent to #lead-calls");
     }
