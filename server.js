@@ -116,7 +116,10 @@ function safe(val) {
 function formatPhone(number) {
   const num = safe(number);
   const lineName = PHONE_LINES[num];
-  return lineName ? `${lineName} (${num})` : num;
+  if (lineName) return `${lineName} (${num})`;
+  const contactName = getContactName(num);
+  if (contactName) return `${contactName} (${num})`;
+  return num;
 }
 
 function formatFrom(phoneNumber) {
