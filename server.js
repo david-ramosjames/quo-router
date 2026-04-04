@@ -106,7 +106,8 @@ async function postToSlack(webhookUrl, text) {
 
 // --- Detection ---
 
-function isSonaCall(payload) {
+function isSonaCall(payload, cached) {
+  // 1. Check explicit fields on payload
   const handledBy = extractField(payload, "data.object.handledBy", "data.handledBy");
   if (handledBy && String(handledBy).toLowerCase().includes("sona")) return true;
 
@@ -116,11 +117,30 @@ function isSonaCall(payload) {
   const agent = extractField(payload, "data.object.agent", "data.agent");
   if (agent && String(agent).toLowerCase().includes("sona")) return true;
 
-  const answeredBy = extractField(payload, "data.object.answeredBy");
-  if (answeredBy && String(answeredBy).toLowerCase().includes("sona")) return true;
+  // 2. Check for sona_summary field (Quo docs say Sona calls include this)
+  const sonaSummary = extractField(payload, "data.object.sona_summary", "data.object.sonaSummary", "data.sona_summary");
+  if (sonaSummary) return true;
 
+  // 3. Check for jobs array (Sona creates jobs during calls)
+  const jobs = extractField(payload, "data.object.jobs");
+  if (Array.isArray(jobs) && jobs.length > 0) return true;
+
+  // 4. Check answeredBy from cached call.completed data
+  // If answeredBy is a system ID (starts with "SY") and userId is different, it's likely Sona
+  if (cached?.answeredBy) {
+    const ab = String(cached.answeredBy);
+    if (ab.toLowerCase().includes("sona")) return true;
+    // Quo system IDs starting with "SY" indicate a system/AI agent answered
+    if (ab.startsWith("SY")) return true;
+  }
+
+  // 5. Check summary text for Sona/AI patterns
   const combinedText = extractText(payload);
-  const sonaPatterns = ["this is sona", "i'm sona", "hi, i'm sona", "i am sona"];
+  const sonaPatterns = [
+    "this is sona", "i'm sona", "hi, i'm sona", "i am sona",
+    "ai assistant", "ai receptionist", "virtual assistant", "virtual receptionist",
+    "automated assistant",
+  ];
   for (const pattern of sonaPatterns) {
     if (combinedText.includes(pattern)) return true;
   }
@@ -199,8 +219,8 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
     // Cache call info for call-summary lookup later
     if (callId) {
-      cacheCall(callId, { from: obj.from, to: obj.to, direction, contactName });
-      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (contact: ${contactName || "unknown"})`);
+      cacheCall(callId, { from: obj.from, to: obj.to, direction, contactName, answeredBy: obj.answeredBy, userId: obj.userId });
+      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (contact: ${contactName || "unknown"}, answeredBy: ${obj.answeredBy || "none"}, userId: ${obj.userId || "none"})`);
     }
 
     // Only send to #missed-calls if it was actually missed or has a voicemail
@@ -249,7 +269,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const rawSummary = obj.summary;
     const summary = Array.isArray(rawSummary) ? rawSummary.join("\n") : safe(rawSummary);
 
-    const sona = isSonaCall(payload);
+    const sona = isSonaCall(payload, cached);
     const lead = isLeadCall(payload);
 
     // Build display lines
