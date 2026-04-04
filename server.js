@@ -11,6 +11,8 @@ const SLACK_MISSED_CALLS_WEBHOOK_URL = process.env.SLACK_MISSED_CALLS_WEBHOOK_UR
 const SLACK_HUMAN_CALLS_WEBHOOK_URL = process.env.SLACK_HUMAN_CALLS_WEBHOOK_URL;
 const SLACK_SONA_CALLS_WEBHOOK_URL = process.env.SLACK_SONA_CALLS_WEBHOOK_URL;
 const SLACK_LEAD_CALLS_WEBHOOK_URL = process.env.SLACK_LEAD_CALLS_WEBHOOK_URL;
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_LEAD_CALLS_CHANNEL_ID = process.env.SLACK_LEAD_CALLS_CHANNEL_ID;
 
 // --- Phone line mapping ---
 const PHONE_LINES = {
@@ -22,9 +24,8 @@ const PHONE_LINES = {
 };
 
 // --- Quo Contacts Cache ---
-// Maps phone number (e.g. "+15125001234") → "First Last"
 const contactsCache = new Map();
-const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000;
 
 async function loadQuoContacts() {
   if (!QUO_API_KEY) {
@@ -125,6 +126,12 @@ function formatFrom(phoneNumber) {
   return formatPhone(num);
 }
 
+// Strip the "+" and any non-digit chars to get just digits for matching
+function normalizePhone(phone) {
+  if (!phone) return "";
+  return phone.replace(/\D/g, "");
+}
+
 function extractField(payload, ...paths) {
   for (const path of paths) {
     const parts = path.split(".");
@@ -167,6 +174,98 @@ async function postToSlack(webhookUrl, text) {
     }
   } catch (err) {
     console.error("Error posting to Slack:", err.message);
+  }
+}
+
+// --- Slack Bot API for #lead-calls threading ---
+
+async function findThreadByPhone(phoneNumber) {
+  if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID || !phoneNumber) return null;
+
+  const normalized = normalizePhone(phoneNumber);
+  if (!normalized) return null;
+
+  try {
+    // Search recent messages in #lead-calls (last 7 days worth, up to 200 messages)
+    const url = new URL("https://slack.com/api/conversations.history");
+    url.searchParams.set("channel", SLACK_LEAD_CALLS_CHANNEL_ID);
+    url.searchParams.set("limit", "200");
+    // Look back 7 days
+    const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+    url.searchParams.set("oldest", String(sevenDaysAgo));
+
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    });
+
+    if (!res.ok) {
+      console.error(`[lead-thread] Slack API responded ${res.status}`);
+      return null;
+    }
+
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[lead-thread] Slack API error: ${json.error}`);
+      return null;
+    }
+
+    // Search messages for the phone number (check both +1... and raw digits)
+    for (const msg of json.messages || []) {
+      const msgText = msg.text || "";
+      if (msgText.includes(phoneNumber) || msgText.includes(normalized)) {
+        // Return the thread_ts — use existing thread parent, or the message ts itself
+        console.log(`[lead-thread] Found matching message for ${phoneNumber} (ts: ${msg.thread_ts || msg.ts})`);
+        return msg.thread_ts || msg.ts;
+      }
+    }
+
+    console.log(`[lead-thread] No existing thread found for ${phoneNumber}`);
+    return null;
+  } catch (err) {
+    console.error("[lead-thread] Error searching for thread:", err.message);
+    return null;
+  }
+}
+
+async function postLeadToSlack(text, phoneNumber) {
+  // If we have bot token + channel ID, use the Slack API with threading
+  if (SLACK_BOT_TOKEN && SLACK_LEAD_CALLS_CHANNEL_ID) {
+    try {
+      const threadTs = await findThreadByPhone(phoneNumber);
+
+      const body = {
+        channel: SLACK_LEAD_CALLS_CHANNEL_ID,
+        text,
+      };
+      if (threadTs) {
+        body.thread_ts = threadTs;
+        console.log(`[lead-calls] Replying in thread ${threadTs}`);
+      }
+
+      const res = await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[lead-calls] Slack API error: ${json.error}`);
+        // Fall back to webhook
+        await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
+      } else {
+        console.log(`[lead-calls] Posted via Slack API (threaded: ${!!threadTs})`);
+      }
+    } catch (err) {
+      console.error("[lead-calls] Slack API error:", err.message);
+      await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
+    }
+  } else {
+    // Fall back to webhook if no bot token
+    await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
   }
 }
 
@@ -277,16 +376,13 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       console.log(`[calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"})`);
     }
 
-    // Skip ringing events — wait for call.completed to determine if missed
+    // Skip ringing events
     if (eventType === "call.ringing" || status === "ringing") {
       console.log(`[calls] Ringing — waiting for completion`);
       return;
     }
 
-    // Detect missed calls:
-    // - explicit missed statuses
-    // - completed but never answered (answeredAt is null)
-    // - has a voicemail
+    // Detect missed calls
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
     const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
     const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
@@ -350,7 +446,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
       const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}${linkLine}`;
-      await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, leadText);
+      await postLeadToSlack(leadText, from);
       console.log("[call-summary] ALSO sent to #lead-calls");
     }
   } catch (err) {
@@ -359,12 +455,10 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 });
 
 // --- Start ---
-// Load contacts first, then start server
 loadQuoContacts().then(() => {
   app.listen(PORT, () => {
     console.log(`Quo Slack Router listening on port ${PORT}`);
   });
 
-  // Refresh contacts every 10 minutes
   setInterval(loadQuoContacts, CONTACTS_REFRESH_INTERVAL);
 });
