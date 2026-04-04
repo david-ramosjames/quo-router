@@ -176,11 +176,12 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     const status = (obj.status || "").toLowerCase();
     const voicemail = obj.voicemail || null;
     const direction = obj.direction || "";
+    const contactName = obj.contactName || obj.contact?.name || obj.contact?.displayName || payload.data?.contactName || null;
 
     // Cache call info for call-summary lookup later
     if (callId) {
-      cacheCall(callId, { from: obj.from, to: obj.to, direction });
-      console.log(`[calls] Cached call ${callId}: ${from} → ${to}`);
+      cacheCall(callId, { from: obj.from, to: obj.to, direction, contactName });
+      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (contact: ${contactName || "unknown"})`);
     }
 
     // Only send to #missed-calls if it was actually missed or has a voicemail
@@ -192,7 +193,8 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       return;
     }
 
-    let text = `📞 Missed Call / Voicemail\nFrom: ${from}\nTo: ${to}`;
+    const fromLine = contactName ? `${contactName} (${from})` : from;
+    let text = `📞 Missed Call / Voicemail\nFrom: ${fromLine}\nTo: ${to}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
@@ -217,10 +219,11 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const callId = obj.callId || null;
     const deepLink = payload.data?.deepLink || null;
 
-    // Get from/to from cached call.completed event
+    // Get from/to/contact from cached call.completed event
     const cached = callId ? getCachedCall(callId) : null;
     const from = safe(cached?.from);
     const to = safe(cached?.to);
+    const contactName = cached?.contactName || null;
 
     // Summary is an array of strings in Quo
     const rawSummary = obj.summary;
@@ -229,16 +232,19 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const sona = isSonaCall(payload);
     const lead = isLeadCall(payload);
 
-    console.log(`[call-summary] From: ${from} | To: ${to} | Sona: ${sona} | Lead: ${lead}`);
+    // Build the "From" display line: show contact name if available
+    const fromLine = contactName ? `${contactName} (${from})` : from;
+
+    console.log(`[call-summary] From: ${fromLine} | To: ${to} | Sona: ${sona} | Lead: ${lead}`);
 
     // 1. Always post to base channel
     const linkLine = deepLink ? `\nLink: ${deepLink}` : "";
     if (sona) {
-      const text = `🤖 Sona Call Completed\nFrom: ${from}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `🤖 Sona Call Completed\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      const text = `📞 Human Call Completed\nFrom: ${from}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `📞 Human Call Completed\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
@@ -246,7 +252,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     // 2. If lead, ALSO send to #lead-calls
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
-      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${from}\nTo: ${to}\nSummary: ${summary}${linkLine}`;
+      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromLine}\nTo: ${to}\nSummary: ${summary}${linkLine}`;
       await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, leadText);
       console.log("[call-summary] ALSO sent to #lead-calls");
     }
