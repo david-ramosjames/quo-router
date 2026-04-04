@@ -418,27 +418,54 @@ async function postLeadToSlack(text, phoneNumber) {
 
 // --- Case Channel Routing ---
 
-function extractCaseInfo(contactName) {
+function extractCaseNumber(contactName) {
   if (!contactName) return null;
   // Match "Name 1234" pattern — case number at end
   const match = contactName.match(/^(.+?)\s+(\d{3,})$/);
   if (!match) return null;
-  const name = match[1].trim();
-  const caseNumber = match[2];
-  // Channel format: lowercase name, no spaces, hyphen, case number
-  const channelName = name.toLowerCase().replace(/[^a-z0-9]/g, "") + "-" + caseNumber;
-  return { name, caseNumber, channelName };
+  return match[2];
+}
+
+function findChannelByCaseNumber(caseNumber) {
+  // Search all cached channels for one ending with the case number
+  for (const [name, info] of slackChannels) {
+    if (name.endsWith("-" + caseNumber) || name.endsWith(caseNumber)) {
+      return { name, ...info };
+    }
+  }
+  return null;
+}
+
+async function joinChannel(channelId) {
+  try {
+    const res = await fetch("https://slack.com/api/conversations.join", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channel: channelId }),
+    });
+    const json = await res.json();
+    if (!json.ok && json.error !== "already_in_channel") {
+      console.error(`[case-channel] Failed to join channel: ${json.error}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`[case-channel] Error joining channel:`, err.message);
+    return false;
+  }
 }
 
 function extractMentionsFromTopic(topic) {
   if (!topic) return "";
-  // Find @Name mentions in the topic
   const mentions = [];
   const atMatches = topic.match(/@(\w+)/g);
   if (!atMatches) return "";
 
   for (const atName of atMatches) {
-    const name = atName.slice(1).toLowerCase(); // remove @
+    const name = atName.slice(1).toLowerCase();
     const userId = slackUsers.get(name);
     if (userId) {
       mentions.push(`<@${userId}>`);
@@ -450,19 +477,31 @@ function extractMentionsFromTopic(topic) {
 async function postToCaseChannel(text, phoneFrom, phoneTo) {
   if (!SLACK_BOT_TOKEN) return;
 
-  // Check both from and to numbers for a contact with a case number
   const phones = [phoneFrom, phoneTo].filter(Boolean);
 
   for (const phone of phones) {
     const contactName = getContactName(phone);
-    const caseInfo = extractCaseInfo(contactName);
-    if (!caseInfo) continue;
+    const caseNumber = extractCaseNumber(contactName);
+    if (!caseNumber) continue;
 
-    const channel = slackChannels.get(caseInfo.channelName);
+    // Try to find channel by case number
+    let channel = findChannelByCaseNumber(caseNumber);
+
+    // If not found, refresh cache and try again
     if (!channel) {
-      console.log(`[case-channel] No channel found for #${caseInfo.channelName}`);
+      console.log(`[case-channel] No cached channel for case ${caseNumber}, refreshing...`);
+      await loadSlackChannels();
+      channel = findChannelByCaseNumber(caseNumber);
+    }
+
+    if (!channel) {
+      console.log(`[case-channel] No channel found for case ${caseNumber}`);
       continue;
     }
+
+    // Auto-join the channel
+    const joined = await joinChannel(channel.id);
+    if (!joined) continue;
 
     // Get mentions from channel topic
     const mentions = extractMentionsFromTopic(channel.topic);
@@ -470,7 +509,7 @@ async function postToCaseChannel(text, phoneFrom, phoneTo) {
 
     const ok = await postViaBot(channel.id, caseText);
     if (ok) {
-      console.log(`[case-channel] Posted to #${caseInfo.channelName}${mentions ? " with mentions" : ""}`);
+      console.log(`[case-channel] Posted to #${channel.name}${mentions ? " with mentions" : ""}`);
     }
   }
 }
