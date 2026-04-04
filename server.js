@@ -432,20 +432,20 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 
     console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${lead}`);
 
-    const linkLine = deepLink ? `\nLink: ${deepLink}` : "";
+    const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
     if (sona) {
-      const text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      const text = `📞 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      const text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
 
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
-      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}${linkLine}`;
+      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${linkLine}`;
       await postLeadToSlack(leadText, from);
       console.log("[call-summary] ALSO sent to #lead-calls");
     }
