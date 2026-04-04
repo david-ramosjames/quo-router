@@ -422,7 +422,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const to = safe(cached?.to);
 
     const rawSummary = obj.summary;
-    const summary = Array.isArray(rawSummary) ? rawSummary.join("\n") : safe(rawSummary);
+    const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
     const lead = isLeadCall(payload);
