@@ -5,6 +5,7 @@ app.use(express.json());
 
 // --- Environment ---
 const PORT = process.env.PORT || 3000;
+const QUO_API_KEY = process.env.QUO_API_KEY;
 const SLACK_TEXT_MESSAGES_WEBHOOK_URL = process.env.SLACK_TEXT_MESSAGES_WEBHOOK_URL;
 const SLACK_MISSED_CALLS_WEBHOOK_URL = process.env.SLACK_MISSED_CALLS_WEBHOOK_URL;
 const SLACK_HUMAN_CALLS_WEBHOOK_URL = process.env.SLACK_HUMAN_CALLS_WEBHOOK_URL;
@@ -20,15 +21,74 @@ const PHONE_LINES = {
   "+15126300907": "RJL Transfers",
 };
 
+// --- Quo Contacts Cache ---
+// Maps phone number (e.g. "+15125001234") → "First Last"
+const contactsCache = new Map();
+const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+
+async function loadQuoContacts() {
+  if (!QUO_API_KEY) {
+    console.warn("[contacts] QUO_API_KEY not set — skipping contact sync");
+    return;
+  }
+
+  console.log("[contacts] Fetching contacts from Quo API...");
+  let totalLoaded = 0;
+  let pageToken = null;
+
+  try {
+    do {
+      const url = new URL("https://api.openphone.com/v1/contacts");
+      url.searchParams.set("maxResults", "100");
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: QUO_API_KEY },
+      });
+
+      if (!res.ok) {
+        console.error(`[contacts] Quo API responded ${res.status}: ${await res.text()}`);
+        break;
+      }
+
+      const json = await res.json();
+      const contacts = json.data || [];
+
+      for (const contact of contacts) {
+        const firstName = contact.defaultFields?.firstName || "";
+        const lastName = contact.defaultFields?.lastName || "";
+        const name = `${firstName} ${lastName}`.trim();
+        if (!name) continue;
+
+        const phoneNumbers = contact.defaultFields?.phoneNumbers || [];
+        for (const phone of phoneNumbers) {
+          if (phone.value) {
+            contactsCache.set(phone.value, name);
+          }
+        }
+      }
+
+      totalLoaded += contacts.length;
+      pageToken = json.nextPageToken || null;
+    } while (pageToken);
+
+    console.log(`[contacts] Loaded ${totalLoaded} contacts, ${contactsCache.size} phone numbers mapped`);
+  } catch (err) {
+    console.error("[contacts] Error fetching contacts:", err.message);
+  }
+}
+
+function getContactName(phoneNumber) {
+  if (!phoneNumber) return null;
+  return contactsCache.get(phoneNumber) || null;
+}
+
 // --- In-memory call cache ---
-// call.completed fires before call.summary.completed, so we cache from/to/line info
-// keyed by callId, auto-expires after 10 minutes
 const callCache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
 
 function cacheCall(callId, info) {
   callCache.set(callId, { ...info, cachedAt: Date.now() });
-  // Clean up old entries
   for (const [key, val] of callCache) {
     if (Date.now() - val.cachedAt > CACHE_TTL) callCache.delete(key);
   }
@@ -58,6 +118,13 @@ function formatPhone(number) {
   return lineName ? `${lineName} (${num})` : num;
 }
 
+function formatFrom(phoneNumber) {
+  const num = safe(phoneNumber);
+  const contactName = getContactName(num);
+  if (contactName) return `${contactName} (${num})`;
+  return formatPhone(num);
+}
+
 function extractField(payload, ...paths) {
   for (const path of paths) {
     const parts = path.split(".");
@@ -78,27 +145,10 @@ function extractText(payload) {
   const transcript = extractField(payload, "data.object.transcript", "data.transcript", "transcript") || "";
   const body = extractField(payload, "data.object.body", "data.body", "body") || "";
 
-  // Handle arrays (Quo sends summary as an array of strings)
   const parts = [summary, transcript, body].map((v) =>
     Array.isArray(v) ? v.join(" ") : String(v)
   );
   return parts.join(" ").toLowerCase();
-}
-
-// Deep-search a payload for any keys containing "contact" or "name"
-function findContactFields(obj, prefix = "") {
-  const results = {};
-  if (!obj || typeof obj !== "object") return results;
-  for (const [key, val] of Object.entries(obj)) {
-    const path = prefix ? `${prefix}.${key}` : key;
-    if (/contact|name|caller/i.test(key) && val != null) {
-      results[path] = val;
-    }
-    if (val && typeof val === "object" && !Array.isArray(val)) {
-      Object.assign(results, findContactFields(val, path));
-    }
-  }
-  return results;
 }
 
 async function postToSlack(webhookUrl, text) {
@@ -123,7 +173,6 @@ async function postToSlack(webhookUrl, text) {
 // --- Detection ---
 
 function isSonaCall(payload, cached) {
-  // 1. Check explicit fields on payload
   const handledBy = extractField(payload, "data.object.handledBy", "data.handledBy");
   if (handledBy && String(handledBy).toLowerCase().includes("sona")) return true;
 
@@ -133,24 +182,18 @@ function isSonaCall(payload, cached) {
   const agent = extractField(payload, "data.object.agent", "data.agent");
   if (agent && String(agent).toLowerCase().includes("sona")) return true;
 
-  // 2. Check for sona_summary field (Quo docs say Sona calls include this)
   const sonaSummary = extractField(payload, "data.object.sona_summary", "data.object.sonaSummary", "data.sona_summary");
   if (sonaSummary) return true;
 
-  // 3. Check for jobs array (Sona creates jobs during calls)
   const jobs = extractField(payload, "data.object.jobs");
   if (Array.isArray(jobs) && jobs.length > 0) return true;
 
-  // 4. Check answeredBy from cached call.completed data
-  // If answeredBy is a system ID (starts with "SY") and userId is different, it's likely Sona
   if (cached?.answeredBy) {
     const ab = String(cached.answeredBy);
     if (ab.toLowerCase().includes("sona")) return true;
-    // Quo system IDs starting with "SY" indicate a system/AI agent answered
     if (ab.startsWith("SY")) return true;
   }
 
-  // 5. Check summary text for Sona/AI patterns
   const combinedText = extractText(payload);
   const sonaPatterns = [
     "this is sona", "i'm sona", "hi, i'm sona", "i am sona",
@@ -197,16 +240,11 @@ app.post("/webhooks/quo/messages", async (req, res) => {
 
   try {
     const payload = req.body || {};
-    console.log("[messages] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
-    console.log("[messages] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
-
-    const obj = payload.data?.object || {};
     const from = safe(extractField(payload, "data.object.from", "data.from", "from"));
     const to = safe(extractField(payload, "data.object.to", "data.to", "to"));
-    const contactName = obj.contactName || obj.contact?.name || obj.contact?.displayName || payload.data?.contactName || null;
     const body = safe(extractField(payload, "data.object.body", "data.body", "body", "data.object.message", "data.message"));
 
-    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
     const text = `💬 New Text Message\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}`;
 
@@ -223,9 +261,6 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
   try {
     const payload = req.body || {};
-    console.log("[calls] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
-    console.log("[calls] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
-
     const obj = payload.data?.object || {};
     const callId = obj.id || null;
     const from = safe(obj.from);
@@ -233,12 +268,11 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     const status = (obj.status || "").toLowerCase();
     const voicemail = obj.voicemail || null;
     const direction = obj.direction || "";
-    const contactName = obj.contactName || obj.contact?.name || obj.contact?.displayName || payload.data?.contactName || null;
 
     // Cache call info for call-summary lookup later
     if (callId) {
-      cacheCall(callId, { from: obj.from, to: obj.to, direction, contactName, answeredBy: obj.answeredBy, userId: obj.userId });
-      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (contact: ${contactName || "unknown"}, answeredBy: ${obj.answeredBy || "none"}, userId: ${obj.userId || "none"})`);
+      cacheCall(callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
+      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (answeredBy: ${obj.answeredBy || "none"})`);
     }
 
     // Only send to #missed-calls if it was actually missed or has a voicemail
@@ -250,7 +284,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       return;
     }
 
-    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
     let text = `📞 Missed Call / Voicemail\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
@@ -258,7 +292,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       text += `\nVoicemail: ${vmUrl}`;
     }
 
-    console.log(`[calls] Missed call from: ${from}`);
+    console.log(`[calls] Missed call from: ${fromDisplay}`);
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
   } catch (err) {
@@ -271,33 +305,25 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 
   try {
     const payload = req.body || {};
-    console.log("[call-summary] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
-    console.log("[call-summary] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
-
     const obj = payload.data?.object || {};
     const callId = obj.callId || null;
     const deepLink = payload.data?.deepLink || null;
 
-    // Get from/to/contact from cached call.completed event
     const cached = callId ? getCachedCall(callId) : null;
     const from = safe(cached?.from);
     const to = safe(cached?.to);
-    const contactName = cached?.contactName || null;
 
-    // Summary is an array of strings in Quo
     const rawSummary = obj.summary;
     const summary = Array.isArray(rawSummary) ? rawSummary.join("\n") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
     const lead = isLeadCall(payload);
 
-    // Build display lines
-    const fromDisplay = contactName ? `${contactName} (${from})` : formatPhone(from);
+    const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
 
     console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${lead}`);
 
-    // 1. Always post to base channel
     const linkLine = deepLink ? `\nLink: ${deepLink}` : "";
     if (sona) {
       const text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
@@ -309,7 +335,6 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       console.log("[call-summary] Sent to #human-calls");
     }
 
-    // 2. If lead, ALSO send to #lead-calls
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
       const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary: ${summary}${linkLine}`;
@@ -322,6 +347,12 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 });
 
 // --- Start ---
-app.listen(PORT, () => {
-  console.log(`Quo Slack Router listening on port ${PORT}`);
+// Load contacts first, then start server
+loadQuoContacts().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Quo Slack Router listening on port ${PORT}`);
+  });
+
+  // Refresh contacts every 10 minutes
+  setInterval(loadQuoContacts, CONTACTS_REFRESH_INTERVAL);
 });
