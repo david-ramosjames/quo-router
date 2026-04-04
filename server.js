@@ -39,7 +39,7 @@ async function loadQuoContacts() {
   try {
     do {
       const url = new URL("https://api.openphone.com/v1/contacts");
-      url.searchParams.set("maxResults", "100");
+      url.searchParams.set("maxResults", "50");
       if (pageToken) url.searchParams.set("pageToken", pageToken);
 
       const res = await fetch(url.toString(), {
@@ -268,19 +268,31 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     const status = (obj.status || "").toLowerCase();
     const voicemail = obj.voicemail || null;
     const direction = obj.direction || "";
+    const answeredAt = obj.answeredAt || null;
+    const eventType = (payload.type || "").toLowerCase();
 
     // Cache call info for call-summary lookup later
     if (callId) {
       cacheCall(callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
-      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (answeredBy: ${obj.answeredBy || "none"})`);
+      console.log(`[calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"})`);
     }
 
-    // Only send to #missed-calls if it was actually missed or has a voicemail
-    const isMissed = ["no-answer", "busy", "canceled", "failed"].includes(status);
+    // Skip ringing events — wait for call.completed to determine if missed
+    if (eventType === "call.ringing" || status === "ringing") {
+      console.log(`[calls] Ringing — waiting for completion`);
+      return;
+    }
+
+    // Detect missed calls:
+    // - explicit missed statuses
+    // - completed but never answered (answeredAt is null)
+    // - has a voicemail
+    const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
+    const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
     const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
 
-    if (!isMissed && !hasVoicemail) {
-      console.log(`[calls] Skipping completed call (status: ${status}) — not missed`);
+    if (!isMissedStatus && !isUnanswered && !hasVoicemail) {
+      console.log(`[calls] Skipping answered call (status: ${status}) — not missed`);
       return;
     }
 
