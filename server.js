@@ -148,13 +148,16 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     const payload = req.body || {};
     console.log("[messages] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
 
+    const obj = payload.data?.object || {};
     const from = safe(extractField(payload, "data.object.from", "data.from", "from"));
     const to = safe(extractField(payload, "data.object.to", "data.to", "to"));
+    const contactName = obj.contactName || obj.contact?.name || obj.contact?.displayName || payload.data?.contactName || null;
     const body = safe(extractField(payload, "data.object.body", "data.body", "body", "data.object.message", "data.message"));
 
-    const text = `💬 New Text Message\nFrom: ${from}\nTo: ${to}\nMessage: ${body}`;
+    const fromLine = contactName ? `${contactName} (${from})` : from;
+    const text = `💬 New Text Message\nFrom: ${fromLine}\nTo: ${to}\nMessage: ${body}`;
 
-    console.log(`[messages] From: ${from} → To: ${to}`);
+    console.log(`[messages] From: ${fromLine} → To: ${to}`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
     console.log("[messages] Sent to #text-messages");
   } catch (err) {
