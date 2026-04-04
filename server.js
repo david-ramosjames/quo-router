@@ -85,6 +85,22 @@ function extractText(payload) {
   return parts.join(" ").toLowerCase();
 }
 
+// Deep-search a payload for any keys containing "contact" or "name"
+function findContactFields(obj, prefix = "") {
+  const results = {};
+  if (!obj || typeof obj !== "object") return results;
+  for (const [key, val] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (/contact|name|caller/i.test(key) && val != null) {
+      results[path] = val;
+    }
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      Object.assign(results, findContactFields(val, path));
+    }
+  }
+  return results;
+}
+
 async function postToSlack(webhookUrl, text) {
   if (!webhookUrl) {
     console.error("Slack webhook URL not configured");
@@ -182,6 +198,7 @@ app.post("/webhooks/quo/messages", async (req, res) => {
   try {
     const payload = req.body || {};
     console.log("[messages] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
+    console.log("[messages] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
 
     const obj = payload.data?.object || {};
     const from = safe(extractField(payload, "data.object.from", "data.from", "from"));
@@ -207,6 +224,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
   try {
     const payload = req.body || {};
     console.log("[calls] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
+    console.log("[calls] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
 
     const obj = payload.data?.object || {};
     const callId = obj.id || null;
@@ -254,6 +272,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
   try {
     const payload = req.body || {};
     console.log("[call-summary] RAW PAYLOAD:", JSON.stringify(payload, null, 2));
+    console.log("[call-summary] CONTACT FIELDS:", JSON.stringify(findContactFields(payload)));
 
     const obj = payload.data?.object || {};
     const callId = obj.callId || null;
