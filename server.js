@@ -84,6 +84,91 @@ function getContactName(phoneNumber) {
   return contactsCache.get(phoneNumber) || null;
 }
 
+// --- Slack Channels + Users Cache ---
+const slackChannels = new Map(); // channelName → { id, topic }
+const slackUsers = new Map(); // lowercaseDisplayName → userId
+
+async function loadSlackChannels() {
+  if (!SLACK_BOT_TOKEN) return;
+
+  console.log("[slack] Loading channels...");
+  let cursor = "";
+  let total = 0;
+
+  try {
+    do {
+      const url = new URL("https://slack.com/api/conversations.list");
+      url.searchParams.set("types", "public_channel,private_channel");
+      url.searchParams.set("limit", "200");
+      url.searchParams.set("exclude_archived", "true");
+      if (cursor) url.searchParams.set("cursor", cursor);
+
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      });
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[slack] channels error: ${json.error}`);
+        break;
+      }
+
+      for (const ch of json.channels || []) {
+        slackChannels.set(ch.name, { id: ch.id, topic: ch.topic?.value || "" });
+      }
+
+      total += (json.channels || []).length;
+      cursor = json.response_metadata?.next_cursor || "";
+    } while (cursor);
+
+    console.log(`[slack] Loaded ${total} channels`);
+  } catch (err) {
+    console.error("[slack] Error loading channels:", err.message);
+  }
+}
+
+async function loadSlackUsers() {
+  if (!SLACK_BOT_TOKEN) return;
+
+  console.log("[slack] Loading users...");
+  let cursor = "";
+  let total = 0;
+
+  try {
+    do {
+      const url = new URL("https://slack.com/api/users.list");
+      url.searchParams.set("limit", "200");
+      if (cursor) url.searchParams.set("cursor", cursor);
+
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      });
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[slack] users error: ${json.error}`);
+        break;
+      }
+
+      for (const user of json.members || []) {
+        if (user.deleted || user.is_bot) continue;
+        const displayName = (user.profile?.display_name || "").toLowerCase().trim();
+        const realName = (user.real_name || "").toLowerCase().trim();
+        const firstName = (user.profile?.first_name || "").toLowerCase().trim();
+
+        if (displayName) slackUsers.set(displayName, user.id);
+        if (realName) slackUsers.set(realName, user.id);
+        if (firstName) slackUsers.set(firstName, user.id);
+      }
+
+      total += (json.members || []).length;
+      cursor = json.response_metadata?.next_cursor || "";
+    } while (cursor);
+
+    console.log(`[slack] Loaded ${total} users, ${slackUsers.size} name mappings`);
+  } catch (err) {
+    console.error("[slack] Error loading users:", err.message);
+  }
+}
+
 // --- In-memory call cache ---
 const callCache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
@@ -129,7 +214,6 @@ function formatFrom(phoneNumber) {
   return formatPhone(num);
 }
 
-// Strip the "+" and any non-digit chars to get just digits for matching
 function normalizePhone(phone) {
   if (!phone) return "";
   return phone.replace(/\D/g, "");
@@ -161,6 +245,60 @@ function extractText(payload) {
   return parts.join(" ").toLowerCase();
 }
 
+// --- Spanish Detection + Translation ---
+
+const SPANISH_WORDS = [
+  "hola", "gracias", "por favor", "buenos", "buenas", "días", "tardes", "noches",
+  "cómo", "está", "estoy", "llamar", "llamando", "accidente", "abogado", "número",
+  "necesito", "ayuda", "puede", "quiero", "tiene", "cuando", "donde", "porque",
+  "también", "pero", "para", "como", "desde", "sobre", "entre", "después",
+  "antes", "aquí", "ahora", "muy", "más", "menos", "mejor", "usted",
+  "nosotros", "ellos", "mensaje", "teléfono", "oficina", "caso",
+];
+
+function isSpanish(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  // Check for Spanish-specific characters
+  const hasSpecialChars = /[áéíóúñ¿¡ü]/.test(lower);
+  // Count Spanish word matches
+  const wordCount = SPANISH_WORDS.filter((w) => lower.includes(w)).length;
+  return hasSpecialChars || wordCount >= 2;
+}
+
+async function translateToEnglish(text) {
+  try {
+    const url = new URL("https://translate.googleapis.com/translate_a/single");
+    url.searchParams.set("client", "gtx");
+    url.searchParams.set("sl", "es");
+    url.searchParams.set("tl", "en");
+    url.searchParams.set("dt", "t");
+    url.searchParams.set("q", text);
+
+    const res = await fetch(url.toString());
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    // Response format: [[["translated text","original text",...],...],...]
+    const translated = (json[0] || []).map((part) => part[0]).join("");
+    return translated || null;
+  } catch (err) {
+    console.error("[translate] Error:", err.message);
+    return null;
+  }
+}
+
+async function appendTranslation(text) {
+  if (!isSpanish(text)) return "";
+  const translated = await translateToEnglish(text);
+  if (translated) {
+    return `\n🌐 Translation: ${translated}`;
+  }
+  return "";
+}
+
+// --- Slack Posting ---
+
 async function postToSlack(webhookUrl, text) {
   if (!webhookUrl) {
     console.error("Slack webhook URL not configured");
@@ -180,7 +318,30 @@ async function postToSlack(webhookUrl, text) {
   }
 }
 
-// --- Slack Bot API for #lead-calls threading ---
+async function postViaBot(channelId, text) {
+  if (!SLACK_BOT_TOKEN) return false;
+  try {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channel: channelId, text }),
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[slack-bot] Error posting to ${channelId}: ${json.error}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`[slack-bot] Error:`, err.message);
+    return false;
+  }
+}
+
+// --- Lead-calls threading ---
 
 async function findThreadByPhone(phoneNumber) {
   if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID || !phoneNumber) return null;
@@ -189,11 +350,9 @@ async function findThreadByPhone(phoneNumber) {
   if (!normalized) return null;
 
   try {
-    // Search recent messages in #lead-calls (last 7 days worth, up to 200 messages)
     const url = new URL("https://slack.com/api/conversations.history");
     url.searchParams.set("channel", SLACK_LEAD_CALLS_CHANNEL_ID);
     url.searchParams.set("limit", "200");
-    // Look back 7 days
     const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
     url.searchParams.set("oldest", String(sevenDaysAgo));
 
@@ -201,45 +360,32 @@ async function findThreadByPhone(phoneNumber) {
       headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
     });
 
-    if (!res.ok) {
-      console.error(`[lead-thread] Slack API responded ${res.status}`);
-      return null;
-    }
-
     const json = await res.json();
     if (!json.ok) {
       console.error(`[lead-thread] Slack API error: ${json.error}`);
       return null;
     }
 
-    // Search messages for the phone number (check both +1... and raw digits)
     for (const msg of json.messages || []) {
       const msgText = msg.text || "";
       if (msgText.includes(phoneNumber) || msgText.includes(normalized)) {
-        // Return the thread_ts — use existing thread parent, or the message ts itself
         console.log(`[lead-thread] Found matching message for ${phoneNumber} (ts: ${msg.thread_ts || msg.ts})`);
         return msg.thread_ts || msg.ts;
       }
     }
 
-    console.log(`[lead-thread] No existing thread found for ${phoneNumber}`);
     return null;
   } catch (err) {
-    console.error("[lead-thread] Error searching for thread:", err.message);
+    console.error("[lead-thread] Error:", err.message);
     return null;
   }
 }
 
 async function postLeadToSlack(text, phoneNumber) {
-  // If we have bot token + channel ID, use the Slack API with threading
   if (SLACK_BOT_TOKEN && SLACK_LEAD_CALLS_CHANNEL_ID) {
     try {
       const threadTs = await findThreadByPhone(phoneNumber);
-
-      const body = {
-        channel: SLACK_LEAD_CALLS_CHANNEL_ID,
-        text,
-      };
+      const body = { channel: SLACK_LEAD_CALLS_CHANNEL_ID, text };
       if (threadTs) {
         body.thread_ts = threadTs;
         console.log(`[lead-calls] Replying in thread ${threadTs}`);
@@ -257,7 +403,6 @@ async function postLeadToSlack(text, phoneNumber) {
       const json = await res.json();
       if (!json.ok) {
         console.error(`[lead-calls] Slack API error: ${json.error}`);
-        // Fall back to webhook
         await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
       } else {
         console.log(`[lead-calls] Posted via Slack API (threaded: ${!!threadTs})`);
@@ -267,8 +412,66 @@ async function postLeadToSlack(text, phoneNumber) {
       await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
     }
   } else {
-    // Fall back to webhook if no bot token
     await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
+  }
+}
+
+// --- Case Channel Routing ---
+
+function extractCaseInfo(contactName) {
+  if (!contactName) return null;
+  // Match "Name 1234" pattern — case number at end
+  const match = contactName.match(/^(.+?)\s+(\d{3,})$/);
+  if (!match) return null;
+  const name = match[1].trim();
+  const caseNumber = match[2];
+  // Channel format: lowercase name, no spaces, hyphen, case number
+  const channelName = name.toLowerCase().replace(/[^a-z0-9]/g, "") + "-" + caseNumber;
+  return { name, caseNumber, channelName };
+}
+
+function extractMentionsFromTopic(topic) {
+  if (!topic) return "";
+  // Find @Name mentions in the topic
+  const mentions = [];
+  const atMatches = topic.match(/@(\w+)/g);
+  if (!atMatches) return "";
+
+  for (const atName of atMatches) {
+    const name = atName.slice(1).toLowerCase(); // remove @
+    const userId = slackUsers.get(name);
+    if (userId) {
+      mentions.push(`<@${userId}>`);
+    }
+  }
+  return mentions.length > 0 ? mentions.join(" ") + "\n" : "";
+}
+
+async function postToCaseChannel(text, phoneFrom, phoneTo) {
+  if (!SLACK_BOT_TOKEN) return;
+
+  // Check both from and to numbers for a contact with a case number
+  const phones = [phoneFrom, phoneTo].filter(Boolean);
+
+  for (const phone of phones) {
+    const contactName = getContactName(phone);
+    const caseInfo = extractCaseInfo(contactName);
+    if (!caseInfo) continue;
+
+    const channel = slackChannels.get(caseInfo.channelName);
+    if (!channel) {
+      console.log(`[case-channel] No channel found for #${caseInfo.channelName}`);
+      continue;
+    }
+
+    // Get mentions from channel topic
+    const mentions = extractMentionsFromTopic(channel.topic);
+    const caseText = mentions + text;
+
+    const ok = await postViaBot(channel.id, caseText);
+    if (ok) {
+      console.log(`[case-channel] Posted to #${caseInfo.channelName}${mentions ? " with mentions" : ""}`);
+    }
   }
 }
 
@@ -348,11 +551,18 @@ app.post("/webhooks/quo/messages", async (req, res) => {
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
-    const text = `💬 New Text Message\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}`;
+
+    // Translate if Spanish
+    const translation = await appendTranslation(body);
+
+    const text = `💬 New Text Message\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${translation}`;
 
     console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay}`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
     console.log("[messages] Sent to #text-messages");
+
+    // Post to case channel if applicable
+    await postToCaseChannel(text, from, to);
   } catch (err) {
     console.error("[messages] Error:", err.message);
   }
@@ -406,6 +616,9 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     console.log(`[calls] Missed call from: ${fromDisplay}`);
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
+
+    // Post to case channel if applicable
+    await postToCaseChannel(text, from, to);
   } catch (err) {
     console.error("[calls] Error:", err.message);
   }
@@ -433,35 +646,46 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
 
+    // Translate summary if Spanish
+    const summaryText = Array.isArray(rawSummary) ? rawSummary.join(" ") : (rawSummary || "");
+    const translation = await appendTranslation(summaryText);
+
     console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${lead}`);
 
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
+    let text;
     if (sona) {
-      const text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      const text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
 
     if (lead) {
       const handledBy = sona ? "Sona" : "Human";
-      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${linkLine}`;
+      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       await postLeadToSlack(leadText, from);
       console.log("[call-summary] ALSO sent to #lead-calls");
     }
+
+    // Post to case channel if applicable
+    await postToCaseChannel(text, from, to);
   } catch (err) {
     console.error("[call-summary] Error:", err.message);
   }
 });
 
 // --- Start ---
-loadQuoContacts().then(() => {
+Promise.all([loadQuoContacts(), loadSlackChannels(), loadSlackUsers()]).then(() => {
   app.listen(PORT, () => {
     console.log(`Quo Slack Router listening on port ${PORT}`);
   });
 
+  // Refresh caches periodically
   setInterval(loadQuoContacts, CONTACTS_REFRESH_INTERVAL);
+  setInterval(loadSlackChannels, CONTACTS_REFRESH_INTERVAL);
+  setInterval(loadSlackUsers, CONTACTS_REFRESH_INTERVAL);
 });
