@@ -754,13 +754,17 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 });
 
 // --- Start ---
-Promise.all([loadQuoContacts(), loadSlackChannels(), loadSlackUsers()]).then(() => {
-  app.listen(PORT, () => {
-    console.log(`Quo Slack Router listening on port ${PORT}`);
-  });
-
-  // Refresh caches periodically
-  setInterval(loadQuoContacts, CONTACTS_REFRESH_INTERVAL);
-  setInterval(loadSlackChannels, CONTACTS_REFRESH_INTERVAL);
-  setInterval(loadSlackUsers, CONTACTS_REFRESH_INTERVAL);
+// Start server immediately so we don't miss webhooks during cache loading
+app.listen(PORT, () => {
+  console.log(`Quo Slack Router listening on port ${PORT}`);
 });
+
+// Load caches in background — routes work without them (just no contact names/case channels)
+Promise.all([loadQuoContacts(), loadSlackChannels(), loadSlackUsers()]).then(() => {
+  console.log("[startup] All caches loaded");
+});
+
+// Refresh caches periodically (staggered to avoid API bursts)
+setInterval(loadQuoContacts, 10 * 60 * 1000);
+setInterval(loadSlackChannels, 15 * 60 * 1000);
+setInterval(loadSlackUsers, 30 * 60 * 1000);
