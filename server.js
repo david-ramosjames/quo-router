@@ -584,9 +584,16 @@ app.post("/webhooks/quo/messages", async (req, res) => {
 
   try {
     const payload = req.body || {};
+    const obj = payload.data?.object || {};
     const from = safe(extractField(payload, "data.object.from", "data.from", "from"));
     const to = safe(extractField(payload, "data.object.to", "data.to", "to"));
     const body = safe(extractField(payload, "data.object.body", "data.body", "body", "data.object.message", "data.message"));
+    const direction = obj.direction || "";
+    const eventType = (payload.type || "").toLowerCase();
+
+    const isOutbound = direction === "outgoing" || eventType === "message.delivered";
+    const emoji = isOutbound ? "📤" : "💬";
+    const label = isOutbound ? "Outbound Text Message" : "New Text Message";
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
@@ -594,7 +601,7 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     // Translate if Spanish
     const translation = await appendTranslation(body);
 
-    const text = `💬 New Text Message\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${translation}`;
+    const text = `${emoji} ${label}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${translation}`;
 
     console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay}`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
