@@ -625,12 +625,23 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
 
+    // Extract media/attachments (photos, files)
+    const media = obj.media || [];
+    const mediaLines = media
+      .map((m) => {
+        const url = m.url || m;
+        const type = m.type || "attachment";
+        return typeof url === "string" ? `📎 <${url}|${type}>` : null;
+      })
+      .filter(Boolean);
+    const mediaSection = mediaLines.length > 0 ? "\n" + mediaLines.join("\n") : "";
+
     // Translate if Spanish
     const translation = await appendTranslation(body);
 
-    const text = `${emoji} ${label}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${translation}`;
+    const text = `${emoji} ${label}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${mediaSection}${translation}`;
 
-    console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay}`);
+    console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay} (media: ${media.length})`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
     console.log("[messages] Sent to #text-messages");
 
