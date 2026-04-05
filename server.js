@@ -551,26 +551,53 @@ function isSonaCall(payload, cached) {
   return false;
 }
 
-function isLeadCall(payload) {
+// Lead = anyone seeking ANY type of legal help
+// Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
+function classifyLead(payload) {
   const text = extractText(payload);
-  if (!text) return false;
-
-  const positiveSignals = [
-    "accident", "injury", "injured", "hurt", "truck", "18-wheeler",
-    "crash", "collision", "rear-ended", "hit", "insurance", "hospital",
-    "ambulance", "pain",
-  ];
+  if (!text) return { isLead: false, isQualified: false, label: "No" };
 
   const negativeSignals = [
     "wrong number", "spam", "sales", "job", "employment",
     "recruiting", "vendor", "marketing", "existing client",
+    "soliciting", "cold call",
   ];
 
   const hasNegative = negativeSignals.some((s) => text.includes(s));
-  if (hasNegative) return false;
+  if (hasNegative) return { isLead: false, isQualified: false, label: "No" };
 
-  const hasPositive = positiveSignals.some((s) => text.includes(s));
-  return hasPositive;
+  // Broad lead signals — anyone looking for legal help
+  const leadSignals = [
+    "lawyer", "attorney", "legal", "law firm", "lawsuit", "sue",
+    "case", "claim", "represent", "representation", "consultation",
+    "consult", "help me", "need help", "looking for help",
+    "advice", "rights", "compensation", "damages", "settlement",
+    "negligence", "liability", "fault", "incident", "police report",
+    "medical", "doctor", "treatment", "surgery",
+    "new client", "potential client", "intake",
+    "referral", "referred",
+  ];
+
+  // Qualified lead signals — PI / auto / workplace situations
+  const qualifiedSignals = [
+    "accident", "injury", "injured", "hurt", "truck", "18-wheeler",
+    "crash", "collision", "rear-ended", "hit", "insurance", "hospital",
+    "ambulance", "pain", "wreck", "car accident", "auto accident",
+    "motorcycle", "pedestrian", "slip", "fall", "fell",
+    "workplace", "work injury", "on the job", "workers comp",
+    "wrongful death", "death", "killed", "fatality",
+    "drunk driver", "dui", "hit and run",
+    "broken", "fracture", "spinal", "brain", "concussion",
+    "disability", "disabled", "paralyz",
+  ];
+
+  const hasQualified = qualifiedSignals.some((s) => text.includes(s));
+  if (hasQualified) return { isLead: true, isQualified: true, label: "🔥 Qualified Lead" };
+
+  const hasLead = leadSignals.some((s) => text.includes(s));
+  if (hasLead) return { isLead: true, isQualified: false, label: "Lead" };
+
+  return { isLead: false, isQualified: false, label: "No" };
 }
 
 // --- Routes ---
@@ -687,7 +714,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const lead = isLeadCall(payload);
+    const { isLead, isQualified, label: leadLabel } = classifyLead(payload);
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
@@ -696,25 +723,27 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const summaryText = Array.isArray(rawSummary) ? rawSummary.join(" ") : (rawSummary || "");
     const translation = await appendTranslation(summaryText);
 
-    console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${lead}`);
+    console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${leadLabel}`);
 
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
     let text;
     if (sona) {
-      text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${lead ? "Yes" : "No"}${linkLine}`;
+      text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
 
-    if (lead) {
+    // Send ALL leads (qualified or not) to #lead-calls
+    if (isLead) {
       const handledBy = sona ? "Sona" : "Human";
-      const leadText = `🔥 Potential Lead Call\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
+      const qualTag = isQualified ? "🔥 Qualified Lead Call" : "📋 Lead Call";
+      const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       await postLeadToSlack(leadText, from);
-      console.log("[call-summary] ALSO sent to #lead-calls");
+      console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
     }
 
     // Post to case channel if applicable
