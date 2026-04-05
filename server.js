@@ -460,27 +460,34 @@ async function joinChannel(channelId) {
 
 function extractMentionsFromTopic(topic) {
   if (!topic) return "";
-  const mentions = [];
 
-  // Match @Name patterns in the topic
+  // Slack stores mentions as <@U12345> in the topic via API
+  const userIdMatches = topic.match(/<@(U[A-Z0-9]+)>/g);
+  if (userIdMatches && userIdMatches.length > 0) {
+    console.log(`[mentions] Found ${userIdMatches.length} user mentions in topic`);
+    return userIdMatches.join(" ") + "\n";
+  }
+
+  // Fallback: try @Name patterns and resolve via users cache
   const atMatches = topic.match(/@(\w+)/g);
   if (!atMatches) {
-    console.log(`[mentions] No @mentions found in topic: "${topic}"`);
+    console.log(`[mentions] No mentions found in topic: "${topic}"`);
     return "";
   }
 
+  const mentions = [];
   for (const atName of atMatches) {
     const name = atName.slice(1).toLowerCase();
     const userId = slackUsers.get(name);
     if (userId) {
       mentions.push(`<@${userId}>`);
     } else {
-      console.log(`[mentions] Could not find Slack user for "${name}" — available similar: ${[...slackUsers.keys()].filter(k => k.includes(name.slice(0, 3))).join(", ") || "none"}`);
+      console.log(`[mentions] Could not resolve "${name}" to a Slack user`);
     }
   }
 
   if (mentions.length > 0) {
-    console.log(`[mentions] Resolved ${mentions.length}/${atMatches.length} mentions from topic`);
+    console.log(`[mentions] Resolved ${mentions.length}/${atMatches.length} mentions`);
   }
   return mentions.length > 0 ? mentions.join(" ") + "\n" : "";
 }
