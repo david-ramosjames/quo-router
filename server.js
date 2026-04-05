@@ -461,15 +461,26 @@ async function joinChannel(channelId) {
 function extractMentionsFromTopic(topic) {
   if (!topic) return "";
   const mentions = [];
+
+  // Match @Name patterns in the topic
   const atMatches = topic.match(/@(\w+)/g);
-  if (!atMatches) return "";
+  if (!atMatches) {
+    console.log(`[mentions] No @mentions found in topic: "${topic}"`);
+    return "";
+  }
 
   for (const atName of atMatches) {
     const name = atName.slice(1).toLowerCase();
     const userId = slackUsers.get(name);
     if (userId) {
       mentions.push(`<@${userId}>`);
+    } else {
+      console.log(`[mentions] Could not find Slack user for "${name}" — available similar: ${[...slackUsers.keys()].filter(k => k.includes(name.slice(0, 3))).join(", ") || "none"}`);
     }
+  }
+
+  if (mentions.length > 0) {
+    console.log(`[mentions] Resolved ${mentions.length}/${atMatches.length} mentions from topic`);
   }
   return mentions.length > 0 ? mentions.join(" ") + "\n" : "";
 }
