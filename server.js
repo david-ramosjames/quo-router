@@ -620,9 +620,26 @@ function isSonaCall(payload, cached) {
   return false;
 }
 
+// Check if a phone number belongs to an existing client (has a case number)
+function isExistingClient(phoneNumber) {
+  const contactName = getContactName(phoneNumber);
+  return !!extractCaseNumber(contactName);
+}
+
 // Lead = anyone seeking ANY type of legal help
 // Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
-function classifyLead(payload) {
+// Existing clients (contact with case number) are NOT leads
+function classifyLead(payload, phoneFrom, phoneTo) {
+  // If either party is an existing client, not a lead
+  const phones = [phoneFrom, phoneTo].filter(Boolean);
+  for (const phone of phones) {
+    if (PHONE_LINES[phone]) continue; // skip our own lines
+    if (isExistingClient(phone)) {
+      console.log(`[lead] Skipping — existing client: ${getContactName(phone)}`);
+      return { isLead: false, isQualified: false, label: "No (Existing Client)" };
+    }
+  }
+
   const text = extractText(payload);
   if (!text) return { isLead: false, isQualified: false, label: "No" };
 
@@ -794,7 +811,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const { isLead, isQualified, label: leadLabel } = classifyLead(payload);
+    const { isLead, isQualified, label: leadLabel } = classifyLead(payload, from, to);
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
