@@ -828,10 +828,21 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "adjuster", "claims adjuster", "claims representative", "claims department",
     "calling from insurance", "calling about a claim", "regarding a claim",
     "subrogation", "insurance company calling",
+    "insurance called", "insurance is calling",
+    "from progressive insurance", "from state farm", "from usaa",
+    "from nationwide", "from allstate", "from geico", "from liberty mutual",
+    "from farmers insurance", "from travelers", "from hartford",
+    "from american family", "from erie insurance", "from safeco",
+    "from mercury insurance", "from kemper", "from bristol west",
+    "from root insurance", "from lemonade", "from amica",
+    "from esurance", "from elephant insurance", "from metlife",
+    "regarding client", "regarding a client",
   ];
 
   const hasInsuranceCaller = insuranceCallerSignals.some((s) => text.includes(s));
-  if (hasInsuranceCaller) {
+  // Also catch "from [X] insurance" pattern dynamically
+  const fromInsurancePattern = /from\s+\w+(\s+\w+)?\s+insurance/i.test(text);
+  if (hasInsuranceCaller || fromInsurancePattern) {
     console.log(`[lead] Skipping — insurance caller signal in text`);
     return { isLead: false, isQualified: false, label: "No (Insurance)" };
   }
