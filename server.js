@@ -729,6 +729,26 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "soliciting", "cold call",
   ];
 
+  // Insurance company / adjuster signals — these callers are not leads
+  const insuranceCompanySignals = [
+    "state farm", "usaa", "nationwide", "allstate", "geico", "progressive",
+    "liberty mutual", "farmers insurance", "travelers", "hartford",
+    "american family", "erie insurance", "safeco", "kemper",
+    "mercury insurance", "bristol west", "mapfre", "the general",
+    "root insurance", "lemonade", "metlife auto", "amica",
+    "csaa", "aaa insurance", "esurance", "elephant insurance",
+    "adjuster", "claims adjuster", "claims representative", "claims department",
+    "claim number", "policy number", "filed a claim", "insurance adjuster",
+    "calling from insurance", "calling about a claim", "regarding a claim",
+    "subrogation", "insurance company calling",
+  ];
+
+  const hasInsurance = insuranceCompanySignals.some((s) => text.includes(s));
+  if (hasInsurance) {
+    console.log(`[lead] Skipping — insurance company/adjuster signal detected`);
+    return { isLead: false, isQualified: false, label: "No (Insurance)" };
+  }
+
   const hasNegative = negativeSignals.some((s) => text.includes(s));
   if (hasNegative) return { isLead: false, isQualified: false, label: "No" };
 
@@ -747,7 +767,7 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
   // Qualified lead signals — PI / auto / workplace situations
   const qualifiedSignals = [
     "accident", "injury", "injured", "hurt", "truck", "18-wheeler",
-    "crash", "collision", "rear-ended", "hit", "insurance", "hospital",
+    "crash", "collision", "rear-ended", "hit", "hospital",
     "ambulance", "pain", "wreck", "car accident", "auto accident",
     "motorcycle", "pedestrian", "slip", "fall", "fell",
     "workplace", "work injury", "on the job", "workers comp",
