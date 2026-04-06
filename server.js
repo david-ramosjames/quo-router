@@ -667,7 +667,13 @@ function isExistingClient(phoneNumber) {
 // Lead = anyone seeking ANY type of legal help
 // Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
 // Existing clients (contact with case number) are NOT leads
-function classifyLead(payload, phoneFrom, phoneTo) {
+function classifyLead(payload, phoneFrom, phoneTo, cached) {
+  // Outbound calls from our lines are never leads (we're calling out, not receiving an inquiry)
+  if (PHONE_LINES[phoneFrom] && cached?.direction === "outgoing") {
+    console.log(`[lead] Skipping — outbound call from ${phoneFrom}`);
+    return { isLead: false, isQualified: false, label: "No" };
+  }
+
   // If either party is an existing client, not a lead
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
@@ -849,7 +855,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const { isLead, isQualified, label: leadLabel } = classifyLead(payload, from, to);
+    const { isLead, isQualified, label: leadLabel } = classifyLead(payload, from, to, cached);
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
