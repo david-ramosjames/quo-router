@@ -350,15 +350,53 @@ function lastTenDigits(phone) {
   return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
+// Build a single searchable string from a Slack message (text + attachments + blocks)
+function getFullMessageText(msg) {
+  let parts = [msg.text || ""];
+
+  // Attachments (used by Zapier, CallRail, etc.)
+  if (msg.attachments) {
+    for (const att of msg.attachments) {
+      parts.push(att.text || "", att.fallback || "", att.pretext || "", att.title || "");
+      if (att.fields) {
+        for (const f of att.fields) {
+          parts.push(f.title || "", f.value || "");
+        }
+      }
+    }
+  }
+
+  // Blocks (Slack Block Kit)
+  if (msg.blocks) {
+    for (const block of msg.blocks) {
+      if (block.text?.text) parts.push(block.text.text);
+      if (block.fields) {
+        for (const f of block.fields) {
+          parts.push(f.text || "");
+        }
+      }
+      // Section accessories, context elements
+      if (block.elements) {
+        for (const el of block.elements) {
+          parts.push(el.text || el.value || "");
+          if (el.text?.text) parts.push(el.text.text);
+        }
+      }
+    }
+  }
+
+  return parts.join(" ");
+}
+
 function searchChannelHistoryForPhone(messages, phoneNumber) {
   const last10 = lastTenDigits(phoneNumber);
   const normalized = normalizePhone(phoneNumber);
   if (!last10) return null;
 
   for (const msg of messages) {
-    const msgText = msg.text || "";
+    const fullText = getFullMessageText(msg);
     // Extract all digit sequences from the message and check for match
-    const msgDigits = msgText.match(/\d{7,}/g) || [];
+    const msgDigits = fullText.match(/\d{7,}/g) || [];
     for (const seq of msgDigits) {
       const seqLast10 = seq.length >= 10 ? seq.slice(-10) : seq;
       if (seqLast10 === last10) {
@@ -367,7 +405,7 @@ function searchChannelHistoryForPhone(messages, phoneNumber) {
       }
     }
     // Also check raw string includes
-    if (msgText.includes(phoneNumber) || msgText.includes(normalized) || msgText.includes(last10)) {
+    if (fullText.includes(phoneNumber) || fullText.includes(normalized) || fullText.includes(last10)) {
       console.log(`[lead-thread] Found string match in message (ts: ${msg.thread_ts || msg.ts})`);
       return msg.thread_ts || msg.ts;
     }
