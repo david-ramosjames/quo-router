@@ -84,6 +84,46 @@ function getContactName(phoneNumber) {
   return contactsCache.get(phoneNumber) || null;
 }
 
+// --- Quo Users Cache ---
+const quoUsersCache = new Map(); // quoUserId → name
+const QUO_USERS_REFRESH_INTERVAL = 30 * 60 * 1000;
+
+async function loadQuoUsers() {
+  if (!QUO_API_KEY) return;
+
+  console.log("[quo-users] Fetching users from Quo API...");
+  try {
+    const res = await fetch("https://api.openphone.com/v1/users", {
+      headers: { Authorization: QUO_API_KEY },
+    });
+
+    if (!res.ok) {
+      console.error(`[quo-users] Quo API responded ${res.status}: ${await res.text()}`);
+      return;
+    }
+
+    const json = await res.json();
+    const users = json.data || [];
+    quoUsersCache.clear();
+
+    for (const user of users) {
+      const name = [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+      if (user.id && name) {
+        quoUsersCache.set(user.id, name);
+      }
+    }
+
+    console.log(`[quo-users] Loaded ${quoUsersCache.size} users`);
+  } catch (err) {
+    console.error("[quo-users] Error fetching users:", err.message);
+  }
+}
+
+function getQuoUserName(userId) {
+  if (!userId) return null;
+  return quoUsersCache.get(userId) || null;
+}
+
 // --- Slack Channels + Users Cache ---
 const slackChannels = new Map(); // channelName → { id, topic }
 const slackUsers = new Map(); // lowercaseDisplayName → userId
@@ -756,23 +796,41 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "prescription", "refill", "lab results",
   ];
 
-  // Insurance company / adjuster signals — these callers are not leads
-  const insuranceCompanySignals = [
+  // Insurance company / adjuster signals — check against CONTACT NAME only, not summary text
+  // (Leads often mention insurance companies in their story)
+  const insuranceCompanyNames = [
     "state farm", "usaa", "nationwide", "allstate", "geico", "progressive",
     "liberty mutual", "farmers insurance", "travelers", "hartford",
     "american family", "erie insurance", "safeco", "kemper",
     "mercury insurance", "bristol west", "mapfre", "the general",
     "root insurance", "lemonade", "metlife auto", "amica",
     "csaa", "aaa insurance", "esurance", "elephant insurance",
+  ];
+
+  // Check if the external party's contact name matches an insurance company
+  for (const phone of phones) {
+    if (PHONE_LINES[phone]) continue;
+    const contactName = getContactName(phone);
+    if (contactName) {
+      const nameLower = contactName.toLowerCase();
+      if (insuranceCompanyNames.some((s) => nameLower.includes(s))) {
+        console.log(`[lead] Skipping — insurance company contact: ${contactName}`);
+        return { isLead: false, isQualified: false, label: "No (Insurance)" };
+      }
+    }
+  }
+
+  // Adjuster/insurance-call signals — these ARE checked in summary text
+  // (these indicate the CALLER is from an insurance company, not just mentioning one)
+  const insuranceCallerSignals = [
     "adjuster", "claims adjuster", "claims representative", "claims department",
-    "claim number", "policy number", "filed a claim", "insurance adjuster",
     "calling from insurance", "calling about a claim", "regarding a claim",
     "subrogation", "insurance company calling",
   ];
 
-  const hasInsurance = insuranceCompanySignals.some((s) => text.includes(s));
-  if (hasInsurance) {
-    console.log(`[lead] Skipping — insurance company/adjuster signal detected`);
+  const hasInsuranceCaller = insuranceCallerSignals.some((s) => text.includes(s));
+  if (hasInsuranceCaller) {
+    console.log(`[lead] Skipping — insurance caller signal in text`);
     return { isLead: false, isQualified: false, label: "No (Insurance)" };
   }
 
@@ -956,7 +1014,9 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      text = `🧑 *Human Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
+      const handlerName = getQuoUserName(cached?.userId);
+      const handlerLine = handlerName ? `\nHandled By: ${handlerName}` : "";
+      text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
@@ -984,11 +1044,12 @@ app.listen(PORT, () => {
 });
 
 // Load caches in background — routes work without them (just no contact names/case channels)
-Promise.all([loadQuoContacts(), loadSlackChannels(), loadSlackUsers()]).then(() => {
+Promise.all([loadQuoContacts(), loadQuoUsers(), loadSlackChannels(), loadSlackUsers()]).then(() => {
   console.log("[startup] All caches loaded");
 });
 
 // Refresh caches periodically (staggered to avoid API bursts)
 setInterval(loadQuoContacts, 10 * 60 * 1000);
+setInterval(loadQuoUsers, QUO_USERS_REFRESH_INTERVAL);
 setInterval(loadSlackChannels, 15 * 60 * 1000);
 setInterval(loadSlackUsers, 30 * 60 * 1000);
