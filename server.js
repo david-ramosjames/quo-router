@@ -678,17 +678,33 @@ function isExistingClient(phoneNumber) {
   return !!extractCaseNumber(contactName);
 }
 
+// Check if a phone number belongs to a known business/vendor contact
+// (has a contact name but no case number — e.g. "USAA", "State Farm", "Dr. Smith")
+function isKnownBusiness(phoneNumber) {
+  const contactName = getContactName(phoneNumber);
+  if (!contactName) return false;
+  // If it has a case number, it's a client not a business
+  if (extractCaseNumber(contactName)) return false;
+  // Contact exists without a case number = known business/vendor
+  return true;
+}
+
 // Lead = anyone seeking ANY type of legal help
 // Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
 // Existing clients (contact with case number) are NOT leads
+// Known businesses/vendors in contacts are NOT leads
 function classifyLead(payload, phoneFrom, phoneTo, cached) {
-  // If either party is an existing client, not a lead
+  // If either party is an existing client or known business, not a lead
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
     if (PHONE_LINES[phone]) continue; // skip our own lines
     if (isExistingClient(phone)) {
       console.log(`[lead] Skipping — existing client: ${getContactName(phone)}`);
       return { isLead: false, isQualified: false, label: "No (Existing Client)" };
+    }
+    if (isKnownBusiness(phone)) {
+      console.log(`[lead] Skipping — known business: ${getContactName(phone)}`);
+      return { isLead: false, isQualified: false, label: "No" };
     }
   }
 
