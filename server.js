@@ -343,11 +343,40 @@ async function postViaBot(channelId, text) {
 
 // --- Lead-calls threading ---
 
-async function findThreadByPhone(phoneNumber) {
-  if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID || !phoneNumber) return null;
+// Extract the last 10 digits of a phone number for flexible matching
+function lastTenDigits(phone) {
+  if (!phone) return "";
+  const digits = phone.replace(/\D/g, "");
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
 
+function searchChannelHistoryForPhone(messages, phoneNumber) {
+  const last10 = lastTenDigits(phoneNumber);
   const normalized = normalizePhone(phoneNumber);
-  if (!normalized) return null;
+  if (!last10) return null;
+
+  for (const msg of messages) {
+    const msgText = msg.text || "";
+    // Extract all digit sequences from the message and check for match
+    const msgDigits = msgText.match(/\d{7,}/g) || [];
+    for (const seq of msgDigits) {
+      const seqLast10 = seq.length >= 10 ? seq.slice(-10) : seq;
+      if (seqLast10 === last10) {
+        console.log(`[lead-thread] Found phone match in message (ts: ${msg.thread_ts || msg.ts})`);
+        return msg.thread_ts || msg.ts;
+      }
+    }
+    // Also check raw string includes
+    if (msgText.includes(phoneNumber) || msgText.includes(normalized) || msgText.includes(last10)) {
+      console.log(`[lead-thread] Found string match in message (ts: ${msg.thread_ts || msg.ts})`);
+      return msg.thread_ts || msg.ts;
+    }
+  }
+  return null;
+}
+
+async function fetchLeadChannelHistory() {
+  if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID) return [];
 
   try {
     const url = new URL("https://slack.com/api/conversations.history");
@@ -363,22 +392,34 @@ async function findThreadByPhone(phoneNumber) {
     const json = await res.json();
     if (!json.ok) {
       console.error(`[lead-thread] Slack API error: ${json.error}`);
-      return null;
+      return [];
     }
-
-    for (const msg of json.messages || []) {
-      const msgText = msg.text || "";
-      if (msgText.includes(phoneNumber) || msgText.includes(normalized)) {
-        console.log(`[lead-thread] Found matching message for ${phoneNumber} (ts: ${msg.thread_ts || msg.ts})`);
-        return msg.thread_ts || msg.ts;
-      }
-    }
-
-    return null;
+    return json.messages || [];
   } catch (err) {
-    console.error("[lead-thread] Error:", err.message);
-    return null;
+    console.error("[lead-thread] Error fetching history:", err.message);
+    return [];
   }
+}
+
+async function findThreadByPhone(phoneNumber) {
+  if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID || !phoneNumber) return null;
+
+  // First attempt
+  let messages = await fetchLeadChannelHistory();
+  let threadTs = searchChannelHistoryForPhone(messages, phoneNumber);
+  if (threadTs) return threadTs;
+
+  // Race condition: CallRail/Meta/Website may post at nearly the same time
+  // Wait 5 seconds and try again
+  console.log(`[lead-thread] No thread found for ${phoneNumber}, retrying in 5s...`);
+  await new Promise((r) => setTimeout(r, 5000));
+
+  messages = await fetchLeadChannelHistory();
+  threadTs = searchChannelHistoryForPhone(messages, phoneNumber);
+  if (threadTs) return threadTs;
+
+  console.log(`[lead-thread] No thread found for ${phoneNumber} after retry`);
+  return null;
 }
 
 async function postLeadToSlack(text, phoneNumber) {
