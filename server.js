@@ -784,6 +784,10 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "wrong number", "spam", "sales", "job", "employment",
     "recruiting", "vendor", "marketing", "existing client",
     "soliciting", "cold call",
+    // Sales / media / press — not legal leads
+    "regarding an article", "about an article", "write an article",
+    "interview", "press inquiry", "media inquiry", "journalist",
+    "editor of", "reporter", "business journal", "publication",
     // Medical providers / automated phone systems — not leads
     "automated message", "automated system", "phone tree",
     "press 1", "press 2", "press one", "press two",
@@ -837,11 +841,13 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "from root insurance", "from lemonade", "from amica",
     "from esurance", "from elephant insurance", "from metlife",
     "regarding client", "regarding a client",
+    "partial demand", "demand package", "respond to the demand",
+    "received the demand",
   ];
 
   const hasInsuranceCaller = insuranceCallerSignals.some((s) => text.includes(s));
-  // Also catch "from [X] insurance" pattern dynamically
-  const fromInsurancePattern = /from\s+\w+(\s+\w+)?\s+insurance/i.test(text);
+  // Also catch "from/at [X] insurance" patterns dynamically
+  const fromInsurancePattern = /(?:from|at)\s+\w+(\s+\w+)?\s+insurance/i.test(text);
   if (hasInsuranceCaller || fromInsurancePattern) {
     console.log(`[lead] Skipping — insurance caller signal in text`);
     return { isLead: false, isQualified: false, label: "No (Insurance)" };
@@ -1050,8 +1056,10 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      const handlerName = getQuoUserName(cached?.userId);
-      console.log(`[call-summary] Handler lookup: userId=${cached?.userId}, name=${handlerName || "not found"}, cache size=${quoUsersCache.size}`);
+      // answeredBy = actual person who picked up; userId = phone number owner
+      const answeredById = cached?.answeredBy;
+      const handlerName = getQuoUserName(answeredById) || getQuoUserName(cached?.userId);
+      console.log(`[call-summary] Handler lookup: answeredBy=${answeredById}, userId=${cached?.userId}, resolved=${handlerName || "not found"}, cache size=${quoUsersCache.size}`);
       const handlerLine = handlerName ? `\nHandled By: *${handlerName}*` : "";
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
@@ -1060,7 +1068,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 
     // Send ALL leads (qualified or not) to #lead-calls
     if (isLead) {
-      const handlerDisplay = sona ? "Sona" : (getQuoUserName(cached?.userId) || "Human");
+      const handlerDisplay = sona ? "Sona" : (getQuoUserName(cached?.answeredBy) || getQuoUserName(cached?.userId) || "Human");
       const handledBy = handlerDisplay;
       const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
