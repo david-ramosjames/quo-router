@@ -416,26 +416,37 @@ function searchChannelHistoryForPhone(messages, phoneNumber) {
 async function fetchLeadChannelHistory() {
   if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID) return [];
 
+  const allMessages = [];
+  const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+  let cursor = "";
+
   try {
-    const url = new URL("https://slack.com/api/conversations.history");
-    url.searchParams.set("channel", SLACK_LEAD_CALLS_CHANNEL_ID);
-    url.searchParams.set("limit", "200");
-    const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
-    url.searchParams.set("oldest", String(sevenDaysAgo));
+    do {
+      const url = new URL("https://slack.com/api/conversations.history");
+      url.searchParams.set("channel", SLACK_LEAD_CALLS_CHANNEL_ID);
+      url.searchParams.set("limit", "200");
+      url.searchParams.set("oldest", String(sevenDaysAgo));
+      if (cursor) url.searchParams.set("cursor", cursor);
 
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-    });
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      });
 
-    const json = await res.json();
-    if (!json.ok) {
-      console.error(`[lead-thread] Slack API error: ${json.error}`);
-      return [];
-    }
-    return json.messages || [];
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[lead-thread] Slack API error: ${json.error}`);
+        break;
+      }
+
+      allMessages.push(...(json.messages || []));
+      cursor = json.response_metadata?.next_cursor || "";
+    } while (cursor);
+
+    console.log(`[lead-thread] Fetched ${allMessages.length} total messages from #lead-calls (7 days)`);
+    return allMessages;
   } catch (err) {
     console.error("[lead-thread] Error fetching history:", err.message);
-    return [];
+    return allMessages;
   }
 }
 
@@ -447,16 +458,6 @@ async function findThreadByPhone(phoneNumber) {
 
   // First attempt
   let messages = await fetchLeadChannelHistory();
-  console.log(`[lead-thread] Fetched ${messages.length} messages from #lead-calls`);
-
-  // Debug: log first few messages to see their structure
-  for (const msg of messages.slice(0, 3)) {
-    const fullText = getFullMessageText(msg);
-    const hasAttachments = msg.attachments ? msg.attachments.length : 0;
-    const hasBlocks = msg.blocks ? msg.blocks.length : 0;
-    console.log(`[lead-thread] Message ts:${msg.ts} | textLen:${(msg.text||'').length} | attachments:${hasAttachments} | blocks:${hasBlocks} | fullTextLen:${fullText.length}`);
-  }
-
   let threadTs = searchChannelHistoryForPhone(messages, phoneNumber);
   if (threadTs) return threadTs;
 
