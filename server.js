@@ -788,6 +788,12 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "regarding an article", "about an article", "write an article",
     "interview", "press inquiry", "media inquiry", "journalist",
     "editor of", "reporter", "business journal", "publication",
+    // Other law firms / legal vendors — case management, not new leads
+    "legal group", "law group", "law office", "law offices",
+    "mediation", "mediator", "arbitration",
+    "opposing counsel", "co-counsel", "other counsel",
+    "regarding their client", "for their client",
+    "reschedule", "rescheduled",
     // Medical providers / automated phone systems — not leads
     "automated message", "automated system", "phone tree",
     "press 1", "press 2", "press one", "press two",
