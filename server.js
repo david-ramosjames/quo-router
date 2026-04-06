@@ -305,10 +305,20 @@ async function postToSlack(webhookUrl, text) {
     return;
   }
   try {
+    // Use blocks with mrkdwn so bold/formatting works via webhooks
+    const payload = {
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text },
+        },
+      ],
+      text, // fallback for notifications
+    };
     const res = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       console.error(`Slack responded ${res.status}: ${await res.text()}`);
