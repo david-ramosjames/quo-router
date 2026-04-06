@@ -1049,7 +1049,8 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 
     // Send ALL leads (qualified or not) to #lead-calls
     if (isLead) {
-      const handledBy = sona ? "Sona" : "Human";
+      const handlerDisplay = sona ? "Sona" : (getQuoUserName(cached?.userId) || "Human");
+      const handledBy = handlerDisplay;
       const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       await postLeadToSlack(leadText, from, to);
