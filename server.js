@@ -13,6 +13,7 @@ const SLACK_SONA_CALLS_WEBHOOK_URL = process.env.SLACK_SONA_CALLS_WEBHOOK_URL;
 const SLACK_LEAD_CALLS_WEBHOOK_URL = process.env.SLACK_LEAD_CALLS_WEBHOOK_URL;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_LEAD_CALLS_CHANNEL_ID = process.env.SLACK_LEAD_CALLS_CHANNEL_ID;
+const SLACK_LEGAL_ASSISTANT_WEBHOOK_URL = process.env.SLACK_LEGAL_ASSISTANT_WEBHOOK_URL;
 
 // --- Phone line mapping ---
 const PHONE_LINES = {
@@ -872,6 +873,18 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
   return { isLead: false, isQualified: false, label: "No" };
 }
 
+// Check if inbound event should go to #legalassistant-phone
+// Routes inbound items that are NOT leads, NOT existing clients, NOT known businesses
+function shouldRouteToLegalAssistant(phoneFrom, phoneTo) {
+  const phones = [phoneFrom, phoneTo].filter(Boolean);
+  for (const phone of phones) {
+    if (PHONE_LINES[phone]) continue; // skip our own lines
+    if (isExistingClient(phone)) return false; // already routes to case channel
+    if (isKnownBusiness(phone)) return false; // not actionable
+  }
+  return true;
+}
+
 // --- Routes ---
 
 app.get("/", (_req, res) => {
@@ -916,6 +929,12 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay} (media: ${media.length})`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
     console.log("[messages] Sent to #text-messages");
+
+    // Route inbound texts to #legalassistant-phone (not outbound, not clients, not businesses)
+    if (!isOutbound && shouldRouteToLegalAssistant(from, to)) {
+      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      console.log("[messages] ALSO sent to #legalassistant-phone");
+    }
 
     // Post to case channel if applicable
     await postToCaseChannel(text, from, to);
@@ -972,6 +991,12 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     console.log(`[calls] Missed call from: ${fromDisplay}`);
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
+
+    // Route to #legalassistant-phone (not clients, not businesses)
+    if (shouldRouteToLegalAssistant(from, to)) {
+      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      console.log("[calls] ALSO sent to #legalassistant-phone");
+    }
 
     // Post to case channel if applicable
     await postToCaseChannel(text, from, to);
@@ -1030,6 +1055,13 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       await postLeadToSlack(leadText, from, to);
       console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
+    }
+
+    // Route inbound non-lead calls to #legalassistant-phone
+    const callDirection = cached?.direction || "";
+    if (!isLead && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
+      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      console.log("[call-summary] ALSO sent to #legalassistant-phone");
     }
 
     // Post to case channel if applicable
