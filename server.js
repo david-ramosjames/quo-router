@@ -422,10 +422,20 @@ async function findThreadByPhone(phoneNumber) {
   return null;
 }
 
-async function postLeadToSlack(text, phoneNumber) {
+async function postLeadToSlack(text, phoneFrom, phoneTo) {
   if (SLACK_BOT_TOKEN && SLACK_LEAD_CALLS_CHANNEL_ID) {
     try {
-      const threadTs = await findThreadByPhone(phoneNumber);
+      // Search for thread matching either the from or to number
+      const phones = [phoneFrom, phoneTo].filter(Boolean);
+      let threadTs = null;
+
+      for (const phone of phones) {
+        // Skip our own phone lines — only search for the external party
+        if (PHONE_LINES[phone]) continue;
+        threadTs = await findThreadByPhone(phone);
+        if (threadTs) break;
+      }
+
       const body = { channel: SLACK_LEAD_CALLS_CHANNEL_ID, text };
       if (threadTs) {
         body.thread_ts = threadTs;
@@ -812,7 +822,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       const handledBy = sona ? "Sona" : "Human";
       const qualTag = isQualified ? "🔥 Qualified Lead Call" : "📋 Lead Call";
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
-      await postLeadToSlack(leadText, from);
+      await postLeadToSlack(leadText, from, to);
       console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
     }
 
