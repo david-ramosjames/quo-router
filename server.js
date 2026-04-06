@@ -403,24 +403,37 @@ function searchChannelHistoryForPhone(messages, phoneNumber) {
   const normalized = normalizePhone(phoneNumber);
   if (!last10) return null;
 
+  // Find ALL matching messages, then return the earliest (oldest) one
+  const matches = [];
+
   for (const msg of messages) {
     const fullText = getFullMessageText(msg);
+    let found = false;
     // Extract all digit sequences from the message and check for match
     const msgDigits = fullText.match(/\d{7,}/g) || [];
     for (const seq of msgDigits) {
       const seqLast10 = seq.length >= 10 ? seq.slice(-10) : seq;
       if (seqLast10 === last10) {
-        console.log(`[lead-thread] Found phone match in message (ts: ${msg.thread_ts || msg.ts})`);
-        return msg.thread_ts || msg.ts;
+        found = true;
+        break;
       }
     }
     // Also check raw string includes
-    if (fullText.includes(phoneNumber) || fullText.includes(normalized) || fullText.includes(last10)) {
-      console.log(`[lead-thread] Found string match in message (ts: ${msg.thread_ts || msg.ts})`);
-      return msg.thread_ts || msg.ts;
+    if (!found && (fullText.includes(phoneNumber) || fullText.includes(normalized) || fullText.includes(last10))) {
+      found = true;
+    }
+    if (found) {
+      const ts = msg.thread_ts || msg.ts;
+      matches.push(ts);
     }
   }
-  return null;
+
+  if (matches.length === 0) return null;
+
+  // Return the earliest (smallest timestamp) — first mention of this phone number
+  matches.sort((a, b) => parseFloat(a) - parseFloat(b));
+  console.log(`[lead-thread] Found ${matches.length} messages with phone match, using earliest (ts: ${matches[0]})`);
+  return matches[0];
 }
 
 async function fetchLeadChannelHistory() {
