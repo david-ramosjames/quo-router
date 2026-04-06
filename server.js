@@ -1017,7 +1017,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     } else {
       const handlerName = getQuoUserName(cached?.userId);
       console.log(`[call-summary] Handler lookup: userId=${cached?.userId}, name=${handlerName || "not found"}, cache size=${quoUsersCache.size}`);
-      const handlerLine = handlerName ? `\nHandled By: ${handlerName}` : "";
+      const handlerLine = handlerName ? `\nHandled By: *${handlerName}*` : "";
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
