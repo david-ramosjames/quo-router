@@ -464,6 +464,14 @@ function searchChannelHistoryForPhone(messages, phoneNumber) {
     if (!found && (fullText.includes(phoneNumber) || fullText.includes(normalized) || fullText.includes(last10))) {
       found = true;
     }
+    // Also strip ALL non-digits from the text and search for last10
+    // Catches formatted numbers like "+1 956-252-6478" where digits are split by dashes/spaces
+    if (!found) {
+      const strippedDigits = fullText.replace(/\D/g, "");
+      if (strippedDigits.includes(last10)) {
+        found = true;
+      }
+    }
     if (found) {
       const ts = msg.thread_ts || msg.ts;
       matches.push(ts);
@@ -582,6 +590,50 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
   } else {
     await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
   }
+}
+
+// Thread any event into #lead-calls if the phone number matches an existing post
+async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
+  if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID) return false;
+
+  const phones = [phoneFrom, phoneTo].filter(Boolean);
+  let threadTs = null;
+
+  for (const phone of phones) {
+    if (PHONE_LINES[phone]) continue;
+    // Quick search — no retry since this is supplementary routing
+    const messages = await fetchLeadChannelHistory();
+    threadTs = searchChannelHistoryForPhone(messages, phone);
+    if (threadTs) break;
+  }
+
+  if (!threadTs) return false;
+
+  try {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        channel: SLACK_LEAD_CALLS_CHANNEL_ID,
+        text,
+        thread_ts: threadTs,
+      }),
+    });
+
+    const json = await res.json();
+    if (json.ok) {
+      console.log(`[lead-thread] Threaded event in #lead-calls (ts: ${threadTs})`);
+      return true;
+    } else {
+      console.error(`[lead-thread] Slack API error: ${json.error}`);
+    }
+  } catch (err) {
+    console.error("[lead-thread] Error:", err.message);
+  }
+  return false;
 }
 
 // --- Case Channel Routing ---
@@ -958,6 +1010,9 @@ app.post("/webhooks/quo/messages", async (req, res) => {
       console.log("[messages] ALSO sent to #legalassistant-phone");
     }
 
+    // Thread in #lead-calls if phone matches an existing lead post
+    await threadInLeadChannelIfMatch(text, from, to);
+
     // Post to case channel if applicable
     await postToCaseChannel(text, from, to);
   } catch (err) {
@@ -1019,6 +1074,9 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
       console.log("[calls] ALSO sent to #legalassistant-phone");
     }
+
+    // Thread in #lead-calls if phone matches an existing lead post
+    await threadInLeadChannelIfMatch(text, from, to);
 
     // Post to case channel if applicable
     await postToCaseChannel(text, from, to);
@@ -1087,6 +1145,11 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     if (!isLead && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
       await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
       console.log("[call-summary] ALSO sent to #legalassistant-phone");
+    }
+
+    // Thread in #lead-calls if phone matches an existing lead post (non-leads only; leads already thread)
+    if (!isLead) {
+      await threadInLeadChannelIfMatch(text, from, to);
     }
 
     // Post to case channel if applicable
