@@ -793,7 +793,7 @@ app.post("/webhooks/quo/messages", async (req, res) => {
     // Translate if Spanish
     const translation = await appendTranslation(body);
 
-    const text = `${emoji} ${label}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${mediaSection}${translation}`;
+    const text = `${emoji} *${label}*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}${mediaSection}${translation}`;
 
     console.log(`[messages] From: ${fromDisplay} → To: ${toDisplay} (media: ${media.length})`);
     await postToSlack(SLACK_TEXT_MESSAGES_WEBHOOK_URL, text);
@@ -845,7 +845,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
-    let text = `📞 Missed Call / Voicemail\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
+    let text = `📞 *Missed Call / Voicemail*\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
@@ -893,11 +893,11 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
     let text;
     if (sona) {
-      text = `🤖 Sona Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
+      text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
-      text = `🧑 Human Call Completed\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
+      text = `🧑 *Human Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
     }
@@ -905,7 +905,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     // Send ALL leads (qualified or not) to #lead-calls
     if (isLead) {
       const handledBy = sona ? "Sona" : "Human";
-      const qualTag = isQualified ? "🔥 Qualified Lead Call" : "📋 Lead Call";
+      const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       await postLeadToSlack(leadText, from, to);
       console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
