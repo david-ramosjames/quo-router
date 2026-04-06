@@ -442,8 +442,21 @@ async function fetchLeadChannelHistory() {
 async function findThreadByPhone(phoneNumber) {
   if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID || !phoneNumber) return null;
 
+  const last10 = lastTenDigits(phoneNumber);
+  console.log(`[lead-thread] Searching for phone ${phoneNumber} (last10: ${last10})`);
+
   // First attempt
   let messages = await fetchLeadChannelHistory();
+  console.log(`[lead-thread] Fetched ${messages.length} messages from #lead-calls`);
+
+  // Debug: log first few messages to see their structure
+  for (const msg of messages.slice(0, 3)) {
+    const fullText = getFullMessageText(msg);
+    const hasAttachments = msg.attachments ? msg.attachments.length : 0;
+    const hasBlocks = msg.blocks ? msg.blocks.length : 0;
+    console.log(`[lead-thread] Message ts:${msg.ts} | textLen:${(msg.text||'').length} | attachments:${hasAttachments} | blocks:${hasBlocks} | fullTextLen:${fullText.length}`);
+  }
+
   let threadTs = searchChannelHistoryForPhone(messages, phoneNumber);
   if (threadTs) return threadTs;
 
@@ -668,12 +681,6 @@ function isExistingClient(phoneNumber) {
 // Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
 // Existing clients (contact with case number) are NOT leads
 function classifyLead(payload, phoneFrom, phoneTo, cached) {
-  // Outbound calls from our lines are never leads (we're calling out, not receiving an inquiry)
-  if (PHONE_LINES[phoneFrom] && cached?.direction === "outgoing") {
-    console.log(`[lead] Skipping — outbound call from ${phoneFrom}`);
-    return { isLead: false, isQualified: false, label: "No" };
-  }
-
   // If either party is an existing client, not a lead
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
