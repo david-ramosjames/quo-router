@@ -874,13 +874,12 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
 }
 
 // Check if inbound event should go to #legalassistant-phone
-// Routes inbound items that are NOT leads, NOT existing clients, NOT known businesses
+// Routes inbound items that are NOT leads, NOT existing clients
 function shouldRouteToLegalAssistant(phoneFrom, phoneTo) {
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
     if (PHONE_LINES[phone]) continue; // skip our own lines
     if (isExistingClient(phone)) return false; // already routes to case channel
-    if (isKnownBusiness(phone)) return false; // not actionable
   }
   return true;
 }
