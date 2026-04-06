@@ -711,6 +711,8 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
   const text = extractText(payload);
   if (!text) return { isLead: false, isQualified: false, label: "No" };
 
+  console.log(`[lead] Analyzing text (${text.length} chars): "${text.slice(0, 150)}..."`);
+
   const negativeSignals = [
     "wrong number", "spam", "sales", "job", "employment",
     "recruiting", "vendor", "marketing", "existing client",
