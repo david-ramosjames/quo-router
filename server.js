@@ -546,10 +546,11 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
 
 function extractCaseNumber(contactName) {
   if (!contactName) return null;
-  // Match "Name 1234" pattern — case number at end
-  const match = contactName.match(/^(.+?)\s+(\d{3,})$/);
+  // Match a 3+ digit case number in the contact name
+  // e.g. "Barbara Glass 1281", "Wendy Veal 946 New Phone", "Elmer Ramirez Brother 1403"
+  const match = contactName.match(/\b(\d{3,5})\b/);
   if (!match) return null;
-  return match[2];
+  return match[1];
 }
 
 function findChannelByCaseNumber(caseNumber) {
@@ -626,6 +627,7 @@ async function postToCaseChannel(text, phoneFrom, phoneTo) {
   for (const phone of phones) {
     const contactName = getContactName(phone);
     const caseNumber = extractCaseNumber(contactName);
+    console.log(`[case-channel] Phone: ${phone}, Contact: ${contactName || "none"}, Case#: ${caseNumber || "none"}`);
     if (!caseNumber) continue;
 
     // Try to find channel by case number
