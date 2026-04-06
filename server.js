@@ -108,6 +108,7 @@ async function loadQuoUsers() {
 
     for (const user of users) {
       const name = [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+      console.log(`[quo-users] User: id=${user.id}, name="${name}", email=${user.email || "N/A"}`);
       if (user.id && name) {
         quoUsersCache.set(user.id, name);
       }
@@ -1015,6 +1016,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       console.log("[call-summary] Sent to #sona-calls");
     } else {
       const handlerName = getQuoUserName(cached?.userId);
+      console.log(`[call-summary] Handler lookup: userId=${cached?.userId}, name=${handlerName || "not found"}, cache size=${quoUsersCache.size}`);
       const handlerLine = handlerName ? `\nHandled By: ${handlerName}` : "";
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
