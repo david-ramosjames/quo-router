@@ -742,6 +742,18 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     "wrong number", "spam", "sales", "job", "employment",
     "recruiting", "vendor", "marketing", "existing client",
     "soliciting", "cold call",
+    // Medical providers / automated phone systems — not leads
+    "automated message", "automated system", "phone tree",
+    "press 1", "press 2", "press one", "press two",
+    "scheduling evaluations", "making payments", "medical records request",
+    "recorded for quality", "training purposes",
+    "physiotherapy", "physical therapy", "chiropractic", "chiropractor",
+    "radiology", "imaging center", "diagnostic", "diagnostics",
+    "pharmacy", "dentist", "dental", "optometrist", "dermatology",
+    "urgent care", "clinic calling", "doctor's office",
+    "medical provider", "healthcare provider",
+    "appointment reminder", "appointment confirmation", "schedule an appointment",
+    "prescription", "refill", "lab results",
   ];
 
   // Insurance company / adjuster signals — these callers are not leads
