@@ -14,6 +14,7 @@ const SLACK_LEAD_CALLS_WEBHOOK_URL = process.env.SLACK_LEAD_CALLS_WEBHOOK_URL;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_LEAD_CALLS_CHANNEL_ID = process.env.SLACK_LEAD_CALLS_CHANNEL_ID;
 const SLACK_LEGAL_ASSISTANT_WEBHOOK_URL = process.env.SLACK_LEGAL_ASSISTANT_WEBHOOK_URL;
+const SLACK_LEGAL_ASSISTANT_CHANNEL_ID = process.env.SLACK_LEGAL_ASSISTANT_CHANNEL_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // --- Phone line mapping ---
@@ -637,6 +638,89 @@ async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
   return false;
 }
 
+// Fetch recent #legalassistant-phone history (7 days, paginated)
+async function fetchLegalAssistantHistory() {
+  if (!SLACK_BOT_TOKEN || !SLACK_LEGAL_ASSISTANT_CHANNEL_ID) return [];
+
+  const allMessages = [];
+  const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+  let cursor = "";
+
+  try {
+    do {
+      const url = new URL("https://slack.com/api/conversations.history");
+      url.searchParams.set("channel", SLACK_LEGAL_ASSISTANT_CHANNEL_ID);
+      url.searchParams.set("limit", "200");
+      url.searchParams.set("oldest", String(sevenDaysAgo));
+      if (cursor) url.searchParams.set("cursor", cursor);
+
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      });
+
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[la-thread] Slack API error: ${json.error}`);
+        break;
+      }
+
+      allMessages.push(...(json.messages || []));
+      cursor = json.response_metadata?.next_cursor || "";
+    } while (cursor);
+
+    return allMessages;
+  } catch (err) {
+    console.error("[la-thread] Error fetching history:", err.message);
+    return allMessages;
+  }
+}
+
+// Post to #legalassistant-phone, threading under a prior post if phone number matches
+async function postToLegalAssistant(text, phoneFrom, phoneTo) {
+  // Try to thread via Slack API if bot token + channel ID are configured
+  if (SLACK_BOT_TOKEN && SLACK_LEGAL_ASSISTANT_CHANNEL_ID) {
+    try {
+      const phones = [phoneFrom, phoneTo].filter(Boolean);
+      let threadTs = null;
+
+      const messages = await fetchLegalAssistantHistory();
+      for (const phone of phones) {
+        if (PHONE_LINES[phone]) continue;
+        threadTs = searchChannelHistoryForPhone(messages, phone);
+        if (threadTs) break;
+      }
+
+      const body = { channel: SLACK_LEGAL_ASSISTANT_CHANNEL_ID, text };
+      if (threadTs) {
+        body.thread_ts = threadTs;
+        console.log(`[la-thread] Replying in thread ${threadTs}`);
+      }
+
+      const res = await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      const json = await res.json();
+      if (!json.ok) {
+        console.error(`[la-thread] Slack API error: ${json.error}`);
+        await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      } else {
+        console.log(`[la-thread] Posted via Slack API (threaded: ${!!threadTs})`);
+      }
+      return;
+    } catch (err) {
+      console.error("[la-thread] Error:", err.message);
+    }
+  }
+  // Fallback to webhook
+  await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+}
+
 // --- Case Channel Routing ---
 
 function extractCaseNumber(contactName) {
@@ -965,7 +1049,7 @@ app.post("/webhooks/quo/messages", async (req, res) => {
 
     // Route inbound texts to #legalassistant-phone (not outbound, not clients, not threaded into leads)
     if (!isOutbound && !threadedInLeads && shouldRouteToLegalAssistant(from, to)) {
-      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      await postToLegalAssistant(text, from, to);
       console.log("[messages] ALSO sent to #legalassistant-phone");
     }
 
@@ -1032,7 +1116,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     // and not if it was already threaded in #lead-calls
     const externalPhone = PHONE_LINES[from] ? to : from;
     if (!isExistingClient(externalPhone) && !threadedInLeads) {
-      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      await postToLegalAssistant(text, from, to);
       console.log("[calls] ALSO sent to #legalassistant-phone");
     } else if (threadedInLeads) {
       console.log("[calls] Skipping #legalassistant-phone — threaded in #lead-calls");
@@ -1112,7 +1196,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     // Skip if already in #lead-calls (as a lead or threaded) or if Sona-handled
     const callDirection = cached?.direction || "";
     if (!isLead && !threadedInLeads && !sona && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
-      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      await postToLegalAssistant(text, from, to);
       console.log("[call-summary] ALSO sent to #legalassistant-phone");
     }
 
