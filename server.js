@@ -1025,9 +1025,15 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
 
-    // ALWAYS post missed calls/voicemails to #legalassistant-phone (high urgency)
-    await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
-    console.log("[calls] ALSO sent to #legalassistant-phone");
+    // Post missed calls/voicemails to #legalassistant-phone — but not for existing clients
+    // (those go to case channels and the paralegal handles them there)
+    const externalPhone = PHONE_LINES[from] ? to : from;
+    if (!isExistingClient(externalPhone)) {
+      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+      console.log("[calls] ALSO sent to #legalassistant-phone");
+    } else {
+      console.log("[calls] Skipping #legalassistant-phone — existing client");
+    }
 
     // Thread in #lead-calls if phone matches an existing lead post
     await threadInLeadChannelIfMatch(text, from, to);
@@ -1094,9 +1100,10 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
     }
 
-    // Route inbound non-lead calls to #legalassistant-phone
+    // Route inbound non-lead, non-Sona calls to #legalassistant-phone
+    // (Sona calls are already handled in #sona-calls)
     const callDirection = cached?.direction || "";
-    if (!isLead && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
+    if (!isLead && !sona && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
       await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
       console.log("[call-summary] ALSO sent to #legalassistant-phone");
     }
