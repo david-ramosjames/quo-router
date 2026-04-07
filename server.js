@@ -14,6 +14,7 @@ const SLACK_LEAD_CALLS_WEBHOOK_URL = process.env.SLACK_LEAD_CALLS_WEBHOOK_URL;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_LEAD_CALLS_CHANNEL_ID = process.env.SLACK_LEAD_CALLS_CHANNEL_ID;
 const SLACK_LEGAL_ASSISTANT_WEBHOOK_URL = process.env.SLACK_LEGAL_ASSISTANT_WEBHOOK_URL;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // --- Phone line mapping ---
 const PHONE_LINES = {
@@ -808,11 +809,12 @@ function isKnownBusiness(phoneNumber) {
   return true;
 }
 
-// Lead = anyone seeking ANY type of legal help
-// Qualified Lead = situation the firm may be able to help with (PI, auto, workplace, etc.)
+// Lead = anyone seeking ANY type of legal help that the firm could potentially handle
+// Qualified Lead = situation the firm specializes in (PI, auto, workplace, wrongful death, etc.)
 // Existing clients (contact with case number) are NOT leads
 // Known businesses/vendors in contacts are NOT leads
-function classifyLead(payload, phoneFrom, phoneTo, cached) {
+// Uses Claude Haiku to classify based on call summary text
+async function classifyLead(payload, phoneFrom, phoneTo, cached) {
   // If either party is an existing client or known business, not a lead
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
@@ -823,129 +825,83 @@ function classifyLead(payload, phoneFrom, phoneTo, cached) {
     }
     if (isKnownBusiness(phone)) {
       console.log(`[lead] Skipping — known business: ${getContactName(phone)}`);
-      return { isLead: false, isQualified: false, label: "No" };
+      return { isLead: false, isQualified: false, label: "No (Known Business)" };
     }
   }
 
   const text = extractText(payload);
   if (!text) return { isLead: false, isQualified: false, label: "No" };
 
-  console.log(`[lead] Analyzing text (${text.length} chars): "${text.slice(0, 150)}..."`);
+  // No API key — fall back to "not a lead" rather than mis-classify
+  if (!ANTHROPIC_API_KEY) {
+    console.warn("[lead] ANTHROPIC_API_KEY not set — cannot classify");
+    return { isLead: false, isQualified: false, label: "No (Unclassified)" };
+  }
 
-  const negativeSignals = [
-    "wrong number", "spam", "sales", "job", "employment",
-    "recruiting", "vendor", "marketing", "existing client",
-    "soliciting", "cold call",
-    // Sales / media / press — not legal leads
-    "regarding an article", "about an article", "write an article",
-    "interview", "press inquiry", "media inquiry", "journalist",
-    "editor of", "reporter", "business journal", "publication",
-    // Other law firms / legal vendors — case management, not new leads
-    "legal group", "law group", "law office", "law offices",
-    "mediation", "mediator", "arbitration",
-    "opposing counsel", "co-counsel", "other counsel",
-    "regarding their client", "for their client",
-    "reschedule", "rescheduled",
-    // Medical providers / automated phone systems — not leads
-    "automated message", "automated system", "phone tree",
-    "press 1", "press 2", "press one", "press two",
-    "scheduling evaluations", "making payments", "medical records request",
-    "recorded for quality", "training purposes",
-    "physiotherapy", "physical therapy", "chiropractic", "chiropractor",
-    "radiology", "imaging center", "diagnostic", "diagnostics",
-    "pharmacy", "dentist", "dental", "optometrist", "dermatology",
-    "urgent care", "clinic calling", "doctor's office",
-    "medical provider", "healthcare provider",
-    "appointment reminder", "appointment confirmation", "schedule an appointment",
-    "prescription", "refill", "lab results",
-  ];
+  try {
+    const systemPrompt = `You classify call summaries for a personal injury law firm (Ramos James Law).
 
-  // Insurance company / adjuster signals — check against CONTACT NAME only, not summary text
-  // (Leads often mention insurance companies in their story)
-  const insuranceCompanyNames = [
-    "state farm", "usaa", "nationwide", "allstate", "geico", "progressive",
-    "liberty mutual", "farmers insurance", "travelers", "hartford",
-    "american family", "erie insurance", "safeco", "kemper",
-    "mercury insurance", "bristol west", "mapfre", "the general",
-    "root insurance", "lemonade", "metlife auto", "amica",
-    "csaa", "aaa insurance", "esurance", "elephant insurance",
-  ];
+Classify each call into ONE of these categories:
+- "qualified_lead": A NEW potential client seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury case.
+- "lead": A NEW potential client seeking legal help, but for something OUTSIDE personal injury (family law, divorce, child support, criminal, immigration, etc.) OR a vague legal inquiry.
+- "not_lead": Anything else, including:
+  * Calls about an EXISTING case or existing client (even if the caller mentions injuries, accidents, etc.)
+  * Calls from insurance adjusters / insurance companies (Progressive, USAA, GEICO, State Farm, etc.) about claims, demands, subrogation
+  * Calls from other law firms about case management, mediation, opposing counsel, co-counsel
+  * Calls from medical providers (doctors, clinics, physiotherapy) about appointments, records, payments
+  * Sales calls, marketing, recruiting, vendors
+  * Press / media inquiries
+  * Wrong numbers, spam
+  * Automated phone systems
 
-  // Check if the external party's contact name matches an insurance company
-  for (const phone of phones) {
-    if (PHONE_LINES[phone]) continue;
-    const contactName = getContactName(phone);
-    if (contactName) {
-      const nameLower = contactName.toLowerCase();
-      if (insuranceCompanyNames.some((s) => nameLower.includes(s))) {
-        console.log(`[lead] Skipping — insurance company contact: ${contactName}`);
-        return { isLead: false, isQualified: false, label: "No (Insurance)" };
-      }
+CRITICAL RULES:
+- If the summary mentions "existing case", "their case", "the case", "client [name]", or references an ongoing matter — it's NOT a new lead
+- If the caller is calling FROM an insurance company or law firm (not as a victim) — it's NOT a lead
+- A new lead is someone calling for the FIRST TIME because they need legal help with their own situation
+- If a caller's situation is explicitly outside personal injury (e.g., "child support", "divorce") and the intake explicitly declined them, it's still a "lead" (just not qualified)
+
+Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No explanation.`;
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 10,
+        system: systemPrompt,
+        messages: [{ role: "user", content: `Call summary:\n${text}` }],
+      }),
+    });
+
+    if (!res.ok) {
+      console.error(`[lead] Anthropic API error ${res.status}: ${await res.text()}`);
+      return { isLead: false, isQualified: false, label: "No (API Error)" };
     }
+
+    const json = await res.json();
+    const reply = (json.content?.[0]?.text || "").toLowerCase().trim();
+    console.log(`[lead] LLM classification: "${reply}"`);
+
+    if (reply.includes("qualified_lead")) {
+      return { isLead: true, isQualified: true, label: "🔥 Qualified Lead" };
+    }
+    if (reply.includes("not_lead")) {
+      return { isLead: false, isQualified: false, label: "No" };
+    }
+    if (reply.includes("lead")) {
+      return { isLead: true, isQualified: false, label: "Lead" };
+    }
+
+    console.warn(`[lead] Unexpected LLM response: "${reply}"`);
+    return { isLead: false, isQualified: false, label: "No (Unparseable)" };
+  } catch (err) {
+    console.error("[lead] Classification error:", err.message);
+    return { isLead: false, isQualified: false, label: "No (Error)" };
   }
-
-  // Adjuster/insurance-call signals — these ARE checked in summary text
-  // (these indicate the CALLER is from an insurance company, not just mentioning one)
-  const insuranceCallerSignals = [
-    "adjuster", "claims adjuster", "claims representative", "claims department",
-    "calling from insurance", "calling about a claim", "regarding a claim",
-    "subrogation", "insurance company calling",
-    "insurance called", "insurance is calling",
-    "from progressive insurance", "from state farm", "from usaa",
-    "from nationwide", "from allstate", "from geico", "from liberty mutual",
-    "from farmers insurance", "from travelers", "from hartford",
-    "from american family", "from erie insurance", "from safeco",
-    "from mercury insurance", "from kemper", "from bristol west",
-    "from root insurance", "from lemonade", "from amica",
-    "from esurance", "from elephant insurance", "from metlife",
-    "regarding client", "regarding a client",
-    "partial demand", "demand package", "respond to the demand",
-    "received the demand",
-  ];
-
-  const hasInsuranceCaller = insuranceCallerSignals.some((s) => text.includes(s));
-  // Also catch "from/at [X] insurance" patterns dynamically
-  const fromInsurancePattern = /(?:from|at)\s+\w+(\s+\w+)?\s+insurance/i.test(text);
-  if (hasInsuranceCaller || fromInsurancePattern) {
-    console.log(`[lead] Skipping — insurance caller signal in text`);
-    return { isLead: false, isQualified: false, label: "No (Insurance)" };
-  }
-
-  const hasNegative = negativeSignals.some((s) => text.includes(s));
-  if (hasNegative) return { isLead: false, isQualified: false, label: "No" };
-
-  // Broad lead signals — anyone looking for legal help
-  const leadSignals = [
-    "lawyer", "attorney", "legal", "law firm", "lawsuit", "sue",
-    "case", "claim", "represent", "representation", "consultation",
-    "consult", "help me", "need help", "looking for help",
-    "advice", "rights", "compensation", "damages", "settlement",
-    "negligence", "liability", "fault", "incident", "police report",
-    "medical", "doctor", "treatment", "surgery",
-    "new client", "potential client", "intake",
-    "referral", "referred",
-  ];
-
-  // Qualified lead signals — PI / auto / workplace situations
-  const qualifiedSignals = [
-    "accident", "injury", "injured", "hurt", "truck", "18-wheeler",
-    "crash", "collision", "rear-ended", "hit", "hospital",
-    "ambulance", "pain", "wreck", "car accident", "auto accident",
-    "motorcycle", "pedestrian", "slip", "fall", "fell",
-    "workplace", "work injury", "on the job", "workers comp",
-    "wrongful death", "death", "killed", "fatality",
-    "drunk driver", "dui", "hit and run",
-    "broken", "fracture", "spinal", "brain", "concussion",
-    "disability", "disabled", "paralyz",
-  ];
-
-  const hasQualified = qualifiedSignals.some((s) => text.includes(s));
-  if (hasQualified) return { isLead: true, isQualified: true, label: "🔥 Qualified Lead" };
-
-  const hasLead = leadSignals.some((s) => text.includes(s));
-  if (hasLead) return { isLead: true, isQualified: false, label: "Lead" };
-
-  return { isLead: false, isQualified: false, label: "No" };
 }
 
 // Check if inbound event should go to #legalassistant-phone
@@ -1100,7 +1056,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const { isLead, isQualified, label: leadLabel } = classifyLead(payload, from, to, cached);
+    const { isLead, isQualified, label: leadLabel } = await classifyLead(payload, from, to, cached);
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
