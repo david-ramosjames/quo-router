@@ -638,12 +638,12 @@ async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
   return false;
 }
 
-// Fetch recent #legalassistant-phone history (7 days, paginated)
+// Fetch recent #legalassistant-phone history (24 hours, paginated)
 async function fetchLegalAssistantHistory() {
   if (!SLACK_BOT_TOKEN || !SLACK_LEGAL_ASSISTANT_CHANNEL_ID) return [];
 
   const allMessages = [];
-  const sevenDaysAgo = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+  const oneDayAgo = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
   let cursor = "";
 
   try {
@@ -651,7 +651,7 @@ async function fetchLegalAssistantHistory() {
       const url = new URL("https://slack.com/api/conversations.history");
       url.searchParams.set("channel", SLACK_LEGAL_ASSISTANT_CHANNEL_ID);
       url.searchParams.set("limit", "200");
-      url.searchParams.set("oldest", String(sevenDaysAgo));
+      url.searchParams.set("oldest", String(oneDayAgo));
       if (cursor) url.searchParams.set("cursor", cursor);
 
       const res = await fetch(url.toString(), {
@@ -1192,10 +1192,10 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       threadedInLeads = await threadInLeadChannelIfMatch(text, from, to);
     }
 
-    // Route inbound non-lead, non-Sona calls to #legalassistant-phone
-    // Skip if already in #lead-calls (as a lead or threaded) or if Sona-handled
+    // Route inbound non-lead calls to #legalassistant-phone (Human or Sona)
+    // Skip if already in #lead-calls (as a lead or threaded), if existing client (case channel), or if outbound
     const callDirection = cached?.direction || "";
-    if (!isLead && !threadedInLeads && !sona && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
+    if (!isLead && !threadedInLeads && callDirection === "incoming" && shouldRouteToLegalAssistant(from, to)) {
       await postToLegalAssistant(text, from, to);
       console.log("[call-summary] ALSO sent to #legalassistant-phone");
     }
