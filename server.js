@@ -1059,7 +1059,7 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
-    let text = `📞 *Missed Call / Voicemail*\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
+    let text = `🚨 *MISSED CALL URGENT* 🚨\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
@@ -1069,11 +1069,9 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
 
-    // Route to #legalassistant-phone (not clients, not businesses)
-    if (shouldRouteToLegalAssistant(from, to)) {
-      await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
-      console.log("[calls] ALSO sent to #legalassistant-phone");
-    }
+    // ALWAYS post missed calls/voicemails to #legalassistant-phone (high urgency)
+    await postToSlack(SLACK_LEGAL_ASSISTANT_WEBHOOK_URL, text);
+    console.log("[calls] ALSO sent to #legalassistant-phone");
 
     // Thread in #lead-calls if phone matches an existing lead post
     await threadInLeadChannelIfMatch(text, from, to);
