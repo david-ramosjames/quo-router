@@ -1099,7 +1099,13 @@ app.post("/webhooks/quo/calls", async (req, res) => {
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
-    let text = `🚨 *MISSED CALL URGENT* 🚨\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
+    // Use urgent header for unknown numbers, normal alert for saved contacts
+    const externalNumber = PHONE_LINES[from] ? to : from;
+    const isSavedContact = !!getContactName(externalNumber);
+    const header = isSavedContact
+      ? `📞 *Missed Call*`
+      : `🚨 *MISSED CALL URGENT* 🚨`;
+    let text = `${header}\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
