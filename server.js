@@ -798,7 +798,7 @@ function extractMentionsFromTopic(topic) {
   return mentions.length > 0 ? mentions.join(" ") + "\n" : "";
 }
 
-async function postToCaseChannel(text, phoneFrom, phoneTo) {
+async function postToCaseChannel(text, phoneFrom, phoneTo, { skipMentions = false } = {}) {
   if (!SLACK_BOT_TOKEN) return;
 
   const phones = [phoneFrom, phoneTo].filter(Boolean);
@@ -828,8 +828,8 @@ async function postToCaseChannel(text, phoneFrom, phoneTo) {
     const joined = await joinChannel(channel.id);
     if (!joined) continue;
 
-    // Get mentions from channel topic
-    const mentions = extractMentionsFromTopic(channel.topic);
+    // Get mentions from channel topic (skip for outbound events — no need to alert for outgoing)
+    const mentions = skipMentions ? "" : extractMentionsFromTopic(channel.topic);
     const caseText = mentions + text;
 
     const ok = await postViaBot(channel.id, caseText);
@@ -1053,8 +1053,8 @@ app.post("/webhooks/quo/messages", async (req, res) => {
       console.log("[messages] ALSO sent to #legalassistant-phone");
     }
 
-    // Post to case channel if applicable
-    await postToCaseChannel(text, from, to);
+    // Post to case channel if applicable (skip topic mentions for outbound — no need to alert)
+    await postToCaseChannel(text, from, to, { skipMentions: isOutbound });
   } catch (err) {
     console.error("[messages] Error:", err.message);
   }
