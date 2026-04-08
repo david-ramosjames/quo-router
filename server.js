@@ -1110,16 +1110,14 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     console.log("[calls] Sent to #missed-calls-voicemail");
 
     // Thread in #lead-calls if phone matches an existing lead post
-    const threadedInLeads = await threadInLeadChannelIfMatch(text, from, to);
+    await threadInLeadChannelIfMatch(text, from, to);
 
-    // Post to #legalassistant-phone — but not for existing clients (already in case channels)
-    // and not if it was already threaded in #lead-calls
+    // Post missed calls/voicemails to #legalassistant-phone — but not for existing clients
+    // (those go to case channels). Always post even if also in #lead-calls — these are urgent.
     const externalPhone = PHONE_LINES[from] ? to : from;
-    if (!isExistingClient(externalPhone) && !threadedInLeads) {
+    if (!isExistingClient(externalPhone)) {
       await postToLegalAssistant(text, from, to);
       console.log("[calls] ALSO sent to #legalassistant-phone");
-    } else if (threadedInLeads) {
-      console.log("[calls] Skipping #legalassistant-phone — threaded in #lead-calls");
     } else {
       console.log("[calls] Skipping #legalassistant-phone — existing client");
     }
