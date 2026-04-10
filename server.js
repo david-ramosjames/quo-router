@@ -1200,9 +1200,11 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
 
     // Route inbound non-lead calls to #legalassistant-phone (Human or Sona)
     // Skip if already in #lead-calls (as a lead or threaded), if existing client (case channel), or if outbound
+    // EXCEPTION: Sona leads always post to #legalassistant-phone (like missed calls, they need follow-up)
     // Determine inbound by checking if `to` is one of our phone lines (more reliable than cached direction)
     const isInbound = !!PHONE_LINES[to] || cached?.direction === "incoming";
-    if (!isLead && !threadedInLeads && isInbound && shouldRouteToLegalAssistant(from, to)) {
+    const sonaLeadOverride = sona && isLead;
+    if (isInbound && shouldRouteToLegalAssistant(from, to) && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
       await postToLegalAssistant(text, from, to);
       console.log("[call-summary] ALSO sent to #legalassistant-phone");
     } else if (!isLead && !threadedInLeads && !isInbound) {
