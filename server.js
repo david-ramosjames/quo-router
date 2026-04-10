@@ -549,6 +549,28 @@ async function findThreadByPhone(phoneNumber) {
   return null;
 }
 
+// Get a Slack permalink for a posted message — handles thread replies correctly
+async function getSlackPermalink(channelId, messageTs) {
+  if (!SLACK_BOT_TOKEN || !channelId || !messageTs) return null;
+  try {
+    const url = new URL("https://slack.com/api/chat.getPermalink");
+    url.searchParams.set("channel", channelId);
+    url.searchParams.set("message_ts", messageTs);
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[permalink] Slack API error: ${json.error}`);
+      return null;
+    }
+    return json.permalink || null;
+  } catch (err) {
+    console.error("[permalink] Error:", err.message);
+    return null;
+  }
+}
+
 async function postLeadToSlack(text, phoneFrom, phoneTo) {
   if (SLACK_BOT_TOKEN && SLACK_LEAD_CALLS_CHANNEL_ID) {
     try {
@@ -586,12 +608,14 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
       }
 
       console.log(`[lead-calls] Posted via Slack API (threaded: ${!!threadTs})`);
-      // Build permalink: https://slack.com/archives/CHANNEL/pTIMESTAMP
+      // Fetch permalink via Slack API — handles thread replies correctly
       const msgTs = json.ts;
       if (msgTs) {
-        const tsNoDot = msgTs.replace(".", "");
-        return `https://slack.com/archives/${SLACK_LEAD_CALLS_CHANNEL_ID}/p${tsNoDot}`;
+        const permalink = await getSlackPermalink(SLACK_LEAD_CALLS_CHANNEL_ID, msgTs);
+        console.log(`[lead-calls] Permalink: ${permalink || "null"}`);
+        return permalink;
       }
+      console.warn("[lead-calls] No ts in Slack response — cannot build permalink");
       return null;
     } catch (err) {
       console.error("[lead-calls] Slack API error:", err.message);
@@ -1190,6 +1214,7 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     let text;
     if (sona) {
       const leadLink = leadPermalink ? `\n<${leadPermalink}|View in #lead-calls>` : "";
+      console.log(`[call-summary] Sona post — isLead=${isLead}, leadPermalink=${leadPermalink || "null"}`);
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
