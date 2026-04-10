@@ -582,9 +582,17 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
       if (!json.ok) {
         console.error(`[lead-calls] Slack API error: ${json.error}`);
         await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
-      } else {
-        console.log(`[lead-calls] Posted via Slack API (threaded: ${!!threadTs})`);
+        return null;
       }
+
+      console.log(`[lead-calls] Posted via Slack API (threaded: ${!!threadTs})`);
+      // Build permalink: https://slack.com/archives/CHANNEL/pTIMESTAMP
+      const msgTs = json.ts;
+      if (msgTs) {
+        const tsNoDot = msgTs.replace(".", "");
+        return `https://slack.com/archives/${SLACK_LEAD_CALLS_CHANNEL_ID}/p${tsNoDot}`;
+      }
+      return null;
     } catch (err) {
       console.error("[lead-calls] Slack API error:", err.message);
       await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
@@ -592,6 +600,7 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
   } else {
     await postToSlack(SLACK_LEAD_CALLS_WEBHOOK_URL, text);
   }
+  return null;
 }
 
 // Thread any event into #lead-calls if the phone number matches an existing post
@@ -1166,9 +1175,22 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     console.log(`[call-summary] From: ${fromDisplay} | To: ${toDisplay} | Sona: ${sona} | Lead: ${leadLabel}`);
 
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
+
+    // For Sona leads, post to #lead-calls FIRST so we can link it from #sona-calls
+    let leadPermalink = null;
+    if (isLead) {
+      const handlerDisplay = sona ? "Sona" : (getQuoUserName(cached?.answeredBy) || getQuoUserName(cached?.userId) || "Human");
+      const handledBy = handlerDisplay;
+      const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
+      const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
+      leadPermalink = await postLeadToSlack(leadText, from, to);
+      console.log(`[call-summary] Sent to #lead-calls (${leadLabel})`);
+    }
+
     let text;
     if (sona) {
-      text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
+      const leadLink = leadPermalink ? `\n<${leadPermalink}|View in #lead-calls>` : "";
+      text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
       await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #sona-calls");
     } else {
@@ -1180,16 +1202,6 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${linkLine}`;
       await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
       console.log("[call-summary] Sent to #human-calls");
-    }
-
-    // Send ALL leads (qualified or not) to #lead-calls
-    if (isLead) {
-      const handlerDisplay = sona ? "Sona" : (getQuoUserName(cached?.answeredBy) || getQuoUserName(cached?.userId) || "Human");
-      const handledBy = handlerDisplay;
-      const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
-      const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
-      await postLeadToSlack(leadText, from, to);
-      console.log(`[call-summary] ALSO sent to #lead-calls (${leadLabel})`);
     }
 
     // Thread non-lead calls in #lead-calls if phone matches an existing post
