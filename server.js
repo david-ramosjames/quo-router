@@ -725,11 +725,13 @@ async function postToLegalAssistant(text, phoneFrom, phoneTo) {
 
 function extractCaseNumber(contactName) {
   if (!contactName) return null;
-  // Match a 3+ digit case number in the contact name
-  // e.g. "Barbara Glass 1281", "Wendy Veal 946 New Phone", "Elmer Ramirez Brother 1403"
-  const match = contactName.match(/\b(\d{3,5})\b/);
-  if (!match) return null;
-  return match[1];
+  // Find all 3-5 digit case numbers in the contact name
+  // e.g. "Barbara Glass 1281", "Wendy Veal 946 New Phone", "Cynthia Hierrezuelo 1313 & 1476"
+  // For contacts with multiple cases, use the largest number (the most recent/active case)
+  const matches = contactName.match(/\b\d{3,5}\b/g);
+  if (!matches || matches.length === 0) return null;
+  // Return the largest case number
+  return matches.reduce((max, num) => (Number(num) > Number(max) ? num : max));
 }
 
 function findChannelByCaseNumber(caseNumber) {
