@@ -29,6 +29,15 @@ const PHONE_LINES = {
 // Slack user IDs to tag on missed/Sona calls threaded into #lead-calls
 const LEAD_THREAD_TAG_USERS = ["U026P9FUKHC", "U0ANAJK56LD"]; // @jon, @Jaymie
 
+// Insert @-mentions as a second line so the event title stays on line 1
+function insertMentionsAfterTitle(text, userIds) {
+  if (!userIds || userIds.length === 0) return text;
+  const mentions = userIds.map((id) => `<@${id}>`).join(" ");
+  const nlIdx = text.indexOf("\n");
+  if (nlIdx === -1) return `${text}\n${mentions}`;
+  return `${text.slice(0, nlIdx)}\n${mentions}${text.slice(nlIdx)}`;
+}
+
 // --- Quo Contacts Cache ---
 const contactsCache = new Map();
 const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000;
@@ -588,12 +597,10 @@ async function postLeadToSlack(text, phoneFrom, phoneTo, { mentionUsersIfThreade
         if (threadTs) break;
       }
 
-      // Prepend @-mentions only when posting as a thread reply (not for top-level posts)
-      let finalText = text;
-      if (threadTs && mentionUsersIfThreaded.length > 0) {
-        const mentionPrefix = mentionUsersIfThreaded.map((id) => `<@${id}>`).join(" ") + " ";
-        finalText = mentionPrefix + text;
-      }
+      // Insert @-mentions as a second line only when posting as a thread reply
+      const finalText = threadTs
+        ? insertMentionsAfterTitle(text, mentionUsersIfThreaded)
+        : text;
 
       const body = { channel: SLACK_LEAD_CALLS_CHANNEL_ID, text: finalText };
       if (threadTs) {
@@ -654,11 +661,8 @@ async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo, { mentionUse
 
   if (!threadTs) return false;
 
-  // Prepend @-mentions so Slack notifies them when posted as a thread reply
-  const mentionPrefix = mentionUsers.length > 0
-    ? mentionUsers.map((id) => `<@${id}>`).join(" ") + " "
-    : "";
-  const finalText = mentionPrefix + text;
+  // Insert @-mentions as a second line so the event title stays on line 1
+  const finalText = insertMentionsAfterTitle(text, mentionUsers);
 
   try {
     const res = await fetch("https://slack.com/api/chat.postMessage", {
