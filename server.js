@@ -26,6 +26,9 @@ const PHONE_LINES = {
   "+15126300907": "RJL Transfers",
 };
 
+// Slack user IDs to tag on missed/Sona calls threaded into #lead-calls
+const LEAD_THREAD_TAG_USERS = ["U026P9FUKHC", "U0ANAJK56LD"]; // @jon, @Jaymie
+
 // --- Quo Contacts Cache ---
 const contactsCache = new Map();
 const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000;
@@ -571,7 +574,7 @@ async function getSlackPermalink(channelId, messageTs) {
   }
 }
 
-async function postLeadToSlack(text, phoneFrom, phoneTo) {
+async function postLeadToSlack(text, phoneFrom, phoneTo, { mentionUsersIfThreaded = [] } = {}) {
   if (SLACK_BOT_TOKEN && SLACK_LEAD_CALLS_CHANNEL_ID) {
     try {
       // Search for thread matching either the from or to number
@@ -585,7 +588,14 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
         if (threadTs) break;
       }
 
-      const body = { channel: SLACK_LEAD_CALLS_CHANNEL_ID, text };
+      // Prepend @-mentions only when posting as a thread reply (not for top-level posts)
+      let finalText = text;
+      if (threadTs && mentionUsersIfThreaded.length > 0) {
+        const mentionPrefix = mentionUsersIfThreaded.map((id) => `<@${id}>`).join(" ") + " ";
+        finalText = mentionPrefix + text;
+      }
+
+      const body = { channel: SLACK_LEAD_CALLS_CHANNEL_ID, text: finalText };
       if (threadTs) {
         body.thread_ts = threadTs;
         console.log(`[lead-calls] Replying in thread ${threadTs}`);
@@ -628,7 +638,7 @@ async function postLeadToSlack(text, phoneFrom, phoneTo) {
 }
 
 // Thread any event into #lead-calls if the phone number matches an existing post
-async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
+async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo, { mentionUsers = [] } = {}) {
   if (!SLACK_BOT_TOKEN || !SLACK_LEAD_CALLS_CHANNEL_ID) return false;
 
   const phones = [phoneFrom, phoneTo].filter(Boolean);
@@ -644,6 +654,12 @@ async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
 
   if (!threadTs) return false;
 
+  // Prepend @-mentions so Slack notifies them when posted as a thread reply
+  const mentionPrefix = mentionUsers.length > 0
+    ? mentionUsers.map((id) => `<@${id}>`).join(" ") + " "
+    : "";
+  const finalText = mentionPrefix + text;
+
   try {
     const res = await fetch("https://slack.com/api/chat.postMessage", {
       method: "POST",
@@ -653,7 +669,7 @@ async function threadInLeadChannelIfMatch(text, phoneFrom, phoneTo) {
       },
       body: JSON.stringify({
         channel: SLACK_LEAD_CALLS_CHANNEL_ID,
-        text,
+        text: finalText,
         thread_ts: threadTs,
       }),
     });
@@ -1150,8 +1166,8 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
 
-    // Thread in #lead-calls if phone matches an existing lead post
-    await threadInLeadChannelIfMatch(text, from, to);
+    // Thread in #lead-calls if phone matches an existing lead post — tag @jon/@jaymie
+    await threadInLeadChannelIfMatch(text, from, to, { mentionUsers: LEAD_THREAD_TAG_USERS });
 
     // Post missed calls/voicemails to #legalassistant-phone — but not for existing clients
     // (those go to case channels). Always post even if also in #lead-calls — these are urgent.
@@ -1207,7 +1223,9 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       const handledBy = handlerDisplay;
       const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
       const leadText = `${qualTag}\nHandled By: ${handledBy}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
-      leadPermalink = await postLeadToSlack(leadText, from, to);
+      // Tag @jon/@jaymie only on Sona calls that end up threaded
+      const leadPostOpts = sona ? { mentionUsersIfThreaded: LEAD_THREAD_TAG_USERS } : {};
+      leadPermalink = await postLeadToSlack(leadText, from, to, leadPostOpts);
       console.log(`[call-summary] Sent to #lead-calls (${leadLabel})`);
     }
 
@@ -1229,10 +1247,12 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
       console.log("[call-summary] Sent to #human-calls");
     }
 
-    // Thread non-lead calls in #lead-calls if phone matches an existing post
+    // Thread non-lead calls in #lead-calls if phone matches an existing post.
+    // Sona calls get @jon/@jaymie tagged; Human calls don't.
     let threadedInLeads = false;
     if (!isLead) {
-      threadedInLeads = await threadInLeadChannelIfMatch(text, from, to);
+      const threadOpts = sona ? { mentionUsers: LEAD_THREAD_TAG_USERS } : {};
+      threadedInLeads = await threadInLeadChannelIfMatch(text, from, to, threadOpts);
     }
 
     // Route inbound non-lead calls to #legalassistant-phone (Human or Sona)
