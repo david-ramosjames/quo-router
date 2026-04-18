@@ -1146,27 +1146,57 @@ app.post("/webhooks/quo/calls", async (req, res) => {
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
     const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
     const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
+    // Menu hangup: caller reached IVR (answeredAt set) but no agent/Sona picked up and no VM
+    const isMenuHangup =
+      status === "completed" &&
+      direction === "incoming" &&
+      !!answeredAt &&
+      !obj.answeredBy &&
+      !hasVoicemail;
 
-    if (!isMissedStatus && !isUnanswered && !hasVoicemail) {
-      console.log(`[calls] Skipping answered call (status: ${status}) — not missed`);
+    if (!isMissedStatus && !isUnanswered && !hasVoicemail && !isMenuHangup) {
+      console.log(`[calls] Skipping answered call (status: ${status}) — not missed/menu-hangup`);
       return;
     }
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
+
+    // Outbound events (no-answer, voicemail left by us) → case channel only, no tags, no transcript
+    if (direction === "outgoing") {
+      const outHeader = hasVoicemail
+        ? `📨 *Outbound Voicemail Left*`
+        : `📞 *Outbound Call Not Answered*`;
+      let outText = `${outHeader}\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
+      if (hasVoicemail) {
+        const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
+        outText += `\nVoicemail: ${vmUrl}`;
+      }
+      console.log(`[calls] Outbound ${hasVoicemail ? "voicemail left" : "no-answer"}: ${fromDisplay} → ${toDisplay}`);
+      await postToCaseChannel(outText, from, to, { skipMentions: true });
+      return;
+    }
+
     // Use urgent header for unknown numbers, normal alert for saved contacts
     const externalNumber = PHONE_LINES[from] ? to : from;
     const isSavedContact = !!getContactName(externalNumber);
-    const header = isSavedContact
-      ? `📞 *Missed Call*`
-      : `🚨 *MISSED CALL URGENT* 🚨`;
+    let header;
+    if (isMenuHangup) {
+      header = isSavedContact
+        ? `📞 *Hung Up at Phone Menu*`
+        : `☎️ *HUNG UP AT PHONE MENU URGENT* ☎️`;
+    } else {
+      header = isSavedContact
+        ? `📞 *Missed Call*`
+        : `🚨 *MISSED CALL URGENT* 🚨`;
+    }
     let text = `${header}\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
     if (hasVoicemail) {
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
     }
 
-    console.log(`[calls] Missed call from: ${fromDisplay}`);
+    console.log(`[calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
     console.log("[calls] Sent to #missed-calls-voicemail");
 
