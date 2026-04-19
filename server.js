@@ -251,9 +251,10 @@ function getCachedCall(callId) {
 // We schedule a timeout on ringing events; if no resolution arrives, route as abandonment.
 const ABANDONMENT_TIMEOUT_MS = 45 * 1000;
 const pendingAbandonment = new Map(); // callId -> { timeoutId, from, to, direction }
+const resolvedCalls = new Set(); // callIds that received a completion/summary event
 
 function scheduleAbandonmentCheck(callId, from, to, direction) {
-  if (!callId) return;
+  if (!callId || resolvedCalls.has(callId)) return;
   cancelAbandonmentCheck(callId);
   const timeoutId = setTimeout(() => {
     pendingAbandonment.delete(callId);
@@ -271,6 +272,13 @@ function cancelAbandonmentCheck(callId) {
     clearTimeout(entry.timeoutId);
     pendingAbandonment.delete(callId);
   }
+}
+
+function markCallResolved(callId) {
+  if (!callId) return;
+  resolvedCalls.add(callId);
+  cancelAbandonmentCheck(callId);
+  setTimeout(() => resolvedCalls.delete(callId), CACHE_TTL);
 }
 
 // --- Helpers ---
@@ -1207,8 +1215,8 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       return;
     }
 
-    // Any non-ringing event resolves the call — cancel pending abandonment check
-    cancelAbandonmentCheck(callId);
+    // Any non-ringing event resolves the call — prevent late ringing events from re-scheduling
+    markCallResolved(callId);
 
     // Detect missed calls
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
@@ -1297,8 +1305,8 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const callId = obj.callId || null;
     const deepLink = payload.data?.deepLink || null;
 
-    // A summary means the call was handled — cancel any pending abandonment check
-    cancelAbandonmentCheck(callId);
+    // A summary means the call was handled — prevent late ringing events from re-scheduling
+    markCallResolved(callId);
 
     const cached = callId ? getCachedCall(callId) : null;
     const from = safe(cached?.from);
