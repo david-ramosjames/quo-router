@@ -250,7 +250,7 @@ function getCachedCall(callId) {
 // Quo sometimes does not fire call.completed or call-summary events.
 // On ringing, we schedule a delayed check. Before acting, we query the Quo API
 // for the call's real status so we never post false positives.
-const CALL_CHECK_DELAY_MS = 3 * 60 * 1000; // 3 minutes
+const CALL_CHECK_DELAY_MS = 5 * 60 * 1000; // 5 minutes — gives /call-summary time to arrive
 const pendingCallChecks = new Map(); // callId -> timeoutId
 const resolvedCalls = new Set(); // callIds that received a non-ringing event
 
@@ -1295,9 +1295,6 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       return;
     }
 
-    // Non-ringing event arrived — mark resolved so the fallback check is skipped
-    markCallResolved(callId);
-
     // Detect missed calls
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
     const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
@@ -1311,9 +1308,13 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       !hasVoicemail;
 
     if (!isMissedStatus && !isUnanswered && !hasVoicemail && !isMenuHangup) {
-      console.log(`[calls] Skipping answered call (status: ${status}) — not missed/menu-hangup`);
+      // Answered call — /call-summary should handle. Keep fallback check active in case it doesn't.
+      console.log(`[calls] Skipping answered call (status: ${status}) — waiting for /call-summary or fallback`);
       return;
     }
+
+    // We are handling the call here — cancel any pending fallback check to avoid duplicate post
+    markCallResolved(callId);
 
     const fromDisplay = formatFrom(from);
     const toDisplay = formatPhone(to);
