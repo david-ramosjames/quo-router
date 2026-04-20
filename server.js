@@ -246,10 +246,153 @@ function getCachedCall(callId) {
   return entry;
 }
 
-// --- Phone menu abandonment detection ---
-// Quo fires call.completed with status "canceled"/"no-answer" for abandonments,
-// or status "completed" with answeredAt set but no answeredBy for IVR hangups.
-// Both are handled in the /calls route below (isMissedStatus and isMenuHangup).
+// --- Unresolved call fallback ---
+// Quo sometimes does not fire call.completed or call-summary events.
+// On ringing, we schedule a delayed check. Before acting, we query the Quo API
+// for the call's real status so we never post false positives.
+const CALL_CHECK_DELAY_MS = 3 * 60 * 1000; // 3 minutes
+const pendingCallChecks = new Map(); // callId -> timeoutId
+const resolvedCalls = new Set(); // callIds that received a non-ringing event
+
+async function fetchCallFromQuo(callId) {
+  if (!QUO_API_KEY || !callId) return null;
+  try {
+    const res = await fetch(`https://api.openphone.com/v1/calls/${callId}`, {
+      headers: { Authorization: QUO_API_KEY },
+    });
+    if (!res.ok) {
+      console.error(`[call-check] Quo API responded ${res.status}`);
+      return null;
+    }
+    const json = await res.json();
+    return json.data || json;
+  } catch (err) {
+    console.error("[call-check] Error fetching call:", err.message);
+    return null;
+  }
+}
+
+function scheduleCallCheck(callId, cachedFrom, cachedTo, cachedDirection) {
+  if (!callId || resolvedCalls.has(callId)) return;
+  clearScheduledCallCheck(callId);
+  const timeoutId = setTimeout(() => {
+    pendingCallChecks.delete(callId);
+    if (resolvedCalls.has(callId)) return;
+    handleUnresolvedCall(callId, cachedFrom, cachedTo, cachedDirection).catch((err) =>
+      console.error("[call-check] Error:", err.message),
+    );
+  }, CALL_CHECK_DELAY_MS);
+  pendingCallChecks.set(callId, timeoutId);
+}
+
+function clearScheduledCallCheck(callId) {
+  if (!callId) return;
+  const tid = pendingCallChecks.get(callId);
+  if (tid) {
+    clearTimeout(tid);
+    pendingCallChecks.delete(callId);
+  }
+}
+
+function markCallResolved(callId) {
+  if (!callId) return;
+  resolvedCalls.add(callId);
+  clearScheduledCallCheck(callId);
+  setTimeout(() => resolvedCalls.delete(callId), CACHE_TTL);
+}
+
+async function handleUnresolvedCall(callId, cachedFrom, cachedTo, cachedDirection) {
+  const call = await fetchCallFromQuo(callId);
+  if (!call) {
+    console.log(`[call-check] Could not verify call ${callId} via API — skipping`);
+    return;
+  }
+
+  const status = (call.status || "").toLowerCase();
+  const direction = call.direction || cachedDirection;
+  const from = safe(call.from || cachedFrom);
+  const to = safe(call.to || cachedTo);
+  const answeredBy = call.answeredBy || null;
+  const answeredAt = call.answeredAt || null;
+  const voicemail = call.voicemail || null;
+  const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
+
+  // Update cache with full data from API
+  cacheCall(callId, { from: call.from || cachedFrom, to: call.to || cachedTo, direction, answeredBy, userId: call.userId });
+
+  console.log(`[call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}`);
+
+  // Still in progress — reschedule one more check
+  if (status === "in-progress" || status === "ringing" || status === "queued" || status === "initiated") {
+    console.log(`[call-check] Call ${callId} still ${status} — rescheduling`);
+    scheduleCallCheck(callId, cachedFrom, cachedTo, cachedDirection);
+    return;
+  }
+
+  if (direction !== "incoming") {
+    console.log(`[call-check] Outbound call ${callId} — skipping fallback`);
+    return;
+  }
+
+  const fromDisplay = formatFrom(from);
+  const toDisplay = formatPhone(to);
+  const externalNumber = PHONE_LINES[from] ? to : from;
+  const isSavedContact = !!getContactName(externalNumber);
+
+  const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
+  const isMenuHangup = status === "completed" && !!answeredAt && !answeredBy && !hasVoicemail;
+  const isAnswered = status === "completed" && !!answeredBy;
+
+  if (isMissedStatus || isMenuHangup || (status === "completed" && !answeredAt && !hasVoicemail)) {
+    // Missed call, unanswered, or menu hangup
+    let header;
+    if (isMenuHangup) {
+      header = isSavedContact ? `📞 *Hung Up at Phone Menu*` : `☎️ *HUNG UP AT PHONE MENU URGENT* ☎️`;
+    } else {
+      header = isSavedContact ? `📞 *Missed Call*` : `🚨 *MISSED CALL URGENT* 🚨`;
+    }
+    let text = `${header}\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
+    if (hasVoicemail) {
+      const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
+      text += `\nVoicemail: ${vmUrl}`;
+    }
+
+    console.log(`[call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
+    await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
+    await threadInLeadChannelIfMatch(text, from, to, { mentionUsers: LEAD_THREAD_TAG_USERS });
+
+    const externalPhone = PHONE_LINES[from] ? to : from;
+    if (!isExistingClient(externalPhone)) {
+      await postToLegalAssistant(text, from, to);
+    }
+    await postToCaseChannel(text, from, to);
+  } else if (isAnswered) {
+    // Call was answered but no webhook events came through — post basic notification
+    const isSona = answeredBy && (String(answeredBy).startsWith("SY") || String(answeredBy).toLowerCase().includes("sona"));
+    const handlerName = getQuoUserName(answeredBy);
+
+    console.log(`[call-check] Fallback: answered call for ${callId} (answeredBy: ${answeredBy}, sona: ${isSona})`);
+
+    let text;
+    if (isSona) {
+      text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
+      await postToSlack(SLACK_SONA_CALLS_WEBHOOK_URL, text);
+    } else {
+      const handlerLine = handlerName ? `\nHandled By: *${handlerName}*` : "";
+      text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
+      await postToSlack(SLACK_HUMAN_CALLS_WEBHOOK_URL, text);
+    }
+
+    // Route to legalassistant / lead-calls / case channel as usual
+    if (shouldRouteToLegalAssistant(from, to)) {
+      await postToLegalAssistant(text, from, to);
+    }
+    await threadInLeadChannelIfMatch(text, from, to, isSona ? { mentionUsers: LEAD_THREAD_TAG_USERS } : {});
+    await postToCaseChannel(text, from, to);
+  } else {
+    console.log(`[call-check] Call ${callId} has unexpected status "${status}" — skipping`);
+  }
+}
 
 // --- Helpers ---
 
@@ -1141,11 +1284,19 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       console.log(`[calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"})`);
     }
 
-    // Skip ringing events — wait for the completion event
+    // Skip ringing events — schedule a fallback check in case Quo never sends completion
     if (eventType === "call.ringing" || status === "ringing") {
-      console.log(`[calls] Ringing — waiting for completion`);
+      if (direction === "incoming") {
+        scheduleCallCheck(callId, obj.from, obj.to, direction);
+        console.log(`[calls] Ringing — scheduled API check in ${CALL_CHECK_DELAY_MS / 1000}s for ${callId}`);
+      } else {
+        console.log(`[calls] Ringing — waiting for completion`);
+      }
       return;
     }
+
+    // Non-ringing event arrived — mark resolved so the fallback check is skipped
+    markCallResolved(callId);
 
     // Detect missed calls
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
@@ -1233,6 +1384,9 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const obj = payload.data?.object || {};
     const callId = obj.callId || null;
     const deepLink = payload.data?.deepLink || null;
+
+    // Summary received — cancel any pending fallback check
+    markCallResolved(callId);
 
     const cached = callId ? getCachedCall(callId) : null;
     const from = safe(cached?.from);
