@@ -247,39 +247,9 @@ function getCachedCall(callId) {
 }
 
 // --- Phone menu abandonment detection ---
-// Quo does not fire call.completed when a caller hangs up during the IVR/ringing.
-// We schedule a timeout on ringing events; if no resolution arrives, route as abandonment.
-const ABANDONMENT_TIMEOUT_MS = 45 * 1000;
-const pendingAbandonment = new Map(); // callId -> { timeoutId, from, to, direction }
-const resolvedCalls = new Set(); // callIds that received a completion/summary event
-
-function scheduleAbandonmentCheck(callId, from, to, direction) {
-  if (!callId || resolvedCalls.has(callId)) return;
-  cancelAbandonmentCheck(callId);
-  const timeoutId = setTimeout(() => {
-    pendingAbandonment.delete(callId);
-    handleMenuAbandonment(callId, from, to, direction).catch((err) =>
-      console.error("[abandonment] Error:", err.message),
-    );
-  }, ABANDONMENT_TIMEOUT_MS);
-  pendingAbandonment.set(callId, { timeoutId, from, to, direction });
-}
-
-function cancelAbandonmentCheck(callId) {
-  if (!callId) return;
-  const entry = pendingAbandonment.get(callId);
-  if (entry) {
-    clearTimeout(entry.timeoutId);
-    pendingAbandonment.delete(callId);
-  }
-}
-
-function markCallResolved(callId) {
-  if (!callId) return;
-  resolvedCalls.add(callId);
-  cancelAbandonmentCheck(callId);
-  setTimeout(() => resolvedCalls.delete(callId), CACHE_TTL);
-}
+// Quo fires call.completed with status "canceled"/"no-answer" for abandonments,
+// or status "completed" with answeredAt set but no answeredBy for IVR hangups.
+// Both are handled in the /calls route below (isMissedStatus and isMenuHangup).
 
 // --- Helpers ---
 
@@ -1150,38 +1120,6 @@ app.post("/webhooks/quo/messages", async (req, res) => {
   }
 });
 
-async function handleMenuAbandonment(callId, fromRaw, toRaw, direction) {
-  const from = safe(fromRaw);
-  const to = safe(toRaw);
-  if (direction !== "incoming") return;
-
-  const fromDisplay = formatFrom(from);
-  const toDisplay = formatPhone(to);
-  const externalNumber = PHONE_LINES[from] ? to : from;
-  const isSavedContact = !!getContactName(externalNumber);
-  const header = isSavedContact
-    ? `📞 *Hung Up at Phone Menu*`
-    : `☎️ *HUNG UP AT PHONE MENU URGENT* ☎️`;
-  const text = `${header}\nFrom: ${fromDisplay}\nTo: ${toDisplay}`;
-
-  console.log(`[abandonment] Menu abandonment (callId: ${callId}): ${fromDisplay}`);
-  await postToSlack(SLACK_MISSED_CALLS_WEBHOOK_URL, text);
-  console.log("[abandonment] Sent to #missed-calls-voicemail");
-
-  // Thread in #lead-calls if phone matches — tag @jon/@jaymie
-  await threadInLeadChannelIfMatch(text, from, to, { mentionUsers: LEAD_THREAD_TAG_USERS });
-
-  // #legalassistant-phone unless existing client (case channel handles those)
-  const externalPhone = PHONE_LINES[from] ? to : from;
-  if (!isExistingClient(externalPhone)) {
-    await postToLegalAssistant(text, from, to);
-    console.log("[abandonment] ALSO sent to #legalassistant-phone");
-  }
-
-  // Case channel
-  await postToCaseChannel(text, from, to);
-}
-
 app.post("/webhooks/quo/calls", async (req, res) => {
   res.status(200).json({ received: true });
 
@@ -1203,20 +1141,11 @@ app.post("/webhooks/quo/calls", async (req, res) => {
       console.log(`[calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"})`);
     }
 
-    // Skip ringing events — but schedule abandonment check for inbound calls.
-    // If no subsequent event arrives within the timeout, treat as menu abandonment.
+    // Skip ringing events — wait for the completion event
     if (eventType === "call.ringing" || status === "ringing") {
-      if (direction === "incoming") {
-        scheduleAbandonmentCheck(callId, obj.from, obj.to, direction);
-        console.log(`[calls] Ringing — scheduled abandonment check for ${callId}`);
-      } else {
-        console.log(`[calls] Ringing — waiting for completion`);
-      }
+      console.log(`[calls] Ringing — waiting for completion`);
       return;
     }
-
-    // Any non-ringing event resolves the call — prevent late ringing events from re-scheduling
-    markCallResolved(callId);
 
     // Detect missed calls
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
@@ -1304,9 +1233,6 @@ app.post("/webhooks/quo/call-summary", async (req, res) => {
     const obj = payload.data?.object || {};
     const callId = obj.callId || null;
     const deepLink = payload.data?.deepLink || null;
-
-    // A summary means the call was handled — prevent late ringing events from re-scheduling
-    markCallResolved(callId);
 
     const cached = callId ? getCachedCall(callId) : null;
     const from = safe(cached?.from);
