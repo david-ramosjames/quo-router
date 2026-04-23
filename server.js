@@ -250,7 +250,7 @@ function getCachedCall(callId) {
 // Quo sometimes does not fire call.completed or call-summary events.
 // On ringing, we schedule a delayed check. Before acting, we query the Quo API
 // for the call's real status so we never post false positives.
-const CALL_CHECK_DELAY_MS = 241 * 1000; // 241s — balance between fallback timing and /call-summary arrival
+const CALL_CHECK_DELAY_MS = 185 * 1000; // 185s
 const pendingCallChecks = new Map(); // callId -> timeoutId
 const resolvedCalls = new Set(); // callIds that received a non-ringing event
 
