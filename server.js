@@ -967,6 +967,25 @@ async function joinChannel(channelId) {
   }
 }
 
+async function fetchChannelTopic(channelId) {
+  try {
+    const url = new URL("https://slack.com/api/conversations.info");
+    url.searchParams.set("channel", channelId);
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[case-channel] conversations.info error: ${json.error}`);
+      return null;
+    }
+    return json.channel?.topic?.value || "";
+  } catch (err) {
+    console.error(`[case-channel] Error fetching channel topic:`, err.message);
+    return null;
+  }
+}
+
 function extractMentionsFromTopic(topic) {
   if (!topic) return "";
 
@@ -1031,8 +1050,9 @@ async function postToCaseChannel(text, phoneFrom, phoneTo, { skipMentions = fals
     const joined = await joinChannel(channel.id);
     if (!joined) continue;
 
-    // Get mentions from channel topic (skip for outbound events — no need to alert for outgoing)
-    const mentions = skipMentions ? "" : extractMentionsFromTopic(channel.topic);
+    // Fetch live topic from Slack (cache may be stale if topic was recently changed)
+    const liveTopic = skipMentions ? null : await fetchChannelTopic(channel.id);
+    const mentions = skipMentions ? "" : extractMentionsFromTopic(liveTopic ?? channel.topic);
     const caseText = mentions + text;
 
     const ok = await postViaBot(channel.id, caseText);
