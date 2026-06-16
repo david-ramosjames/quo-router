@@ -42,6 +42,10 @@ function insertMentionsAfterTitle(text, userIds) {
 const contactsCache = new Map();
 const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000;
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function loadQuoContacts() {
   if (!QUO_API_KEY) {
     console.warn("[contacts] QUO_API_KEY not set — skipping contact sync");
@@ -55,12 +59,22 @@ async function loadQuoContacts() {
   try {
     do {
       const url = new URL("https://api.openphone.com/v1/contacts");
-      url.searchParams.set("maxResults", "50");
+      url.searchParams.set("maxResults", "100");
       if (pageToken) url.searchParams.set("pageToken", pageToken);
 
-      const res = await fetch(url.toString(), {
-        headers: { Authorization: QUO_API_KEY },
-      });
+      let res;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        res = await fetch(url.toString(), {
+          headers: { Authorization: QUO_API_KEY },
+        });
+
+        if (res.status !== 429) break;
+
+        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+        const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
+        console.warn(`[contacts] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
+        await sleep(backoff);
+      }
 
       if (!res.ok) {
         console.error(`[contacts] Quo API responded ${res.status}: ${await res.text()}`);
@@ -86,6 +100,8 @@ async function loadQuoContacts() {
 
       totalLoaded += contacts.length;
       pageToken = json.nextPageToken || null;
+
+      if (pageToken) await sleep(500);
     } while (pageToken);
 
     console.log(`[contacts] Loaded ${totalLoaded} contacts, ${contactsCache.size} phone numbers mapped`);
@@ -108,9 +124,17 @@ async function loadQuoUsers() {
 
   console.log("[quo-users] Fetching users from Quo API...");
   try {
-    const res = await fetch("https://api.openphone.com/v1/users", {
-      headers: { Authorization: QUO_API_KEY },
-    });
+    let res;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      res = await fetch("https://api.openphone.com/v1/users", {
+        headers: { Authorization: QUO_API_KEY },
+      });
+      if (res.status !== 429) break;
+      const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+      const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
+      console.warn(`[quo-users] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
+      await sleep(backoff);
+    }
 
     if (!res.ok) {
       console.error(`[quo-users] Quo API responded ${res.status}: ${await res.text()}`);
@@ -257,9 +281,17 @@ const resolvedCalls = new Set(); // callIds that received a non-ringing event
 async function fetchCallFromQuo(callId) {
   if (!QUO_API_KEY || !callId) return null;
   try {
-    const res = await fetch(`https://api.openphone.com/v1/calls/${callId}`, {
-      headers: { Authorization: QUO_API_KEY },
-    });
+    let res;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      res = await fetch(`https://api.openphone.com/v1/calls/${callId}`, {
+        headers: { Authorization: QUO_API_KEY },
+      });
+      if (res.status !== 429) break;
+      const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+      const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
+      console.warn(`[call-check] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
+      await sleep(backoff);
+    }
     if (!res.ok) {
       console.error(`[call-check] Quo API responded ${res.status}`);
       return null;
@@ -1496,9 +1528,13 @@ app.listen(PORT, () => {
 });
 
 // Load caches in background — routes work without them (just no contact names/case channels)
-Promise.all([loadQuoContacts(), loadQuoUsers(), loadSlackChannels(), loadSlackUsers()]).then(() => {
+// Stagger Quo API calls to avoid rate limits (contacts pages through many results)
+(async () => {
+  await Promise.all([loadSlackChannels(), loadSlackUsers()]);
+  await loadQuoContacts();
+  await loadQuoUsers();
   console.log("[startup] All caches loaded");
-});
+})();
 
 // Refresh caches periodically (staggered to avoid API bursts)
 setInterval(loadQuoContacts, 10 * 60 * 1000);
