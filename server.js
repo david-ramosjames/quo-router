@@ -59,7 +59,7 @@ async function loadQuoContacts() {
   try {
     do {
       const url = new URL("https://api.openphone.com/v1/contacts");
-      url.searchParams.set("maxResults", "100");
+      url.searchParams.set("maxResults", "50");
       if (pageToken) url.searchParams.set("pageToken", pageToken);
 
       let res;
