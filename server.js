@@ -40,7 +40,7 @@ function insertMentionsAfterTitle(text, userIds) {
 
 // --- Quo Contacts Cache ---
 const contactsCache = new Map();
-const CONTACTS_REFRESH_INTERVAL = 10 * 60 * 1000;
+const CONTACTS_REFRESH_INTERVAL = 60 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1537,7 +1537,7 @@ app.listen(PORT, () => {
 })();
 
 // Refresh caches periodically (staggered to avoid API bursts)
-setInterval(loadQuoContacts, 10 * 60 * 1000);
+setInterval(loadQuoContacts, CONTACTS_REFRESH_INTERVAL);
 setInterval(loadQuoUsers, QUO_USERS_REFRESH_INTERVAL);
 setInterval(loadSlackChannels, 15 * 60 * 1000);
 setInterval(loadSlackUsers, 30 * 60 * 1000);
