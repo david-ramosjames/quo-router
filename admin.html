@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quo Router Admin</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --border: #e4e7eb;
+    --text: #1a1f2b;
+    --muted: #6b7280;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --success: #10b981;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+    --code-bg: #f3f4f6;
+    --code-text: #111827;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 20px;
+    line-height: 1.5;
+  }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { margin: 0 0 8px 0; font-size: 24px; }
+  h2 { margin: 0 0 12px 0; font-size: 18px; }
+  h3 { margin: 16px 0 8px 0; font-size: 15px; }
+  .subtitle { color: var(--muted); margin: 0 0 24px 0; font-size: 14px; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  label { display: block; margin: 12px 0 4px 0; font-size: 14px; font-weight: 500; }
+  input, textarea, select {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--card);
+    color: var(--text);
+  }
+  textarea { resize: vertical; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--primary); }
+  button {
+    padding: 8px 16px;
+    background: var(--primary);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  button:hover { background: var(--primary-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary { background: white; color: var(--text); border: 1px solid var(--border); }
+  button.secondary:hover { background: var(--code-bg); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .msg { padding: 10px 12px; border-radius: 6px; margin: 12px 0; font-size: 14px; }
+  .msg.error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+  .msg.success { background: #f0fdf4; color: #14532d; border: 1px solid #bbf7d0; }
+  .msg.warning { background: #fffbeb; color: #78350f; border: 1px solid #fde68a; }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.4;
+    margin: 8px 0;
+  }
+  code { background: var(--code-bg); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .firm-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 8px 0;
+    background: #fafbfc;
+  }
+  .firm-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .firm-name { font-weight: 600; }
+  .firm-id { color: var(--muted); font-family: monospace; font-size: 12px; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 6px;
+  }
+  .badge.ok { background: #d1fae5; color: #065f46; }
+  .badge.missing { background: #fee2e2; color: #991b1b; }
+  details { margin: 8px 0; }
+  summary {
+    cursor: pointer;
+    padding: 8px 0;
+    font-weight: 500;
+    color: var(--text);
+  }
+  summary:hover { color: var(--primary); }
+  details[open] summary { margin-bottom: 8px; }
+  details p, details ul { color: var(--muted); font-size: 14px; margin: 4px 0; }
+  details ul { padding-left: 20px; }
+  .row { display: flex; gap: 12px; align-items: end; }
+  .row > * { flex: 1; }
+  .token-bar {
+    display: flex; gap: 8px; align-items: center;
+    background: var(--code-bg); padding: 10px 12px; border-radius: 6px;
+    margin-bottom: 16px;
+  }
+  .token-bar input { flex: 1; background: white; }
+  .token-bar span { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .url-block {
+    background: var(--code-bg);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    word-break: break-all;
+    margin: 4px 0;
+  }
+  .empty {
+    color: var(--muted);
+    text-align: center;
+    padding: 20px;
+    font-size: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card: #171a21;
+      --border: #262a34;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --code-bg: #1f2330;
+      --code-text: #e5e7eb;
+    }
+    input, textarea { background: var(--code-bg); color: var(--text); }
+    button.secondary { background: var(--code-bg); color: var(--text); }
+    .firm-card { background: #1a1e28; }
+    .msg.error { background: #3a1414; color: #fecaca; border-color: #7f1d1d; }
+    .msg.success { background: #0f2b1e; color: #bbf7d0; border-color: #14532d; }
+    .msg.warning { background: #2b1e08; color: #fde68a; border-color: #78350f; }
+    .badge.ok { background: #14532d; color: #bbf7d0; }
+    .badge.missing { background: #7f1d1d; color: #fecaca; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Quo Router Admin</h1>
+  <p class="subtitle">Manage firms served by this router.</p>
+
+  <div class="token-bar">
+    <span>Admin token:</span>
+    <input id="token" type="password" placeholder="ADMIN_TOKEN">
+    <button onclick="loadFirms()">Load</button>
+  </div>
+
+  <div id="global-msg"></div>
+
+  <section>
+    <h2>Registered Firms</h2>
+    <div id="firms"><div class="empty">Enter your admin token and click Load.</div></div>
+  </section>
+
+  <section>
+    <h2>Add a New Firm</h2>
+    <p class="subtitle" style="margin-bottom:0">
+      Registers a firm in memory and appends it to firms.json on disk. You still need to set
+      the firm's env vars in the deployment and (for permanence across redeploys) commit
+      the updated firms.json to git.
+    </p>
+    <form id="addFirm">
+      <div class="row">
+        <div>
+          <label for="firm-id">Firm ID</label>
+          <input id="firm-id" name="id" required pattern="[a-z0-9-]+" placeholder="smithlaw">
+          <div class="hint">Lowercase letters, numbers, hyphens only. Used in the webhook URL.</div>
+        </div>
+        <div>
+          <label for="firm-name">Display Name</label>
+          <input id="firm-name" name="name" required placeholder="Smith Law Firm">
+        </div>
+      </div>
+      <label for="firm-practice">Practice Area</label>
+      <input id="firm-practice" name="practiceArea" value="personal injury">
+      <div class="hint">Used in the lead-classifier prompt. e.g. "personal injury", "family law".</div>
+
+      <label for="firm-phones">Phone Lines</label>
+      <textarea id="firm-phones" name="phoneLines" rows="5" placeholder="+15551234567=Main Line
++15551234568=Outbound"></textarea>
+      <div class="hint">One per line: <code>+1XXXXXXXXXX=Line Name</code>. These are the firm's own Quo numbers.</div>
+
+      <label for="firm-tags">Lead-Thread Tag Users</label>
+      <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
+      <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
+
+      <div style="margin-top:16px">
+        <button type="submit">Add Firm</button>
+      </div>
+    </form>
+    <div id="add-result"></div>
+  </section>
+
+  <section>
+    <h2>FAQ</h2>
+
+    <details>
+      <summary>What environment variables do I need to set for a new firm?</summary>
+      <p>Secrets are per-firm and named <code>FIRM_&lt;UPPERCASE_ID&gt;_&lt;VAR&gt;</code>. For a firm with id <code>smithlaw</code>, set:</p>
+      <pre>FIRM_SMITHLAW_QUO_API_KEY=...
+FIRM_SMITHLAW_SLACK_BOT_TOKEN=xoxb-...
+FIRM_SMITHLAW_SLACK_TEXT_MESSAGES_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_MISSED_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_HUMAN_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_SONA_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_LEAD_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL=https://hooks.slack.com/...
+FIRM_SMITHLAW_SLACK_LEAD_CALLS_CHANNEL_ID=C0000000000
+FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID=C0000000000</pre>
+      <p><code>ANTHROPIC_API_KEY</code> is shared across all firms (used only for lead classification), no per-firm version is needed.</p>
+    </details>
+
+    <details>
+      <summary>What webhook URLs do I give Quo?</summary>
+      <p>In Quo's webhook settings, point each event to the URL matching the firm's ID:</p>
+      <pre>Messages:     https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/messages
+Calls:        https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/calls
+Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary</pre>
+      <p>Each registered firm's exact URLs are shown in the firm card above once loaded.</p>
+    </details>
+
+    <details>
+      <summary>Where do the Slack bot token and webhook URLs come from?</summary>
+      <ul>
+        <li><strong>Bot token</strong>: create a Slack app in the firm's workspace, add scopes (<code>chat:write</code>, <code>channels:read</code>, <code>groups:read</code>, <code>channels:history</code>, <code>groups:history</code>, <code>channels:join</code>, <code>users:read</code>), install to workspace, then copy the "Bot User OAuth Token" (starts with <code>xoxb-</code>).</li>
+        <li><strong>Incoming webhook URLs</strong>: in the same app, add "Incoming Webhooks" and create one per channel (missed-calls, sona-calls, human-calls, lead-calls, legalassistant-phone, text-messages).</li>
+        <li><strong>Channel IDs</strong>: in Slack, right-click the channel → View channel details → scroll to bottom, or open the channel in browser and grab the ID from the URL.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary>The channel-topic tagging isn't working for a firm. Why?</summary>
+      <p>The bot reads <code>@mentions</code> live from each case-channel's topic (via <code>conversations.info</code>) every time it posts. If mentions aren't showing up:</p>
+      <ul>
+        <li>Confirm the bot is in the case channel (it auto-joins on first post — check it wasn't kicked).</li>
+        <li>Confirm the channel topic contains actual Slack mentions like <code>&lt;@U12345&gt;</code>, not just <code>@Name</code> text.</li>
+        <li>Confirm the bot has <code>channels:read</code>/<code>groups:read</code> scope.</li>
+      </ul>
+    </details>
+
+    <details>
+      <summary>What does the fallback call-check do?</summary>
+      <p>Quo occasionally never sends <code>call.completed</code> or <code>/call-summary</code> events, which would otherwise leave the call silent in Slack. On the <code>ringing</code> event, the router schedules a check 185s later. Before acting, it queries <code>GET /v1/calls/{callId}</code> to get the real status, then routes based on what actually happened (missed / menu-hangup / answered by Sona / answered by human). Each firm has its own set of pending timers.</p>
+    </details>
+
+    <details>
+      <summary>How is data isolated between firms?</summary>
+      <p>Each firm has its own contacts cache, users cache, Slack channel cache, call cache, pending-call-check timers, and resolved-call set. A rate-limit or bug affecting one firm's cache load does not affect another. Secrets (Quo API key, Slack bot token, webhook URLs) come from env vars named <code>FIRM_&lt;ID&gt;_*</code> and are never shared. The only shared piece is <code>ANTHROPIC_API_KEY</code>.</p>
+    </details>
+
+    <details>
+      <summary>How do I edit or remove a firm?</summary>
+      <p>This UI only adds firms. To edit or remove, directly modify <code>firms.json</code> in the repo and redeploy. Also remove the corresponding <code>FIRM_&lt;ID&gt;_*</code> env vars from the deployment.</p>
+    </details>
+
+    <details>
+      <summary>My firm was added but stopped working after redeploy. What happened?</summary>
+      <p>The UI writes to <code>firms.json</code> on the server's disk, but many hosting platforms (Fly.io, Render, etc.) treat disk as ephemeral — it gets wiped on redeploy. To persist across deploys you must commit the updated <code>firms.json</code> to git. The "Add Firm" success response shows you the JSON blob to paste in, and the env vars you still need to configure.</p>
+    </details>
+
+    <details>
+      <summary>Legacy Quo webhook URLs (without <code>/&lt;firmId&gt;/</code>) — still supported?</summary>
+      <p>Yes. The old routes <code>/webhooks/quo/{messages,calls,call-summary}</code> route to <code>DEFAULT_FIRM_ID</code> (default: <code>ramosjames</code>). You can migrate URL by URL at your own pace, or leave the default firm on the legacy URLs and only use per-firm URLs for new firms.</p>
+    </details>
+  </section>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const token = () => $("token").value.trim() || localStorage.getItem("adminToken") || "";
+
+  $("token").value = localStorage.getItem("adminToken") || "";
+
+  function msg(el, kind, html) {
+    el.innerHTML = `<div class="msg ${kind}">${html}</div>`;
+  }
+
+  function escape(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+    );
+  }
+
+  function parsePhoneLines(text) {
+    const out = {};
+    for (const raw of (text || "").split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      const eq = line.indexOf("=");
+      if (eq === -1) continue;
+      const num = line.slice(0, eq).trim();
+      const name = line.slice(eq + 1).trim();
+      if (num && name) out[num] = name;
+    }
+    return out;
+  }
+
+  function parseTagUsers(text) {
+    return (text || "").split(",").map((s) => s.trim()).filter(Boolean);
+  }
+
+  async function loadFirms() {
+    const t = token();
+    if (!t) {
+      msg($("global-msg"), "error", "Enter an admin token first.");
+      return;
+    }
+    localStorage.setItem("adminToken", t);
+    try {
+      const res = await fetch("/admin/api/firms", {
+        headers: { "x-admin-token": t },
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        msg($("global-msg"), "error", `Error ${res.status}: ${escape(json.error || "Failed to load")}`);
+        return;
+      }
+      $("global-msg").innerHTML = "";
+      renderFirms(json);
+    } catch (err) {
+      msg($("global-msg"), "error", `Network error: ${escape(err.message)}`);
+    }
+  }
+
+  function renderFirms(list) {
+    if (!list.length) {
+      $("firms").innerHTML = '<div class="empty">No firms registered yet.</div>';
+      return;
+    }
+    const host = location.origin;
+    $("firms").innerHTML = list
+      .map((f) => `
+        <div class="firm-card">
+          <div class="firm-header">
+            <div>
+              <span class="firm-name">${escape(f.name)}</span>
+              <span class="firm-id">(${escape(f.id)})</span>
+            </div>
+            <div>
+              <span class="badge ${f.hasQuoApiKey ? "ok" : "missing"}">Quo ${f.hasQuoApiKey ? "✓" : "✗"}</span>
+              <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
+            </div>
+          </div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}</div>
+          <details>
+            <summary>Webhook URLs to configure in Quo</summary>
+            <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
+            <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/calls</div>
+            <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/call-summary</div>
+          </details>
+          <details>
+            <summary>Phone lines (${Object.keys(f.phoneLines || {}).length})</summary>
+            <pre>${escape(Object.entries(f.phoneLines || {}).map(([n, name]) => `${n}  ${name}`).join("\n") || "(none)")}</pre>
+          </details>
+        </div>
+      `)
+      .join("");
+  }
+
+  $("addFirm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const t = token();
+    if (!t) {
+      msg($("add-result"), "error", "Enter an admin token first.");
+      return;
+    }
+    const form = e.target;
+    const payload = {
+      id: form.id.value.trim(),
+      name: form.name.value.trim(),
+      practiceArea: form.practiceArea.value.trim(),
+      phoneLines: parsePhoneLines(form.phoneLines.value),
+      leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
+    };
+    try {
+      const res = await fetch("/admin/api/firms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-admin-token": t },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        msg($("add-result"), "error", `Error ${res.status}: ${escape(json.error || "Failed to add firm")}`);
+        return;
+      }
+      const upper = payload.id.toUpperCase();
+      const envVars = [
+        `FIRM_${upper}_QUO_API_KEY`,
+        `FIRM_${upper}_SLACK_BOT_TOKEN`,
+        `FIRM_${upper}_SLACK_TEXT_MESSAGES_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_MISSED_CALLS_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_HUMAN_CALLS_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_SONA_CALLS_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_LEAD_CALLS_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL`,
+        `FIRM_${upper}_SLACK_LEAD_CALLS_CHANNEL_ID`,
+        `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_CHANNEL_ID`,
+      ];
+      $("add-result").innerHTML = `
+        <div class="msg success">
+          Firm <code>${escape(payload.id)}</code> registered in memory and appended to firms.json.
+        </div>
+        <div class="msg warning">
+          Two things to finish setup:
+          <br>1. Set the env vars below in the deployment (secrets — not stored in firms.json).
+          <br>2. Commit the updated <code>firms.json</code> to git so the config survives redeploys.
+        </div>
+        <h3>Env vars to set</h3>
+        <pre>${envVars.join("\n")}</pre>
+        <h3>firms.json entry (for git)</h3>
+        <pre>${escape(JSON.stringify({ [payload.id]: {
+          name: payload.name,
+          practiceArea: payload.practiceArea,
+          phoneLines: payload.phoneLines,
+          leadThreadTagUsers: payload.leadThreadTagUsers,
+        } }, null, 2))}</pre>
+        <h3>Quo webhook URLs</h3>
+        <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/messages</div>
+        <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/calls</div>
+        <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/call-summary</div>
+      `;
+      form.reset();
+      form.practiceArea.value = "personal injury";
+      loadFirms();
+    } catch (err) {
+      msg($("add-result"), "error", `Network error: ${escape(err.message)}`);
+    }
+  });
+
+  if ($("token").value) loadFirms();
+</script>
+</body>
+</html>

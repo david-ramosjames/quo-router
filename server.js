@@ -1391,6 +1391,98 @@ app.post("/webhooks/quo/messages", withDefaultFirm(handleMessages));
 app.post("/webhooks/quo/calls", withDefaultFirm(handleCalls));
 app.post("/webhooks/quo/call-summary", withDefaultFirm(handleCallSummary));
 
+// === Admin UI ===
+
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const FIRM_ID_PATTERN = /^[a-z0-9-]+$/;
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(503).json({ error: "ADMIN_TOKEN not configured on the server" });
+  }
+  const provided = req.get("x-admin-token") || req.query.token;
+  if (provided !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing admin token" });
+  }
+  next();
+}
+
+app.get("/admin", (_req, res) => {
+  res.sendFile(path.join(__dirname, "admin.html"));
+});
+
+app.get("/admin/api/firms", requireAdmin, (_req, res) => {
+  const list = Array.from(firms.values()).map((f) => ({
+    id: f.id,
+    name: f.name,
+    practiceArea: f.practiceArea,
+    phoneLines: f.phoneLines,
+    leadThreadTagUsers: f.leadThreadTagUsers,
+    hasQuoApiKey: !!f.quoApiKey,
+    hasSlackBotToken: !!f.slackBotToken,
+    hasLeadCallsChannel: !!f.slackLeadCallsChannelId,
+    hasLegalAssistantChannel: !!f.slackLegalAssistantChannelId,
+  }));
+  res.json(list);
+});
+
+app.post("/admin/api/firms", requireAdmin, (req, res) => {
+  const { id, name, practiceArea, phoneLines, leadThreadTagUsers } = req.body || {};
+
+  if (!id || !FIRM_ID_PATTERN.test(id)) {
+    return res.status(400).json({ error: "id must be lowercase alphanumeric with hyphens" });
+  }
+  if (firms.has(id)) {
+    return res.status(409).json({ error: `Firm "${id}" already exists` });
+  }
+  if (!name || typeof name !== "string") {
+    return res.status(400).json({ error: "name is required" });
+  }
+  if (phoneLines && typeof phoneLines !== "object") {
+    return res.status(400).json({ error: "phoneLines must be an object mapping phone → line name" });
+  }
+  if (leadThreadTagUsers && !Array.isArray(leadThreadTagUsers)) {
+    return res.status(400).json({ error: "leadThreadTagUsers must be an array of Slack user IDs" });
+  }
+
+  const firmConfig = {
+    name: String(name).trim(),
+    practiceArea: String(practiceArea || "personal injury").trim(),
+    phoneLines: phoneLines || {},
+    leadThreadTagUsers: leadThreadTagUsers || [],
+  };
+
+  // Persist to firms.json on disk (may be ephemeral depending on host)
+  const configPath = path.join(__dirname, "firms.json");
+  let onDisk = {};
+  if (fs.existsSync(configPath)) {
+    try {
+      onDisk = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    } catch (err) {
+      return res.status(500).json({ error: `firms.json is corrupt: ${err.message}` });
+    }
+  }
+  onDisk[id] = firmConfig;
+  try {
+    fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2) + "\n");
+  } catch (err) {
+    console.error(`[admin] Failed to write firms.json:`, err.message);
+    return res.status(500).json({ error: `Failed to write firms.json: ${err.message}` });
+  }
+
+  // Register in-memory so it's live immediately
+  const firm = makeFirm(id, firmConfig);
+  firms.set(id, firm);
+  console.log(`[admin] Registered new firm "${id}" (${firmConfig.name})`);
+
+  // Kick off cache load in the background
+  loadFirmCaches(firm).catch((err) =>
+    console.error(`[${id}][startup] Cache load error:`, err.message)
+  );
+
+  res.json({ ok: true, firmId: id, config: firmConfig });
+});
+
 // === Startup ===
 
 registerFirms();
