@@ -113,6 +113,12 @@
   .danger-btn { background: var(--danger); color: white; }
   .danger-btn:hover { background: #dc2626; }
   input[readonly] { opacity: 0.6; cursor: not-allowed; }
+  input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .secret-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .src-tag { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 10px; }
+  .src-tag.env { background: #e0e7ff; color: #3730a3; }
+  .src-tag.stored { background: #d1fae5; color: #065f46; }
+  .src-tag.none { background: #f3f4f6; color: #6b7280; }
   details { margin: 8px 0; }
   summary {
     cursor: pointer;
@@ -168,6 +174,9 @@
     .badge.ok { background: #14532d; color: #bbf7d0; }
     .badge.missing { background: #7f1d1d; color: #fecaca; }
     .badge.src { background: #312e81; color: #c7d2fe; }
+    .src-tag.env { background: #312e81; color: #c7d2fe; }
+    .src-tag.stored { background: #14532d; color: #bbf7d0; }
+    .src-tag.none { background: #262a34; color: #9ca3af; }
   }
 </style>
 </head>
@@ -220,6 +229,12 @@
       <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
+      <h3 style="margin-top:24px">Credentials</h3>
+      <div class="hint" id="creds-note" style="margin-bottom:8px">
+        Quo API key, Slack bot token, webhook URLs, and channel IDs for this firm.
+      </div>
+      <div id="secret-fields"></div>
+
       <div style="margin-top:16px; display:flex; gap:8px">
         <button type="submit" id="submit-btn">Add Firm</button>
         <button type="button" id="cancel-edit" class="secondary" style="display:none">Cancel</button>
@@ -250,19 +265,29 @@ PUBLIC_URL=https://your-host.com         # used to build the OAuth redirect URI<
     </details>
 
     <details>
-      <summary>What environment variables do I need to set for a new firm?</summary>
-      <p>Secrets are per-firm and named <code>FIRM_&lt;UPPERCASE_ID&gt;_&lt;VAR&gt;</code>. For a firm with id <code>smithlaw</code>, set:</p>
-      <pre>FIRM_SMITHLAW_QUO_API_KEY=...
-FIRM_SMITHLAW_SLACK_BOT_TOKEN=xoxb-...
-FIRM_SMITHLAW_SLACK_TEXT_MESSAGES_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_MISSED_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_HUMAN_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_SONA_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_LEAD_CALLS_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL=https://hooks.slack.com/...
-FIRM_SMITHLAW_SLACK_LEAD_CALLS_CHANNEL_ID=C0000000000
-FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID=C0000000000</pre>
-      <p><code>ANTHROPIC_API_KEY</code> is shared across all firms (used only for lead classification), no per-firm version is needed.</p>
+      <summary>How do I set a firm's credentials (Quo key, Slack token, webhooks)?</summary>
+      <p>Two ways — you can mix and match per field:</p>
+      <ul>
+        <li><strong>In this UI (recommended for new firms):</strong> enter them in the Credentials section of the Add/Edit form. With Postgres configured they're stored in the database (encrypted if <code>SECRET_ENCRYPTION_KEY</code> is set) and survive redeploys. This makes onboarding fully self-service.</li>
+        <li><strong>As env vars:</strong> per-firm and named <code>FIRM_&lt;UPPERCASE_ID&gt;_&lt;VAR&gt;</code>. <strong>Env vars always take precedence</strong> over UI-stored values, so a field set in the environment shows as "from env" and is read-only in the form.</li>
+      </ul>
+      <p>The full set of credential fields (for firm id <code>smithlaw</code>, the env-var names would be):</p>
+      <pre>FIRM_SMITHLAW_QUO_API_KEY
+FIRM_SMITHLAW_SLACK_BOT_TOKEN
+FIRM_SMITHLAW_SLACK_TEXT_MESSAGES_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_MISSED_CALLS_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_HUMAN_CALLS_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_SONA_CALLS_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_LEAD_CALLS_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL
+FIRM_SMITHLAW_SLACK_LEAD_CALLS_CHANNEL_ID
+FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
+      <p><code>ANTHROPIC_API_KEY</code> is shared across all firms (used only for lead classification) and stays an env var — there's no per-firm version.</p>
+    </details>
+
+    <details>
+      <summary>Is it safe to store credentials in the database?</summary>
+      <p>The admin panel is gated behind Google OAuth restricted to your domain, and the API never returns stored secret values (the UI only shows "saved / not set / from env"). For defense in depth, set <code>SECRET_ENCRYPTION_KEY</code> to any strong passphrase — credentials are then AES-256-GCM encrypted before they're written to Postgres, so a database dump alone can't reveal them. The key itself lives only in the environment, never in the database. Without it, credentials are stored as plaintext in the DB (still behind the database's own access controls).</p>
     </details>
 
     <details>
@@ -492,6 +517,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.phoneLines.value = Object.entries(f.phoneLines || {})
       .map(([n, name]) => `${n}=${name}`).join("\n");
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
+    renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
     $("submit-btn").textContent = "Save Changes";
     $("cancel-edit").style.display = "";
@@ -505,10 +531,67 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.reset();
     form.id.readOnly = false;
     form.practiceArea.value = "personal injury";
+    renderSecretFields(null);
     $("add-title").textContent = "Add a New Firm";
     $("submit-btn").textContent = "Add Firm";
     $("cancel-edit").style.display = "none";
     $("add-result").innerHTML = "";
+  }
+
+  let secretFieldMeta = [];
+  let secretEncryptionEnabled = false;
+  let dbConfigured = false;
+
+  async function loadSecretFieldMeta() {
+    try {
+      const res = await fetch("/admin/api/secret-fields", { credentials: "same-origin" });
+      if (!res.ok) return;
+      const json = await res.json();
+      secretFieldMeta = json.fields || [];
+      secretEncryptionEnabled = !!json.encryptionEnabled;
+      dbConfigured = !!json.dbConfigured;
+      const note = $("creds-note");
+      if (!dbConfigured) {
+        note.innerHTML = 'No database is configured (<code>DATABASE_URL</code> unset), so credentials entered here are held in memory only and are lost on restart. Set them as <code>FIRM_&lt;ID&gt;_*</code> env vars, or configure Postgres to store them.';
+      } else {
+        note.innerHTML = `Quo API key, Slack bot token, webhook URLs, and channel IDs for this firm. Stored in Postgres${secretEncryptionEnabled ? " (encrypted at rest)" : " as plaintext — set <code>SECRET_ENCRYPTION_KEY</code> to encrypt"}. Values set via <code>FIRM_&lt;ID&gt;_*</code> env vars always take precedence.`;
+      }
+      renderSecretFields(null);
+    } catch {}
+  }
+
+  function renderSecretFields(sources) {
+    const el = $("secret-fields");
+    if (!el) return;
+    el.innerHTML = secretFieldMeta.map((f) => {
+      const src = sources ? sources[f.key] : null;
+      let status = '<span class="src-tag none">not set</span>';
+      let disabled = "";
+      let ph = f.secret ? "" : "C0000000000";
+      if (src === "env") {
+        status = '<span class="src-tag env">from env — managed via environment</span>';
+        disabled = "disabled";
+        ph = "set via FIRM_" + (editingId || "ID").toUpperCase() + "_" + f.key;
+      } else if (src === "stored") {
+        status = '<span class="src-tag stored">saved — leave blank to keep</span>';
+        ph = "•••••••• (unchanged)";
+      }
+      return `
+        <label class="secret-label">${escape(f.label)} ${status}</label>
+        <input type="${f.secret ? "password" : "text"}" data-secret="${escape(f.key)}" ${disabled}
+          placeholder="${escape(ph)}" autocomplete="off" spellcheck="false">
+      `;
+    }).join("");
+  }
+
+  function collectSecrets() {
+    const out = {};
+    document.querySelectorAll("[data-secret]").forEach((inp) => {
+      if (inp.disabled) return;
+      const v = inp.value.trim();
+      if (v) out[inp.getAttribute("data-secret")] = v;
+    });
+    return out;
   }
 
   async function deleteFirm(id) {
@@ -547,6 +630,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       practiceArea: form.practiceArea.value.trim(),
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
+      secrets: collectSecrets(),
     };
 
     // --- Edit mode: PUT the changes, then reset ---
@@ -595,50 +679,58 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
         return;
       }
       const upper = payload.id.toUpperCase();
-      const envVars = [
-        `FIRM_${upper}_QUO_API_KEY`,
-        `FIRM_${upper}_SLACK_BOT_TOKEN`,
-        `FIRM_${upper}_SLACK_TEXT_MESSAGES_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_MISSED_CALLS_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_HUMAN_CALLS_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_SONA_CALLS_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_LEAD_CALLS_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL`,
-        `FIRM_${upper}_SLACK_LEAD_CALLS_CHANNEL_ID`,
-        `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_CHANNEL_ID`,
-      ];
+      const suppliedSecrets = Object.keys(payload.secrets || {}).length;
       const toPostgres = json.persistedTo === "postgres";
-      const persistMsg = toPostgres
-        ? `<div class="msg success">
+      let persistMsg, extraBlock = "";
+      if (toPostgres) {
+        persistMsg = `<div class="msg success">
              Firm <code>${escape(payload.id)}</code> saved to Postgres and registered live.
-             It will survive redeploys automatically — no git commit needed.
-           </div>
-           <div class="msg warning">
-             One thing left: set the env vars below in the deployment
-             (secrets — never stored in the database).
-           </div>`
-        : `<div class="msg success">
+             ${suppliedSecrets ? "Credentials were saved too — it will survive redeploys automatically." : "It will survive redeploys automatically."}
+           </div>`;
+        if (!suppliedSecrets) {
+          extraBlock = `<div class="msg warning">
+             You didn't enter any credentials. Add them via <strong>Edit</strong>, or set
+             <code>FIRM_${escape(upper)}_*</code> env vars — the firm won't route anything until
+             its Quo API key and Slack details are configured.
+           </div>`;
+        }
+      } else {
+        const envVars = [
+          `FIRM_${upper}_QUO_API_KEY`,
+          `FIRM_${upper}_SLACK_BOT_TOKEN`,
+          `FIRM_${upper}_SLACK_TEXT_MESSAGES_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_MISSED_CALLS_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_HUMAN_CALLS_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_SONA_CALLS_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_LEAD_CALLS_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL`,
+          `FIRM_${upper}_SLACK_LEAD_CALLS_CHANNEL_ID`,
+          `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_CHANNEL_ID`,
+        ];
+        persistMsg = `<div class="msg success">
              Firm <code>${escape(payload.id)}</code> registered live and written to firms.json on disk.
            </div>
            <div class="msg warning">
-             No database is configured (<code>DATABASE_URL</code> unset), so this firm will NOT
-             survive a redeploy. To finish setup:
-             <br>1. Set the env vars below in the deployment (secrets).
-             <br>2. Commit the <code>firms.json</code> entry below to git so the config persists.
+             No database is configured (<code>DATABASE_URL</code> unset), so this firm — and any
+             credentials you entered — will NOT survive a redeploy. To persist:
+             <br>1. Set the env vars below in the deployment.
+             <br>2. Commit the <code>firms.json</code> entry below to git.
+             <br>Or configure Postgres (<code>DATABASE_URL</code>) to make this fully self-service.
            </div>`;
-      const jsonEntryBlock = toPostgres ? "" : `
-        <h3>firms.json entry (for git)</h3>
-        <pre>${escape(JSON.stringify({ [payload.id]: {
-          name: payload.name,
-          practiceArea: payload.practiceArea,
-          phoneLines: payload.phoneLines,
-          leadThreadTagUsers: payload.leadThreadTagUsers,
-        } }, null, 2))}</pre>`;
+        extraBlock = `
+          <h3>Env vars to set</h3>
+          <pre>${envVars.join("\n")}</pre>
+          <h3>firms.json entry (for git)</h3>
+          <pre>${escape(JSON.stringify({ [payload.id]: {
+            name: payload.name,
+            practiceArea: payload.practiceArea,
+            phoneLines: payload.phoneLines,
+            leadThreadTagUsers: payload.leadThreadTagUsers,
+          } }, null, 2))}</pre>`;
+      }
       $("add-result").innerHTML = `
         ${persistMsg}
-        <h3>Env vars to set</h3>
-        <pre>${envVars.join("\n")}</pre>
-        ${jsonEntryBlock}
+        ${extraBlock}
         <h3>Quo webhook URLs</h3>
         <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/messages</div>
         <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/calls</div>
@@ -646,6 +738,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       `;
       form.reset();
       form.practiceArea.value = "personal injury";
+      renderSecretFields(null);
       loadFirms();
     } catch (err) {
       msg($("add-result"), "error", `Network error: ${escape(err.message)}`);
@@ -654,7 +747,10 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
 
   (async () => {
     const authed = await checkSession();
-    if (authed) loadFirms();
+    if (authed) {
+      await loadSecretFieldMeta();
+      loadFirms();
+    }
   })();
 </script>
 </body>

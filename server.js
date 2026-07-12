@@ -44,21 +44,33 @@ function loadFirmConfigFile() {
   return null;
 }
 
-function makeFirm(firmId, config) {
+// Per-firm secret/credential fields. `key` is BOTH the env-var suffix
+// (FIRM_<ID>_<key>) and the key used in the stored-secrets object.
+const SECRET_FIELDS = [
+  { key: "QUO_API_KEY", label: "Quo API Key", secret: true },
+  { key: "SLACK_BOT_TOKEN", label: "Slack Bot Token", secret: true },
+  { key: "SLACK_TEXT_MESSAGES_WEBHOOK_URL", label: "#text-messages webhook", secret: true },
+  { key: "SLACK_MISSED_CALLS_WEBHOOK_URL", label: "#missed-calls webhook", secret: true },
+  { key: "SLACK_HUMAN_CALLS_WEBHOOK_URL", label: "#human-calls webhook", secret: true },
+  { key: "SLACK_SONA_CALLS_WEBHOOK_URL", label: "#sona-calls webhook", secret: true },
+  { key: "SLACK_LEAD_CALLS_WEBHOOK_URL", label: "#lead-calls webhook", secret: true },
+  { key: "SLACK_LEGAL_ASSISTANT_WEBHOOK_URL", label: "#legalassistant-phone webhook", secret: true },
+  { key: "SLACK_LEAD_CALLS_CHANNEL_ID", label: "#lead-calls channel ID", secret: false },
+  { key: "SLACK_LEGAL_ASSISTANT_CHANNEL_ID", label: "#legalassistant-phone channel ID", secret: false },
+];
+
+// Resolve a firm's credentials with precedence: FIRM_<ID>_<key> env var wins,
+// then legacy un-prefixed env (default firm only), then UI-stored secrets.
+// Env always wins so an existing env-based deployment can never be overridden
+// by a value saved through the admin UI.
+function resolveFirmSecrets(firmId, storedSecrets) {
   const upper = firmId.toUpperCase();
   const perFirm = (key) => process.env[`FIRM_${upper}_${key}`];
-  // Legacy fallback: if this is the default firm and no per-firm env vars are set,
-  // fall back to the old un-prefixed env vars so existing deployments keep working.
   const legacyOk = firmId === DEFAULT_FIRM_ID && !perFirm("QUO_API_KEY") && !perFirm("SLACK_BOT_TOKEN");
   const legacy = (key) => (legacyOk ? process.env[key] : undefined);
-  const pick = (key) => perFirm(key) || legacy(key) || null;
-
+  const stored = storedSecrets || {};
+  const pick = (key) => perFirm(key) || legacy(key) || stored[key] || null;
   return {
-    id: firmId,
-    name: config.name || firmId,
-    practiceArea: config.practiceArea || "personal injury",
-    phoneLines: config.phoneLines || {},
-    leadThreadTagUsers: config.leadThreadTagUsers || [],
     slackLeadCallsChannelId: pick("SLACK_LEAD_CALLS_CHANNEL_ID"),
     slackLegalAssistantChannelId: pick("SLACK_LEGAL_ASSISTANT_CHANNEL_ID"),
     quoApiKey: pick("QUO_API_KEY"),
@@ -71,6 +83,35 @@ function makeFirm(firmId, config) {
       leadCalls: pick("SLACK_LEAD_CALLS_WEBHOOK_URL"),
       legalAssistant: pick("SLACK_LEGAL_ASSISTANT_WEBHOOK_URL"),
     },
+  };
+}
+
+// For the admin UI: report where each credential comes from without leaking it.
+// Returns { <key>: "env" | "stored" | null }.
+function secretSources(firmId, storedSecrets) {
+  const upper = firmId.toUpperCase();
+  const legacyOk = firmId === DEFAULT_FIRM_ID
+    && !process.env[`FIRM_${upper}_QUO_API_KEY`]
+    && !process.env[`FIRM_${upper}_SLACK_BOT_TOKEN`];
+  const out = {};
+  for (const { key } of SECRET_FIELDS) {
+    if (process.env[`FIRM_${upper}_${key}`]) out[key] = "env";
+    else if (legacyOk && process.env[key]) out[key] = "env";
+    else if (storedSecrets && storedSecrets[key]) out[key] = "stored";
+    else out[key] = null;
+  }
+  return out;
+}
+
+function makeFirm(firmId, config, storedSecrets = {}) {
+  return {
+    id: firmId,
+    name: config.name || firmId,
+    practiceArea: config.practiceArea || "personal injury",
+    phoneLines: config.phoneLines || {},
+    leadThreadTagUsers: config.leadThreadTagUsers || [],
+    storedSecrets: storedSecrets || {},
+    ...resolveFirmSecrets(firmId, storedSecrets),
     // Per-firm state
     contactsCache: new Map(),
     quoUsersCache: new Map(),
@@ -80,6 +121,12 @@ function makeFirm(firmId, config) {
     pendingCallChecks: new Map(),
     resolvedCalls: new Set(),
   };
+}
+
+// Recompute a firm's derived credential fields in place (after its stored
+// secrets change) without discarding caches or pending timers.
+function applyFirmSecrets(firm) {
+  Object.assign(firm, resolveFirmSecrets(firm.id, firm.storedSecrets));
 }
 
 function registerFirms() {
@@ -128,6 +175,45 @@ function getFirm(firmId) {
 const DATABASE_URL = process.env.DATABASE_URL;
 let pgPool = null;
 
+// Optional encryption at rest for UI-stored credentials. If SECRET_ENCRYPTION_KEY
+// is set, stored secrets are AES-256-GCM encrypted before they touch the DB, so a
+// database dump alone can't reveal them. Without it, secrets are stored as
+// plaintext JSON (still behind the DB's own access controls).
+const SECRET_KEY = process.env.SECRET_ENCRYPTION_KEY
+  ? crypto.scryptSync(process.env.SECRET_ENCRYPTION_KEY, "quo-router-secret-salt", 32)
+  : null;
+
+function encryptSecrets(obj) {
+  const json = JSON.stringify(obj || {});
+  if (!SECRET_KEY) return json; // plaintext fallback
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", SECRET_KEY, iv);
+  const ct = Buffer.concat([cipher.update(json, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:v1:${iv.toString("base64")}:${tag.toString("base64")}:${ct.toString("base64")}`;
+}
+
+function decryptSecrets(str) {
+  if (!str) return {};
+  if (!str.startsWith("enc:")) {
+    try { return JSON.parse(str); } catch { return {}; }
+  }
+  if (!SECRET_KEY) {
+    console.error("[secrets] A firm's secrets are encrypted but SECRET_ENCRYPTION_KEY is not set — cannot decrypt");
+    return {};
+  }
+  try {
+    const [, , ivB, tagB, ctB] = str.split(":");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", SECRET_KEY, Buffer.from(ivB, "base64"));
+    decipher.setAuthTag(Buffer.from(tagB, "base64"));
+    const pt = Buffer.concat([decipher.update(Buffer.from(ctB, "base64")), decipher.final()]);
+    return JSON.parse(pt.toString("utf8"));
+  } catch (err) {
+    console.error("[secrets] Failed to decrypt stored secrets:", err.message);
+    return {};
+  }
+}
+
 async function initFirmStore() {
   if (!DATABASE_URL) {
     console.warn("[db] DATABASE_URL not set — new firms persist to firms.json only (ephemeral on most hosts)");
@@ -147,11 +233,14 @@ async function initFirmStore() {
         practice_area TEXT NOT NULL DEFAULT 'personal injury',
         phone_lines JSONB NOT NULL DEFAULT '{}'::jsonb,
         lead_thread_tag_users JSONB NOT NULL DEFAULT '[]'::jsonb,
+        secrets TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
-    console.log("[db] Connected to Postgres and ensured firms table exists");
+    // Migrate older tables that predate the secrets column.
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS secrets TEXT`);
+    console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
     pgPool = null;
@@ -174,16 +263,17 @@ async function loadFirmsFromDb() {
     let count = 0;
     for (const row of rows) {
       if (row.id.startsWith("_")) continue;
+      const secrets = decryptSecrets(row.secrets);
       // The default firm always comes from firms.json — never let the DB shadow it.
       if (row.id === DEFAULT_FIRM_ID) {
         if (!firms.has(row.id)) {
-          const f = makeFirm(row.id, rowToConfig(row));
+          const f = makeFirm(row.id, rowToConfig(row), secrets);
           f.source = "db";
           firms.set(row.id, f);
         }
         continue;
       }
-      const firm = makeFirm(row.id, rowToConfig(row));
+      const firm = makeFirm(row.id, rowToConfig(row), secrets);
       firm.source = "db";
       firms.set(row.id, firm);
       count++;
@@ -196,16 +286,17 @@ async function loadFirmsFromDb() {
   }
 }
 
-async function saveFirmToDb(id, config) {
+async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
        phone_lines = EXCLUDED.phone_lines,
        lead_thread_tag_users = EXCLUDED.lead_thread_tag_users,
+       secrets = EXCLUDED.secrets,
        updated_at = now()`,
     [
       id,
@@ -213,6 +304,7 @@ async function saveFirmToDb(id, config) {
       config.practiceArea,
       JSON.stringify(config.phoneLines || {}),
       JSON.stringify(config.leadThreadTagUsers || []),
+      encryptSecrets(storedSecrets || {}),
     ],
   );
   return true;
@@ -1767,8 +1859,19 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     hasSlackBotToken: !!f.slackBotToken,
     hasLeadCallsChannel: !!f.slackLeadCallsChannelId,
     hasLegalAssistantChannel: !!f.slackLegalAssistantChannelId,
+    // Per-credential source without leaking values: "env" | "stored" | null
+    secretSources: secretSources(f.id, f.storedSecrets),
   }));
   res.json(list);
+});
+
+// Which credential fields are editable in the UI (metadata only, no values).
+app.get("/admin/api/secret-fields", requireAuth, (_req, res) => {
+  res.json({
+    fields: SECRET_FIELDS.map(({ key, label, secret }) => ({ key, label, secret })),
+    encryptionEnabled: !!SECRET_KEY,
+    dbConfigured: !!pgPool,
+  });
 });
 
 // Validate the editable config fields common to create + update. Returns
@@ -1794,12 +1897,25 @@ function validateFirmBody(body) {
   };
 }
 
-// Persist a firm config to the appropriate store. `source` decides where:
-// db-backed firms go to Postgres; file-backed firms go to firms.json on disk.
+// Pull the known secret fields out of a request body's `secrets` object,
+// keeping only non-empty string values. Unknown keys are ignored.
+function extractSecretsFromBody(body) {
+  const out = {};
+  const provided = (body && body.secrets) || {};
+  for (const { key } of SECRET_FIELDS) {
+    const v = provided[key];
+    if (typeof v === "string" && v.trim()) out[key] = v.trim();
+  }
+  return out;
+}
+
+// Persist a firm to the appropriate store. `source` decides where: db-backed
+// firms go to Postgres (with secrets); file-backed firms go to firms.json on
+// disk (config ONLY — secrets are never written to the git-tracked file).
 // Returns the label used in the response ("postgres" or "disk").
-async function persistFirm(id, config, source) {
+async function persistFirm(id, config, source, storedSecrets) {
   if (source === "db" && pgPool) {
-    await saveFirmToDb(id, config);
+    await saveFirmToDb(id, config, storedSecrets);
     return "postgres";
   }
   saveFirmToDisk(id, config);
@@ -1817,27 +1933,32 @@ app.post("/admin/api/firms", requireAuth, async (req, res) => {
   const { config, error } = validateFirmBody(req.body);
   if (error) return res.status(400).json({ error });
 
+  const storedSecrets = extractSecretsFromBody(req.body);
+
   // New firms go to Postgres when configured, else firms.json on disk.
   const source = pgPool ? "db" : "file";
   let persistedTo;
   try {
-    persistedTo = await persistFirm(id, config, source);
+    persistedTo = await persistFirm(id, config, source, storedSecrets);
   } catch (err) {
     console.error(`[admin] Failed to persist firm "${id}":`, err.message);
     return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
   }
 
   // Register in-memory so it's live immediately
-  const firm = makeFirm(id, config);
+  const firm = makeFirm(id, config, storedSecrets);
   firm.source = source;
   firms.set(id, firm);
-  console.log(`[admin] Registered new firm "${id}" (${config.name}), persisted to ${persistedTo}`);
+  const secretsNote = !pgPool && Object.keys(storedSecrets).length
+    ? " (secrets held in memory only — no DATABASE_URL, they won't survive restart)"
+    : "";
+  console.log(`[admin] Registered new firm "${id}" (${config.name}), persisted to ${persistedTo}${secretsNote}`);
 
   loadFirmCaches(firm).catch((err) =>
     console.error(`[${id}][startup] Cache load error:`, err.message)
   );
 
-  res.json({ ok: true, firmId: id, config, persistedTo });
+  res.json({ ok: true, firmId: id, config, persistedTo, secretsPersisted: pgPool ? true : false });
 });
 
 app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
@@ -1849,9 +1970,18 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   const { config, error } = validateFirmBody(req.body);
   if (error) return res.status(400).json({ error });
 
+  // Merge provided secrets over the firm's existing stored secrets. Blank fields
+  // are left untouched (extractSecretsFromBody drops them), so the UI can leave a
+  // credential's box empty to keep the current value.
+  const provided = extractSecretsFromBody(req.body);
+  const mergedSecrets = { ...(firm.storedSecrets || {}), ...provided };
+  // Explicit clears: a field listed in body.clearSecrets removes the stored value.
+  const clears = Array.isArray(req.body?.clearSecrets) ? req.body.clearSecrets : [];
+  for (const key of clears) delete mergedSecrets[key];
+
   let persistedTo;
   try {
-    persistedTo = await persistFirm(id, config, firm.source || "file");
+    persistedTo = await persistFirm(id, config, firm.source || "file", mergedSecrets);
   } catch (err) {
     console.error(`[admin] Failed to persist edit for firm "${id}":`, err.message);
     return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
@@ -1862,6 +1992,8 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.practiceArea = config.practiceArea;
   firm.phoneLines = config.phoneLines;
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
+  firm.storedSecrets = mergedSecrets;
+  applyFirmSecrets(firm); // recompute quoApiKey/slackBotToken/webhooks/channels
   console.log(`[admin] Updated firm "${id}" (${config.name}), persisted to ${persistedTo}`);
 
   res.json({ ok: true, firmId: id, config, persistedTo });
