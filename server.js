@@ -87,13 +87,15 @@ function registerFirms() {
   if (config && typeof config === "object") {
     for (const [firmId, firmConfig] of Object.entries(config)) {
       if (firmId.startsWith("_")) continue; // skip _docs, _comment, etc.
-      firms.set(firmId, makeFirm(firmId, firmConfig || {}));
+      const firm = makeFirm(firmId, firmConfig || {});
+      firm.source = "file";
+      firms.set(firmId, firm);
     }
   }
   // Legacy fallback: if no firms.json/FIRMS_CONFIG, synthesize a default firm from legacy env vars
   if (firms.size === 0 && process.env.QUO_API_KEY) {
     console.warn(`[firms] No firms.json found — synthesizing "${DEFAULT_FIRM_ID}" from legacy env vars`);
-    firms.set(DEFAULT_FIRM_ID, makeFirm(DEFAULT_FIRM_ID, {
+    const legacyFirm = makeFirm(DEFAULT_FIRM_ID, {
       name: "Ramos James Law",
       practiceArea: "personal injury",
       phoneLines: {
@@ -104,7 +106,9 @@ function registerFirms() {
         "+15126300907": "RJL Transfers",
       },
       leadThreadTagUsers: ["U026P9FUKHC", "U0ANAJK56LD"],
-    }));
+    });
+    legacyFirm.source = "file";
+    firms.set(DEFAULT_FIRM_ID, legacyFirm);
   }
   const summary = Array.from(firms.entries()).map(([id, f]) => `${id} (${f.name})`).join(", ");
   console.log(`[firms] Registered ${firms.size} firm(s): ${summary || "(none)"}`);
@@ -172,10 +176,16 @@ async function loadFirmsFromDb() {
       if (row.id.startsWith("_")) continue;
       // The default firm always comes from firms.json — never let the DB shadow it.
       if (row.id === DEFAULT_FIRM_ID) {
-        if (!firms.has(row.id)) firms.set(row.id, makeFirm(row.id, rowToConfig(row)));
+        if (!firms.has(row.id)) {
+          const f = makeFirm(row.id, rowToConfig(row));
+          f.source = "db";
+          firms.set(row.id, f);
+        }
         continue;
       }
-      firms.set(row.id, makeFirm(row.id, rowToConfig(row)));
+      const firm = makeFirm(row.id, rowToConfig(row));
+      firm.source = "db";
+      firms.set(row.id, firm);
       count++;
     }
     console.log(`[db] Loaded ${count} firm(s) from Postgres`);
@@ -208,6 +218,12 @@ async function saveFirmToDb(id, config) {
   return true;
 }
 
+async function deleteFirmFromDb(id) {
+  if (!pgPool) return false;
+  await pgPool.query("DELETE FROM firms WHERE id = $1", [id]);
+  return true;
+}
+
 // Persist a new firm to firms.json on disk (fallback when no DATABASE_URL).
 function saveFirmToDisk(id, config) {
   const configPath = path.join(__dirname, "firms.json");
@@ -217,6 +233,23 @@ function saveFirmToDisk(id, config) {
   }
   onDisk[id] = config;
   fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2) + "\n");
+}
+
+function deleteFirmFromDisk(id) {
+  const configPath = path.join(__dirname, "firms.json");
+  if (!fs.existsSync(configPath)) return;
+  const onDisk = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  if (!(id in onDisk)) return;
+  delete onDisk[id];
+  fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2) + "\n");
+}
+
+// Cancel all pending fallback timers for a firm (used when a firm is removed,
+// so a scheduled call-check can't fire against a detached firm object).
+function teardownFirm(firm) {
+  for (const tid of firm.pendingCallChecks.values()) clearTimeout(tid);
+  firm.pendingCallChecks.clear();
+  firm.resolvedCalls.clear();
 }
 
 // === Firm-agnostic Utilities ===
@@ -1728,6 +1761,8 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     practiceArea: f.practiceArea,
     phoneLines: f.phoneLines,
     leadThreadTagUsers: f.leadThreadTagUsers,
+    source: f.source || "file",
+    isDefault: f.id === DEFAULT_FIRM_ID,
     hasQuoApiKey: !!f.quoApiKey,
     hasSlackBotToken: !!f.slackBotToken,
     hasLeadCallsChannel: !!f.slackLeadCallsChannelId,
@@ -1736,58 +1771,133 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
   res.json(list);
 });
 
-app.post("/admin/api/firms", requireAuth, async (req, res) => {
-  const { id, name, practiceArea, phoneLines, leadThreadTagUsers } = req.body || {};
+// Validate the editable config fields common to create + update. Returns
+// { config } on success or { error } on failure.
+function validateFirmBody(body) {
+  const { name, practiceArea, phoneLines, leadThreadTagUsers } = body || {};
+  if (!name || typeof name !== "string") {
+    return { error: "name is required" };
+  }
+  if (phoneLines && (typeof phoneLines !== "object" || Array.isArray(phoneLines))) {
+    return { error: "phoneLines must be an object mapping phone → line name" };
+  }
+  if (leadThreadTagUsers && !Array.isArray(leadThreadTagUsers)) {
+    return { error: "leadThreadTagUsers must be an array of Slack user IDs" };
+  }
+  return {
+    config: {
+      name: String(name).trim(),
+      practiceArea: String(practiceArea || "personal injury").trim(),
+      phoneLines: phoneLines || {},
+      leadThreadTagUsers: leadThreadTagUsers || [],
+    },
+  };
+}
 
+// Persist a firm config to the appropriate store. `source` decides where:
+// db-backed firms go to Postgres; file-backed firms go to firms.json on disk.
+// Returns the label used in the response ("postgres" or "disk").
+async function persistFirm(id, config, source) {
+  if (source === "db" && pgPool) {
+    await saveFirmToDb(id, config);
+    return "postgres";
+  }
+  saveFirmToDisk(id, config);
+  return "disk";
+}
+
+app.post("/admin/api/firms", requireAuth, async (req, res) => {
+  const { id } = req.body || {};
   if (!id || !FIRM_ID_PATTERN.test(id)) {
     return res.status(400).json({ error: "id must be lowercase alphanumeric with hyphens" });
   }
   if (firms.has(id)) {
     return res.status(409).json({ error: `Firm "${id}" already exists` });
   }
-  if (!name || typeof name !== "string") {
-    return res.status(400).json({ error: "name is required" });
-  }
-  if (phoneLines && typeof phoneLines !== "object") {
-    return res.status(400).json({ error: "phoneLines must be an object mapping phone → line name" });
-  }
-  if (leadThreadTagUsers && !Array.isArray(leadThreadTagUsers)) {
-    return res.status(400).json({ error: "leadThreadTagUsers must be an array of Slack user IDs" });
-  }
+  const { config, error } = validateFirmBody(req.body);
+  if (error) return res.status(400).json({ error });
 
-  const firmConfig = {
-    name: String(name).trim(),
-    practiceArea: String(practiceArea || "personal injury").trim(),
-    phoneLines: phoneLines || {},
-    leadThreadTagUsers: leadThreadTagUsers || [],
-  };
-
-  // Persist: Postgres if configured (survives redeploys), otherwise firms.json on disk.
+  // New firms go to Postgres when configured, else firms.json on disk.
+  const source = pgPool ? "db" : "file";
   let persistedTo;
   try {
-    if (pgPool) {
-      await saveFirmToDb(id, firmConfig);
-      persistedTo = "postgres";
-    } else {
-      saveFirmToDisk(id, firmConfig);
-      persistedTo = "disk";
-    }
+    persistedTo = await persistFirm(id, config, source);
   } catch (err) {
-    console.error(`[admin] Failed to persist firm "${id}" to ${pgPool ? "Postgres" : "disk"}:`, err.message);
+    console.error(`[admin] Failed to persist firm "${id}":`, err.message);
     return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
   }
 
   // Register in-memory so it's live immediately
-  const firm = makeFirm(id, firmConfig);
+  const firm = makeFirm(id, config);
+  firm.source = source;
   firms.set(id, firm);
-  console.log(`[admin] Registered new firm "${id}" (${firmConfig.name}), persisted to ${persistedTo}`);
+  console.log(`[admin] Registered new firm "${id}" (${config.name}), persisted to ${persistedTo}`);
 
-  // Kick off cache load in the background
   loadFirmCaches(firm).catch((err) =>
     console.error(`[${id}][startup] Cache load error:`, err.message)
   );
 
-  res.json({ ok: true, firmId: id, config: firmConfig, persistedTo });
+  res.json({ ok: true, firmId: id, config, persistedTo });
+});
+
+app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
+  const id = req.params.id;
+  const firm = firms.get(id);
+  if (!firm) {
+    return res.status(404).json({ error: `Firm "${id}" not found` });
+  }
+  const { config, error } = validateFirmBody(req.body);
+  if (error) return res.status(400).json({ error });
+
+  let persistedTo;
+  try {
+    persistedTo = await persistFirm(id, config, firm.source || "file");
+  } catch (err) {
+    console.error(`[admin] Failed to persist edit for firm "${id}":`, err.message);
+    return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
+  }
+
+  // Update the editable fields in place so caches and pending timers are preserved.
+  firm.name = config.name;
+  firm.practiceArea = config.practiceArea;
+  firm.phoneLines = config.phoneLines;
+  firm.leadThreadTagUsers = config.leadThreadTagUsers;
+  console.log(`[admin] Updated firm "${id}" (${config.name}), persisted to ${persistedTo}`);
+
+  res.json({ ok: true, firmId: id, config, persistedTo });
+});
+
+app.delete("/admin/api/firms/:id", requireAuth, async (req, res) => {
+  const id = req.params.id;
+  if (id === DEFAULT_FIRM_ID) {
+    return res.status(403).json({
+      error: `Cannot delete the default firm "${id}". Edit firms.json in the repo to change it.`,
+    });
+  }
+  const firm = firms.get(id);
+  if (!firm) {
+    return res.status(404).json({ error: `Firm "${id}" not found` });
+  }
+
+  let removedFrom;
+  try {
+    if (firm.source === "db" && pgPool) {
+      await deleteFirmFromDb(id);
+      removedFrom = "postgres";
+    } else {
+      deleteFirmFromDisk(id);
+      removedFrom = "disk";
+    }
+  } catch (err) {
+    console.error(`[admin] Failed to delete firm "${id}":`, err.message);
+    return res.status(500).json({ error: `Failed to delete firm: ${err.message}` });
+  }
+
+  teardownFirm(firm);
+  firms.delete(id);
+  console.log(`[admin] Deleted firm "${id}" (removed from ${removedFrom})`);
+
+  res.json({ ok: true, firmId: id, removedFrom });
 });
 
 // === Startup ===

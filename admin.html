@@ -108,6 +108,11 @@
   }
   .badge.ok { background: #d1fae5; color: #065f46; }
   .badge.missing { background: #fee2e2; color: #991b1b; }
+  .badge.src { background: #e0e7ff; color: #3730a3; text-transform: uppercase; letter-spacing: 0.03em; }
+  .firm-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .danger-btn { background: var(--danger); color: white; }
+  .danger-btn:hover { background: #dc2626; }
+  input[readonly] { opacity: 0.6; cursor: not-allowed; }
   details { margin: 8px 0; }
   summary {
     cursor: pointer;
@@ -162,6 +167,7 @@
     .msg.warning { background: #2b1e08; color: #fde68a; border-color: #78350f; }
     .badge.ok { background: #14532d; color: #bbf7d0; }
     .badge.missing { background: #7f1d1d; color: #fecaca; }
+    .badge.src { background: #312e81; color: #c7d2fe; }
   }
 </style>
 </head>
@@ -184,11 +190,10 @@
   </section>
 
   <section id="add-section" style="display:none">
-    <h2>Add a New Firm</h2>
+    <h2 id="add-title">Add a New Firm</h2>
     <p class="subtitle" style="margin-bottom:0">
-      Registers a firm in memory and appends it to firms.json on disk. You still need to set
-      the firm's env vars in the deployment and (for permanence across redeploys) commit
-      the updated firms.json to git.
+      Registers a firm live and persists it (Postgres if configured, otherwise firms.json on
+      disk). Secrets still come from the firm's <code>FIRM_&lt;ID&gt;_*</code> env vars.
     </p>
     <form id="addFirm">
       <div class="row">
@@ -215,8 +220,9 @@
       <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
-      <div style="margin-top:16px">
-        <button type="submit">Add Firm</button>
+      <div style="margin-top:16px; display:flex; gap:8px">
+        <button type="submit" id="submit-btn">Add Firm</button>
+        <button type="button" id="cancel-edit" class="secondary" style="display:none">Cancel</button>
       </div>
     </form>
     <div id="add-result"></div>
@@ -318,7 +324,12 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
 
     <details>
       <summary>How do I edit or remove a firm?</summary>
-      <p>This UI only adds firms. To edit or remove a Postgres-stored firm, update or delete its row in the <code>firms</code> table (then redeploy or restart to reload). For the default firm in <code>firms.json</code>, edit the file in the repo and redeploy. Either way, also remove the corresponding <code>FIRM_&lt;ID&gt;_*</code> env vars when decommissioning a firm.</p>
+      <p>Each firm card has <strong>Edit</strong> and <strong>Delete</strong> buttons.</p>
+      <ul>
+        <li><strong>Edit</strong> loads the firm into the form above; change the name, practice area, phone lines, or tag users and click Save Changes. The firm ID can't be changed. Edits apply immediately and persist to wherever the firm lives (Postgres or firms.json).</li>
+        <li><strong>Delete</strong> removes the firm from the router immediately and from its store (Postgres row or firms.json entry). It does <em>not</em> remove the firm's <code>FIRM_&lt;ID&gt;_*</code> env vars — clean those up in the deployment separately.</li>
+        <li>The <strong>default firm</strong> (<code>ramosjames</code>) can't be deleted from the UI — it's the anchor firm in <code>firms.json</code>. You can Edit it, but since it lives in firms.json, the change is written to disk and must be committed to git to survive a redeploy.</li>
+      </ul>
     </details>
 
     <details>
@@ -330,6 +341,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
 
 <script>
   const $ = (id) => document.getElementById(id);
+  let editingId = null;
 
   function msg(el, kind, html) {
     el.innerHTML = `<div class="msg ${kind}">${html}</div>`;
@@ -418,7 +430,11 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     }
   }
 
+  let firmsById = {};
+
   function renderFirms(list) {
+    firmsById = {};
+    for (const f of list) firmsById[f.id] = f;
     if (!list.length) {
       $("firms").innerHTML = '<div class="empty">No firms registered yet.</div>';
       return;
@@ -431,6 +447,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
             <div>
               <span class="firm-name">${escape(f.name)}</span>
               <span class="firm-id">(${escape(f.id)})</span>
+              ${f.isDefault ? '<span class="badge ok">default</span>' : `<span class="badge src">${escape(f.source)}</span>`}
             </div>
             <div>
               <span class="badge ${f.hasQuoApiKey ? "ok" : "missing"}">Quo ${f.hasQuoApiKey ? "✓" : "✗"}</span>
@@ -448,10 +465,78 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
             <summary>Phone lines (${Object.keys(f.phoneLines || {}).length})</summary>
             <pre>${escape(Object.entries(f.phoneLines || {}).map(([n, name]) => `${n}  ${name}`).join("\n") || "(none)")}</pre>
           </details>
+          <div class="firm-actions">
+            <button class="secondary" data-edit="${escape(f.id)}">Edit</button>
+            ${f.isDefault
+              ? '<button class="secondary" disabled title="The default firm is managed in firms.json">Delete</button>'
+              : `<button class="danger-btn" data-delete="${escape(f.id)}">Delete</button>`}
+          </div>
         </div>
       `)
       .join("");
+    document.querySelectorAll("[data-edit]").forEach((b) =>
+      b.addEventListener("click", () => startEdit(b.getAttribute("data-edit"))));
+    document.querySelectorAll("[data-delete]").forEach((b) =>
+      b.addEventListener("click", () => deleteFirm(b.getAttribute("data-delete"))));
   }
+
+  function startEdit(id) {
+    const f = firmsById[id];
+    if (!f) return;
+    editingId = id;
+    const form = $("addFirm");
+    form.id.value = f.id;
+    form.id.readOnly = true;
+    form.name.value = f.name;
+    form.practiceArea.value = f.practiceArea;
+    form.phoneLines.value = Object.entries(f.phoneLines || {})
+      .map(([n, name]) => `${n}=${name}`).join("\n");
+    form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
+    $("add-title").textContent = `Edit Firm: ${f.name}`;
+    $("submit-btn").textContent = "Save Changes";
+    $("cancel-edit").style.display = "";
+    $("add-result").innerHTML = "";
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function cancelEdit() {
+    editingId = null;
+    const form = $("addFirm");
+    form.reset();
+    form.id.readOnly = false;
+    form.practiceArea.value = "personal injury";
+    $("add-title").textContent = "Add a New Firm";
+    $("submit-btn").textContent = "Add Firm";
+    $("cancel-edit").style.display = "none";
+    $("add-result").innerHTML = "";
+  }
+
+  async function deleteFirm(id) {
+    const f = firmsById[id];
+    if (!f) return;
+    if (!confirm(`Delete firm "${f.name}" (${id})?\n\nThis removes it from the router immediately and from ${f.source === "db" ? "the database" : "firms.json"}. This cannot be undone.\n\nNote: its FIRM_${id.toUpperCase()}_* env vars are not removed — clean those up separately.`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`/admin/api/firms/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      if (res.status === 401) { location.reload(); return; }
+      const json = await res.json();
+      if (!res.ok) {
+        msg($("global-msg"), "error", `Error ${res.status}: ${escape(json.error || "Failed to delete")}`);
+        return;
+      }
+      msg($("global-msg"), "success", `Firm <code>${escape(id)}</code> deleted (removed from ${escape(json.removedFrom)}).`);
+      if (editingId === id) cancelEdit();
+      loadFirms();
+    } catch (err) {
+      msg($("global-msg"), "error", `Network error: ${escape(err.message)}`);
+    }
+  }
+
+  $("cancel-edit").addEventListener("click", cancelEdit);
 
   $("addFirm").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -463,6 +548,36 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
     };
+
+    // --- Edit mode: PUT the changes, then reset ---
+    if (editingId) {
+      try {
+        const res = await fetch(`/admin/api/firms/${encodeURIComponent(editingId)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify(payload),
+        });
+        if (res.status === 401) { location.reload(); return; }
+        const json = await res.json();
+        if (!res.ok) {
+          msg($("add-result"), "error", `Error ${res.status}: ${escape(json.error || "Failed to save changes")}`);
+          return;
+        }
+        const savedId = editingId;
+        const note = json.persistedTo === "postgres"
+          ? "Saved to Postgres — changes persist across redeploys."
+          : "Written to firms.json on disk — commit it to git so the change persists across redeploys.";
+        cancelEdit();
+        msg($("global-msg"), "success", `Firm <code>${escape(savedId)}</code> updated. ${escape(note)}`);
+        loadFirms();
+      } catch (err) {
+        msg($("add-result"), "error", `Network error: ${escape(err.message)}`);
+      }
+      return;
+    }
+
+    // --- Add mode ---
     try {
       const res = await fetch("/admin/api/firms", {
         method: "POST",
