@@ -1,6 +1,7 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1391,27 +1392,231 @@ app.post("/webhooks/quo/messages", withDefaultFirm(handleMessages));
 app.post("/webhooks/quo/calls", withDefaultFirm(handleCalls));
 app.post("/webhooks/quo/call-summary", withDefaultFirm(handleCallSummary));
 
-// === Admin UI ===
+// === Admin UI (Google OAuth) ===
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
+const ADMIN_ALLOWED_DOMAINS = (process.env.ADMIN_ALLOWED_DOMAINS || "ramosjames.com")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// SESSION_SECRET signs the session cookie. If unset, we generate a random one at
+// startup and warn — sessions won't survive a process restart in that case.
+const SESSION_SECRET = process.env.SESSION_SECRET || (() => {
+  const gen = crypto.randomBytes(32).toString("base64url");
+  console.warn("[auth] SESSION_SECRET not set — generated an ephemeral one; sessions will not survive restart");
+  return gen;
+})();
+
+const SESSION_COOKIE = "quo_admin_session";
+const OAUTH_STATE_COOKIE = "quo_admin_oauth_state";
+const SESSION_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 const FIRM_ID_PATTERN = /^[a-z0-9-]+$/;
 
-function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) {
-    return res.status(503).json({ error: "ADMIN_TOKEN not configured on the server" });
+const oauthConfigured = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+
+function parseCookies(header) {
+  const out = {};
+  (header || "").split(";").forEach((c) => {
+    const eq = c.indexOf("=");
+    if (eq === -1) return;
+    const k = c.slice(0, eq).trim();
+    if (k) out[k] = decodeURIComponent(c.slice(eq + 1).trim());
+  });
+  return out;
+}
+
+function signSession(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  return `${body}.${sig}`;
+}
+
+function verifySession(cookie) {
+  if (!cookie || typeof cookie !== "string") return null;
+  const dot = cookie.indexOf(".");
+  if (dot === -1) return null;
+  const body = cookie.slice(0, dot);
+  const sig = cookie.slice(dot + 1);
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    if (typeof payload.exp !== "number" || payload.exp < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
   }
-  const provided = req.get("x-admin-token") || req.query.token;
-  if (provided !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: "Invalid or missing admin token" });
+}
+
+function getSession(req) {
+  const cookies = parseCookies(req.get("cookie"));
+  return verifySession(cookies[SESSION_COOKIE]);
+}
+
+function computeRedirectUri(req) {
+  const base = PUBLIC_URL || `${req.protocol}://${req.get("host")}`;
+  return `${base}/admin/auth/callback`;
+}
+
+function requireAuth(req, res, next) {
+  if (!oauthConfigured) {
+    return res.status(503).json({ error: "OAuth not configured on the server" });
   }
+  const session = getSession(req);
+  if (!session) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+  req.session = session;
   next();
 }
 
-app.get("/admin", (_req, res) => {
+function isAllowedEmail(email) {
+  if (!email) return false;
+  const domain = String(email).toLowerCase().split("@")[1] || "";
+  return ADMIN_ALLOWED_DOMAINS.includes(domain);
+}
+
+// --- OAuth routes ---
+
+app.get("/admin/auth/login", (req, res) => {
+  if (!oauthConfigured) {
+    return res
+      .status(503)
+      .send("OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server.");
+  }
+  const state = crypto.randomBytes(16).toString("hex");
+  res.cookie(OAUTH_STATE_COOKIE, state, {
+    maxAge: 5 * 60 * 1000,
+    httpOnly: true,
+    sameSite: "lax",
+    secure: req.secure,
+  });
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", computeRedirectUri(req));
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid email profile");
+  url.searchParams.set("state", state);
+  url.searchParams.set("prompt", "select_account");
+  // Optional UX hint — Google may still show account picker
+  if (ADMIN_ALLOWED_DOMAINS.length === 1) {
+    url.searchParams.set("hd", ADMIN_ALLOWED_DOMAINS[0]);
+  }
+  res.redirect(url.toString());
+});
+
+app.get("/admin/auth/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) {
+    return res.status(400).send(`OAuth error: ${String(error).replace(/[<>]/g, "")}`);
+  }
+  if (!code) return res.status(400).send("Missing authorization code");
+  const cookies = parseCookies(req.get("cookie"));
+  const expectedState = cookies[OAUTH_STATE_COOKIE];
+  if (!state || state !== expectedState) {
+    return res.status(400).send("Invalid state — please try logging in again.");
+  }
+  try {
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: computeRedirectUri(req),
+        grant_type: "authorization_code",
+      }),
+    });
+    const tokenJson = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error("[auth] Token exchange failed:", tokenJson);
+      return res.status(500).send(`Token exchange failed: ${tokenJson.error_description || tokenJson.error || "unknown"}`);
+    }
+    if (!tokenJson.id_token) {
+      console.error("[auth] No id_token in response:", tokenJson);
+      return res.status(500).send("No id_token returned by Google");
+    }
+
+    // Verify id_token via Google's tokeninfo endpoint
+    const infoRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenJson.id_token)}`,
+    );
+    const info = await infoRes.json();
+    if (!infoRes.ok) {
+      console.error("[auth] tokeninfo failed:", info);
+      return res.status(401).send("ID token verification failed");
+    }
+    if (info.aud !== GOOGLE_CLIENT_ID) {
+      console.error("[auth] aud mismatch:", info.aud, "vs", GOOGLE_CLIENT_ID);
+      return res.status(401).send("ID token audience mismatch");
+    }
+    const emailVerified = info.email_verified === true || info.email_verified === "true";
+    if (!emailVerified) {
+      return res.status(403).send("Email not verified by Google");
+    }
+    const email = String(info.email || "").toLowerCase();
+    if (!isAllowedEmail(email)) {
+      console.warn(`[auth] Denied ${email} — domain not in allow list`);
+      const domains = ADMIN_ALLOWED_DOMAINS.join(", ");
+      return res
+        .status(403)
+        .send(`Access denied for ${email}. Only accounts from: ${domains}`);
+    }
+
+    const exp = Date.now() + SESSION_MAX_AGE_MS;
+    res.cookie(SESSION_COOKIE, signSession({ email, exp }), {
+      maxAge: SESSION_MAX_AGE_MS,
+      httpOnly: true,
+      sameSite: "lax",
+      secure: req.secure,
+    });
+    res.clearCookie(OAUTH_STATE_COOKIE);
+    console.log(`[auth] Logged in ${email}`);
+    res.redirect("/admin");
+  } catch (err) {
+    console.error("[auth] Callback error:", err.message);
+    res.status(500).send("Login error");
+  }
+});
+
+app.post("/admin/auth/logout", (req, res) => {
+  res.clearCookie(SESSION_COOKIE);
+  res.json({ ok: true });
+});
+
+// --- Admin API + page ---
+
+app.get("/admin", (req, res) => {
+  // Always serve the HTML so the client can render an "OAuth not configured" message
+  // or a "Log in with Google" button if unauthenticated. The API endpoints below still
+  // require a valid session.
   res.sendFile(path.join(__dirname, "admin.html"));
 });
 
-app.get("/admin/api/firms", requireAdmin, (_req, res) => {
+app.get("/admin/api/session", (req, res) => {
+  if (!oauthConfigured) {
+    return res.status(503).json({
+      error: "OAuth not configured",
+      allowedDomains: ADMIN_ALLOWED_DOMAINS,
+    });
+  }
+  const session = getSession(req);
+  if (!session) {
+    return res.status(401).json({
+      error: "Not authenticated",
+      allowedDomains: ADMIN_ALLOWED_DOMAINS,
+    });
+  }
+  res.json({ email: session.email, allowedDomains: ADMIN_ALLOWED_DOMAINS });
+});
+
+app.get("/admin/api/firms", requireAuth, (_req, res) => {
   const list = Array.from(firms.values()).map((f) => ({
     id: f.id,
     name: f.name,
@@ -1426,7 +1631,7 @@ app.get("/admin/api/firms", requireAdmin, (_req, res) => {
   res.json(list);
 });
 
-app.post("/admin/api/firms", requireAdmin, (req, res) => {
+app.post("/admin/api/firms", requireAuth, (req, res) => {
   const { id, name, practiceArea, phoneLines, leadThreadTagUsers } = req.body || {};
 
   if (!id || !FIRM_ID_PATTERN.test(id)) {

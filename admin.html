@@ -127,7 +127,8 @@
     margin-bottom: 16px;
   }
   .token-bar input { flex: 1; background: white; }
-  .token-bar span { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .token-bar > span { flex: 1; font-size: 13px; color: var(--muted); }
+  .token-bar strong { color: var(--text); }
   .url-block {
     background: var(--code-bg);
     padding: 8px 10px;
@@ -169,20 +170,20 @@
   <h1>Quo Router Admin</h1>
   <p class="subtitle">Manage firms served by this router.</p>
 
-  <div class="token-bar">
-    <span>Admin token:</span>
-    <input id="token" type="password" placeholder="ADMIN_TOKEN">
-    <button onclick="loadFirms()">Load</button>
+  <div class="token-bar" id="auth-bar">
+    <span id="auth-status">Checking session…</span>
+    <button id="auth-button" style="display:none">Log in with Google</button>
+    <button id="logout-button" class="secondary" style="display:none">Log out</button>
   </div>
 
   <div id="global-msg"></div>
 
-  <section>
+  <section id="firms-section" style="display:none">
     <h2>Registered Firms</h2>
-    <div id="firms"><div class="empty">Enter your admin token and click Load.</div></div>
+    <div id="firms"><div class="empty">Loading…</div></div>
   </section>
 
-  <section>
+  <section id="add-section" style="display:none">
     <h2>Add a New Firm</h2>
     <p class="subtitle" style="margin-bottom:0">
       Registers a firm in memory and appends it to firms.json on disk. You still need to set
@@ -223,6 +224,24 @@
 
   <section>
     <h2>FAQ</h2>
+
+    <details>
+      <summary>How does login work? (Google OAuth setup)</summary>
+      <p>This admin panel uses Google OAuth. Only accounts on an allow-listed domain can sign in.</p>
+      <p><strong>Server env vars:</strong></p>
+      <pre>GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=xxxxx
+SESSION_SECRET=&lt;random 32+ char string&gt;
+ADMIN_ALLOWED_DOMAINS=ramosjames.com    # comma-separated for multiple
+PUBLIC_URL=https://your-host.com         # used to build the OAuth redirect URI</pre>
+      <p><strong>Google Cloud Console setup:</strong></p>
+      <ul>
+        <li>Create an OAuth 2.0 Client ID (Web application) at <code>console.cloud.google.com</code> → APIs &amp; Services → Credentials.</li>
+        <li>Add <code>https://your-host.com/admin/auth/callback</code> as an Authorized redirect URI (replace <code>your-host.com</code> with the actual host).</li>
+        <li>Copy the Client ID and Client Secret into the env vars above.</li>
+      </ul>
+      <p>Sessions are signed HMAC-SHA256 cookies with a 12-hour lifetime. If <code>SESSION_SECRET</code> is not set, the server generates a random one at startup and everyone is logged out on restart.</p>
+    </details>
 
     <details>
       <summary>What environment variables do I need to set for a new firm?</summary>
@@ -297,9 +316,6 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
 
 <script>
   const $ = (id) => document.getElementById(id);
-  const token = () => $("token").value.trim() || localStorage.getItem("adminToken") || "";
-
-  $("token").value = localStorage.getItem("adminToken") || "";
 
   function msg(el, kind, html) {
     el.innerHTML = `<div class="msg ${kind}">${html}</div>`;
@@ -329,17 +345,53 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
     return (text || "").split(",").map((s) => s.trim()).filter(Boolean);
   }
 
-  async function loadFirms() {
-    const t = token();
-    if (!t) {
-      msg($("global-msg"), "error", "Enter an admin token first.");
-      return;
-    }
-    localStorage.setItem("adminToken", t);
+  async function checkSession() {
     try {
-      const res = await fetch("/admin/api/firms", {
-        headers: { "x-admin-token": t },
-      });
+      const res = await fetch("/admin/api/session", { credentials: "same-origin" });
+      const json = await res.json().catch(() => ({}));
+      if (res.status === 503) {
+        $("auth-status").textContent = "OAuth not configured on the server.";
+        $("auth-button").style.display = "none";
+        $("logout-button").style.display = "none";
+        msg($("global-msg"), "warning",
+          `The admin panel requires <code>GOOGLE_CLIENT_ID</code>, <code>GOOGLE_CLIENT_SECRET</code>,
+           and <code>SESSION_SECRET</code> environment variables. See the FAQ below for setup.`);
+        return false;
+      }
+      if (res.status === 401) {
+        $("auth-status").textContent = `Not signed in. Allowed domains: ${(json.allowedDomains || []).join(", ") || "(none)"}`;
+        $("auth-button").style.display = "";
+        $("auth-button").onclick = () => { location.href = "/admin/auth/login"; };
+        $("logout-button").style.display = "none";
+        return false;
+      }
+      if (res.ok) {
+        $("auth-status").innerHTML = `Signed in as <strong>${escape(json.email)}</strong>`;
+        $("auth-button").style.display = "none";
+        $("logout-button").style.display = "";
+        $("logout-button").onclick = async () => {
+          await fetch("/admin/auth/logout", { method: "POST", credentials: "same-origin" });
+          location.reload();
+        };
+        $("firms-section").style.display = "";
+        $("add-section").style.display = "";
+        return true;
+      }
+      $("auth-status").textContent = `Session check failed (HTTP ${res.status})`;
+      return false;
+    } catch (err) {
+      $("auth-status").textContent = `Session check network error: ${err.message}`;
+      return false;
+    }
+  }
+
+  async function loadFirms() {
+    try {
+      const res = await fetch("/admin/api/firms", { credentials: "same-origin" });
+      if (res.status === 401) {
+        location.reload();
+        return;
+      }
       const json = await res.json();
       if (!res.ok) {
         msg($("global-msg"), "error", `Error ${res.status}: ${escape(json.error || "Failed to load")}`);
@@ -389,11 +441,6 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
 
   $("addFirm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const t = token();
-    if (!t) {
-      msg($("add-result"), "error", "Enter an admin token first.");
-      return;
-    }
     const form = e.target;
     const payload = {
       id: form.id.value.trim(),
@@ -405,9 +452,14 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
     try {
       const res = await fetch("/admin/api/firms", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-admin-token": t },
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify(payload),
       });
+      if (res.status === 401) {
+        location.reload();
+        return;
+      }
       const json = await res.json();
       if (!res.ok) {
         msg($("add-result"), "error", `Error ${res.status}: ${escape(json.error || "Failed to add firm")}`);
@@ -457,7 +509,10 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
     }
   });
 
-  if ($("token").value) loadFirms();
+  (async () => {
+    const authed = await checkSession();
+    if (authed) loadFirms();
+  })();
 </script>
 </body>
 </html>
