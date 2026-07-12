@@ -298,13 +298,27 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
     </details>
 
     <details>
-      <summary>How do I edit or remove a firm?</summary>
-      <p>This UI only adds firms. To edit or remove, directly modify <code>firms.json</code> in the repo and redeploy. Also remove the corresponding <code>FIRM_&lt;ID&gt;_*</code> env vars from the deployment.</p>
+      <summary>Where are firms stored? (Postgres vs firms.json)</summary>
+      <p>There are two sources, loaded in this order at startup:</p>
+      <ul>
+        <li><strong>firms.json</strong> (committed to git) — holds the default firm (<code>ramosjames</code>). This never changes and always loads first, so the original firm keeps working regardless of the database.</li>
+        <li><strong>Postgres</strong> — holds firms added through this admin UI. Loaded after firms.json. Requires <code>DATABASE_URL</code> to be set.</li>
+      </ul>
+      <p>When you add a firm here and <code>DATABASE_URL</code> is set, it's written to the <code>firms</code> table and survives redeploys automatically. If <code>DATABASE_URL</code> is <em>not</em> set, the firm is written to <code>firms.json</code> on disk instead — which is ephemeral on most hosts, so you'd need to commit it to git (the success screen gives you the blob).</p>
     </details>
 
     <details>
-      <summary>My firm was added but stopped working after redeploy. What happened?</summary>
-      <p>The UI writes to <code>firms.json</code> on the server's disk, but many hosting platforms (Fly.io, Render, etc.) treat disk as ephemeral — it gets wiped on redeploy. To persist across deploys you must commit the updated <code>firms.json</code> to git. The "Add Firm" success response shows you the JSON blob to paste in, and the env vars you still need to configure.</p>
+      <summary>How do I set up the Postgres database?</summary>
+      <p>Provision a Postgres instance (Fly Postgres, Render, Neon, Supabase, etc.) and set its connection string as an env var:</p>
+      <pre>DATABASE_URL=postgres://user:pass@host:5432/dbname
+DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
+                              # set DATABASE_SSL=disable for a local/no-SSL DB</pre>
+      <p>The router creates the <code>firms</code> table automatically on first boot (<code>CREATE TABLE IF NOT EXISTS</code>) — no migration step needed. Secrets (Quo API key, Slack tokens, webhook URLs) are <strong>never</strong> stored in the database; they always come from <code>FIRM_&lt;ID&gt;_*</code> env vars.</p>
+    </details>
+
+    <details>
+      <summary>How do I edit or remove a firm?</summary>
+      <p>This UI only adds firms. To edit or remove a Postgres-stored firm, update or delete its row in the <code>firms</code> table (then redeploy or restart to reload). For the default firm in <code>firms.json</code>, edit the file in the repo and redeploy. Either way, also remove the corresponding <code>FIRM_&lt;ID&gt;_*</code> env vars when decommissioning a firm.</p>
     </details>
 
     <details>
@@ -478,24 +492,38 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
         `FIRM_${upper}_SLACK_LEAD_CALLS_CHANNEL_ID`,
         `FIRM_${upper}_SLACK_LEGAL_ASSISTANT_CHANNEL_ID`,
       ];
-      $("add-result").innerHTML = `
-        <div class="msg success">
-          Firm <code>${escape(payload.id)}</code> registered in memory and appended to firms.json.
-        </div>
-        <div class="msg warning">
-          Two things to finish setup:
-          <br>1. Set the env vars below in the deployment (secrets — not stored in firms.json).
-          <br>2. Commit the updated <code>firms.json</code> to git so the config survives redeploys.
-        </div>
-        <h3>Env vars to set</h3>
-        <pre>${envVars.join("\n")}</pre>
+      const toPostgres = json.persistedTo === "postgres";
+      const persistMsg = toPostgres
+        ? `<div class="msg success">
+             Firm <code>${escape(payload.id)}</code> saved to Postgres and registered live.
+             It will survive redeploys automatically — no git commit needed.
+           </div>
+           <div class="msg warning">
+             One thing left: set the env vars below in the deployment
+             (secrets — never stored in the database).
+           </div>`
+        : `<div class="msg success">
+             Firm <code>${escape(payload.id)}</code> registered live and written to firms.json on disk.
+           </div>
+           <div class="msg warning">
+             No database is configured (<code>DATABASE_URL</code> unset), so this firm will NOT
+             survive a redeploy. To finish setup:
+             <br>1. Set the env vars below in the deployment (secrets).
+             <br>2. Commit the <code>firms.json</code> entry below to git so the config persists.
+           </div>`;
+      const jsonEntryBlock = toPostgres ? "" : `
         <h3>firms.json entry (for git)</h3>
         <pre>${escape(JSON.stringify({ [payload.id]: {
           name: payload.name,
           practiceArea: payload.practiceArea,
           phoneLines: payload.phoneLines,
           leadThreadTagUsers: payload.leadThreadTagUsers,
-        } }, null, 2))}</pre>
+        } }, null, 2))}</pre>`;
+      $("add-result").innerHTML = `
+        ${persistMsg}
+        <h3>Env vars to set</h3>
+        <pre>${envVars.join("\n")}</pre>
+        ${jsonEntryBlock}
         <h3>Quo webhook URLs</h3>
         <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/messages</div>
         <div class="url-block">${escape(location.origin)}/webhooks/quo/${escape(payload.id)}/calls</div>

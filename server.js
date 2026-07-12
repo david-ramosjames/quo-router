@@ -114,6 +114,111 @@ function getFirm(firmId) {
   return firms.get(firmId) || null;
 }
 
+// === Firm Persistence (Postgres) ===
+// New firms added via the admin UI are stored in Postgres so they survive
+// redeploys. The default firm (ramosjames) is NOT stored here — it comes from
+// the committed firms.json and its config path is unchanged. If DATABASE_URL is
+// not set, the router falls back to writing firms.json on disk (ephemeral on
+// most hosts), so the existing single-firm setup keeps working with no DB.
+
+const DATABASE_URL = process.env.DATABASE_URL;
+let pgPool = null;
+
+async function initFirmStore() {
+  if (!DATABASE_URL) {
+    console.warn("[db] DATABASE_URL not set — new firms persist to firms.json only (ephemeral on most hosts)");
+    return;
+  }
+  try {
+    const pg = await import("pg");
+    const { Pool } = pg.default || pg;
+    pgPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === "disable" ? false : { rejectUnauthorized: false },
+    });
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS firms (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        practice_area TEXT NOT NULL DEFAULT 'personal injury',
+        phone_lines JSONB NOT NULL DEFAULT '{}'::jsonb,
+        lead_thread_tag_users JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    console.log("[db] Connected to Postgres and ensured firms table exists");
+  } catch (err) {
+    console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
+    pgPool = null;
+  }
+}
+
+function rowToConfig(row) {
+  return {
+    name: row.name,
+    practiceArea: row.practice_area,
+    phoneLines: row.phone_lines || {},
+    leadThreadTagUsers: row.lead_thread_tag_users || [],
+  };
+}
+
+async function loadFirmsFromDb() {
+  if (!pgPool) return 0;
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM firms ORDER BY id");
+    let count = 0;
+    for (const row of rows) {
+      if (row.id.startsWith("_")) continue;
+      // The default firm always comes from firms.json — never let the DB shadow it.
+      if (row.id === DEFAULT_FIRM_ID) {
+        if (!firms.has(row.id)) firms.set(row.id, makeFirm(row.id, rowToConfig(row)));
+        continue;
+      }
+      firms.set(row.id, makeFirm(row.id, rowToConfig(row)));
+      count++;
+    }
+    console.log(`[db] Loaded ${count} firm(s) from Postgres`);
+    return count;
+  } catch (err) {
+    console.error("[db] Error loading firms from Postgres:", err.message);
+    return 0;
+  }
+}
+
+async function saveFirmToDb(id, config) {
+  if (!pgPool) return false;
+  await pgPool.query(
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, now())
+     ON CONFLICT (id) DO UPDATE SET
+       name = EXCLUDED.name,
+       practice_area = EXCLUDED.practice_area,
+       phone_lines = EXCLUDED.phone_lines,
+       lead_thread_tag_users = EXCLUDED.lead_thread_tag_users,
+       updated_at = now()`,
+    [
+      id,
+      config.name,
+      config.practiceArea,
+      JSON.stringify(config.phoneLines || {}),
+      JSON.stringify(config.leadThreadTagUsers || []),
+    ],
+  );
+  return true;
+}
+
+// Persist a new firm to firms.json on disk (fallback when no DATABASE_URL).
+function saveFirmToDisk(id, config) {
+  const configPath = path.join(__dirname, "firms.json");
+  let onDisk = {};
+  if (fs.existsSync(configPath)) {
+    onDisk = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  }
+  onDisk[id] = config;
+  fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2) + "\n");
+}
+
 // === Firm-agnostic Utilities ===
 
 function sleep(ms) {
@@ -1631,7 +1736,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
   res.json(list);
 });
 
-app.post("/admin/api/firms", requireAuth, (req, res) => {
+app.post("/admin/api/firms", requireAuth, async (req, res) => {
   const { id, name, practiceArea, phoneLines, leadThreadTagUsers } = req.body || {};
 
   if (!id || !FIRM_ID_PATTERN.test(id)) {
@@ -1657,44 +1762,35 @@ app.post("/admin/api/firms", requireAuth, (req, res) => {
     leadThreadTagUsers: leadThreadTagUsers || [],
   };
 
-  // Persist to firms.json on disk (may be ephemeral depending on host)
-  const configPath = path.join(__dirname, "firms.json");
-  let onDisk = {};
-  if (fs.existsSync(configPath)) {
-    try {
-      onDisk = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    } catch (err) {
-      return res.status(500).json({ error: `firms.json is corrupt: ${err.message}` });
-    }
-  }
-  onDisk[id] = firmConfig;
+  // Persist: Postgres if configured (survives redeploys), otherwise firms.json on disk.
+  let persistedTo;
   try {
-    fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2) + "\n");
+    if (pgPool) {
+      await saveFirmToDb(id, firmConfig);
+      persistedTo = "postgres";
+    } else {
+      saveFirmToDisk(id, firmConfig);
+      persistedTo = "disk";
+    }
   } catch (err) {
-    console.error(`[admin] Failed to write firms.json:`, err.message);
-    return res.status(500).json({ error: `Failed to write firms.json: ${err.message}` });
+    console.error(`[admin] Failed to persist firm "${id}" to ${pgPool ? "Postgres" : "disk"}:`, err.message);
+    return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
   }
 
   // Register in-memory so it's live immediately
   const firm = makeFirm(id, firmConfig);
   firms.set(id, firm);
-  console.log(`[admin] Registered new firm "${id}" (${firmConfig.name})`);
+  console.log(`[admin] Registered new firm "${id}" (${firmConfig.name}), persisted to ${persistedTo}`);
 
   // Kick off cache load in the background
   loadFirmCaches(firm).catch((err) =>
     console.error(`[${id}][startup] Cache load error:`, err.message)
   );
 
-  res.json({ ok: true, firmId: id, config: firmConfig });
+  res.json({ ok: true, firmId: id, config: firmConfig, persistedTo });
 });
 
 // === Startup ===
-
-registerFirms();
-
-app.listen(PORT, () => {
-  console.log(`Quo Slack Router listening on port ${PORT}`);
-});
 
 // Load caches for each firm in the background
 async function loadFirmCaches(firm) {
@@ -1705,6 +1801,18 @@ async function loadFirmCaches(firm) {
 }
 
 (async () => {
+  // 1. Register firms.json/env firms first (includes the default firm).
+  registerFirms();
+  // 2. Connect to Postgres and load any firms added via the admin UI.
+  await initFirmStore();
+  await loadFirmsFromDb();
+
+  // 3. Start listening once all firms are known, so no webhook 404s at boot.
+  app.listen(PORT, () => {
+    console.log(`Quo Slack Router listening on port ${PORT}`);
+  });
+
+  // 4. Warm each firm's caches (Slack channels/users, Quo contacts/users) in the background.
   for (const firm of firms.values()) {
     await loadFirmCaches(firm);
   }
