@@ -1,0 +1,28 @@
+{
+  "_docs": {
+    "purpose": "Per-firm configuration. Each key is a firmId used in the webhook URL: /webhooks/quo/{firmId}/{event}",
+    "onboarding": "To add a new firm, add an entry here AND set the FIRM_<UPPERCASE_ID>_* environment variables listed under 'requiredEnvVars' below.",
+    "requiredEnvVars": [
+      "FIRM_<ID>_QUO_API_KEY",
+      "FIRM_<ID>_SLACK_BOT_TOKEN",
+      "FIRM_<ID>_SLACK_TEXT_MESSAGES_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_MISSED_CALLS_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_HUMAN_CALLS_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_SONA_CALLS_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_LEAD_CALLS_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_LEAD_CALLS_CHANNEL_ID",
+      "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL",
+      "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_CHANNEL_ID"
+    ],
+    "globalEnvVars": ["ANTHROPIC_API_KEY", "DEFAULT_FIRM_ID", "PORT"]
+  },
+  "examplefirm": {
+    "name": "Example Law Firm",
+    "practiceArea": "personal injury",
+    "phoneLines": {
+      "+15551234567": "Main Line",
+      "+15551234568": "Outbound"
+    },
+    "leadThreadTagUsers": ["U00000000", "U11111111"]
+  }
+}
