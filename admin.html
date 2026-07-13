@@ -114,6 +114,8 @@
   .danger-btn:hover { background: #dc2626; }
   input[readonly] { opacity: 0.6; cursor: not-allowed; }
   input:disabled { opacity: 0.5; cursor: not-allowed; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 2px; font-weight: 500; cursor: pointer; }
+  .checkbox-row input { width: auto; margin: 0; }
   .secret-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .src-tag { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 10px; }
   .src-tag.env { background: #e0e7ff; color: #3730a3; }
@@ -223,7 +225,13 @@
       <label for="firm-phones">Phone Lines</label>
       <textarea id="firm-phones" name="phoneLines" rows="5" placeholder="+15551234567=Main Line
 +15551234568=Outbound"></textarea>
-      <div class="hint">One per line: <code>+1XXXXXXXXXX=Line Name</code>. These are the firm's own Quo numbers.</div>
+      <div class="hint">One per line: <code>+1XXXXXXXXXX=Line Name</code>. Use full E.164 format with the <code>+1</code> country code. These are the firm's own Quo numbers.</div>
+
+      <label class="checkbox-row">
+        <input type="checkbox" id="firm-restrict" name="restrictToPhoneLines">
+        <span>Only route events for the phone lines above</span>
+      </label>
+      <div class="hint">When on, calls/texts are posted only if one party is a line listed above — events for the Quo account's other numbers are ignored. Leave off to route everything.</div>
 
       <label for="firm-tags">Lead-Thread Tag Users</label>
       <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
@@ -297,6 +305,12 @@ FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
 Calls:        https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/calls
 Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary</pre>
       <p>Each registered firm's exact URLs are shown in the firm card above once loaded.</p>
+    </details>
+
+    <details>
+      <summary>How does "Only route events for the phone lines above" work?</summary>
+      <p>By default the router posts every call and text the firm's Quo account sends — because one Quo account maps to one firm. If a firm's Quo account has several numbers but you only want some of them mirrored to Slack, turn on this toggle and list only the numbers you want.</p>
+      <p>With it on, an event is posted only if its <code>from</code> or <code>to</code> matches one of the listed phone lines; events for the account's other numbers are dropped (you'll see a "Skipped — neither … is a configured phone line" line in the logs). Matching is done on the last 10 digits, so a missing <code>+1</code> country code won't break it — but list numbers in full <code>+1XXXXXXXXXX</code> form to be safe. With the toggle off, phone lines are only used for labeling and inbound/outbound detection.</p>
     </details>
 
     <details>
@@ -479,7 +493,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
               <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
             </div>
           </div>
-          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}</div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}</div>
           <details>
             <summary>Webhook URLs to configure in Quo</summary>
             <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
@@ -517,6 +531,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.phoneLines.value = Object.entries(f.phoneLines || {})
       .map(([n, name]) => `${n}=${name}`).join("\n");
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
+    form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
     $("submit-btn").textContent = "Save Changes";
@@ -630,6 +645,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       practiceArea: form.practiceArea.value.trim(),
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
+      restrictToPhoneLines: form.restrictToPhoneLines.checked,
       secrets: collectSecrets(),
     };
 

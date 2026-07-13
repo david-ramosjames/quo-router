@@ -110,6 +110,9 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     practiceArea: config.practiceArea || "personal injury",
     phoneLines: config.phoneLines || {},
     leadThreadTagUsers: config.leadThreadTagUsers || [],
+    // When true, only route events where `from` or `to` matches one of the
+    // firm's phone lines (allowlist). Off by default so firms route everything.
+    restrictToPhoneLines: !!config.restrictToPhoneLines,
     storedSecrets: storedSecrets || {},
     ...resolveFirmSecrets(firmId, storedSecrets),
     // Per-firm state
@@ -234,12 +237,14 @@ async function initFirmStore() {
         phone_lines JSONB NOT NULL DEFAULT '{}'::jsonb,
         lead_thread_tag_users JSONB NOT NULL DEFAULT '[]'::jsonb,
         secrets TEXT,
+        restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
-    // Migrate older tables that predate the secrets column.
+    // Migrate older tables that predate newer columns.
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS secrets TEXT`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false`);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
@@ -253,6 +258,7 @@ function rowToConfig(row) {
     practiceArea: row.practice_area,
     phoneLines: row.phone_lines || {},
     leadThreadTagUsers: row.lead_thread_tag_users || [],
+    restrictToPhoneLines: !!row.restrict_to_phone_lines,
   };
 }
 
@@ -289,14 +295,15 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
        phone_lines = EXCLUDED.phone_lines,
        lead_thread_tag_users = EXCLUDED.lead_thread_tag_users,
        secrets = EXCLUDED.secrets,
+       restrict_to_phone_lines = EXCLUDED.restrict_to_phone_lines,
        updated_at = now()`,
     [
       id,
@@ -305,6 +312,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       JSON.stringify(config.phoneLines || {}),
       JSON.stringify(config.leadThreadTagUsers || []),
       encryptSecrets(storedSecrets || {}),
+      !!config.restrictToPhoneLines,
     ],
   );
   return true;
@@ -390,6 +398,26 @@ function lastTenDigits(phone) {
   if (!phone) return "";
   const digits = phone.replace(/\D/g, "");
   return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+
+// Does this number match one of the firm's configured phone lines? Compares on
+// last-10-digits so small formatting differences (missing country code) still match.
+function isOwnLine(firm, number) {
+  if (!number) return false;
+  if (firm.phoneLines[number]) return true; // exact
+  const target = lastTenDigits(number);
+  if (!target) return false;
+  for (const line of Object.keys(firm.phoneLines)) {
+    if (lastTenDigits(line) === target) return true;
+  }
+  return false;
+}
+
+// When a firm has restrictToPhoneLines on, an event is only routed if one of its
+// parties is a configured line. Returns true if the event should be SKIPPED.
+function blockedByPhoneLineFilter(firm, from, to) {
+  if (!firm.restrictToPhoneLines) return false;
+  return !isOwnLine(firm, from) && !isOwnLine(firm, to);
 }
 
 function insertMentionsAfterTitle(text, userIds) {
@@ -1167,6 +1195,11 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   const voicemail = call.voicemail || null;
   const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
 
+  if (blockedByPhoneLineFilter(firm, from, to)) {
+    console.log(`[${firm.id}][call-check] Skipped ${callId} — neither ${from} nor ${to} is a configured phone line`);
+    return;
+  }
+
   cacheCall(firm, callId, { from: call.from || cachedFrom, to: call.to || cachedTo, direction, answeredBy, userId: call.userId });
   console.log(`[${firm.id}][call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}`);
 
@@ -1365,6 +1398,11 @@ async function handleMessages(firm, req, res) {
     const direction = obj.direction || "";
     const eventType = (payload.type || "").toLowerCase();
 
+    if (blockedByPhoneLineFilter(firm, from, to)) {
+      console.log(`[${firm.id}][messages] Skipped — neither ${from} nor ${to} is a configured phone line`);
+      return;
+    }
+
     const isOutbound = direction === "outgoing" || eventType === "message.delivered";
     const emoji = isOutbound ? "📤" : "💬";
     const label = isOutbound ? "Outbound Text Message" : "New Text Message";
@@ -1416,6 +1454,11 @@ async function handleCalls(firm, req, res) {
     const direction = obj.direction || "";
     const answeredAt = obj.answeredAt || null;
     const eventType = (payload.type || "").toLowerCase();
+
+    if (blockedByPhoneLineFilter(firm, from, to)) {
+      console.log(`[${firm.id}][calls] Skipped — neither ${from} nor ${to} is a configured phone line`);
+      return;
+    }
 
     if (callId) {
       cacheCall(firm, callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
@@ -1517,6 +1560,11 @@ async function handleCallSummary(firm, req, res) {
     const cached = callId ? getCachedCall(firm, callId) : null;
     const from = safe(cached?.from);
     const to = safe(cached?.to);
+
+    if (blockedByPhoneLineFilter(firm, from, to)) {
+      console.log(`[${firm.id}][call-summary] Skipped — neither ${from} nor ${to} is a configured phone line`);
+      return;
+    }
 
     const rawSummary = obj.summary;
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
@@ -1853,6 +1901,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     practiceArea: f.practiceArea,
     phoneLines: f.phoneLines,
     leadThreadTagUsers: f.leadThreadTagUsers,
+    restrictToPhoneLines: !!f.restrictToPhoneLines,
     source: f.source || "file",
     isDefault: f.id === DEFAULT_FIRM_ID,
     hasQuoApiKey: !!f.quoApiKey,
@@ -1893,6 +1942,7 @@ function validateFirmBody(body) {
       practiceArea: String(practiceArea || "personal injury").trim(),
       phoneLines: phoneLines || {},
       leadThreadTagUsers: leadThreadTagUsers || [],
+      restrictToPhoneLines: !!(body && body.restrictToPhoneLines),
     },
   };
 }
@@ -1992,6 +2042,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.practiceArea = config.practiceArea;
   firm.phoneLines = config.phoneLines;
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
+  firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.storedSecrets = mergedSecrets;
   applyFirmSecrets(firm); // recompute quoApiKey/slackBotToken/webhooks/channels
   console.log(`[admin] Updated firm "${id}" (${config.name}), persisted to ${persistedTo}`);
