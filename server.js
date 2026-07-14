@@ -1049,6 +1049,27 @@ async function joinChannel(firm, channelId) {
   }
 }
 
+// Auto-join the two "hub" channels the router reads history from and threads
+// into (#lead-calls, #legalassistant-phone). Unlike case channels these aren't
+// joined on demand, so without this the bot hits not_in_channel. Public channels
+// join automatically; private ones can't be self-joined and must be invited.
+async function ensureHubChannelsJoined(firm) {
+  if (!firm.slackBotToken) return;
+  const hubs = [
+    ["lead-calls", firm.slackLeadCallsChannelId],
+    ["legalassistant-phone", firm.slackLegalAssistantChannelId],
+  ];
+  for (const [label, id] of hubs) {
+    if (!id) continue;
+    const ok = await joinChannel(firm, id);
+    if (ok) {
+      console.log(`[${firm.id}][startup] In ${label} channel (${id})`);
+    } else {
+      console.warn(`[${firm.id}][startup] Could NOT auto-join ${label} (${id}) — if it's a private channel, invite the bot manually with /invite`);
+    }
+  }
+}
+
 async function fetchChannelTopic(firm, channelId) {
   try {
     const url = new URL("https://slack.com/api/conversations.info");
@@ -2088,6 +2109,7 @@ app.delete("/admin/api/firms/:id", requireAuth, async (req, res) => {
 // Load caches for each firm in the background
 async function loadFirmCaches(firm) {
   await Promise.all([loadSlackChannels(firm), loadSlackUsers(firm)]);
+  await ensureHubChannelsJoined(firm);
   await loadQuoContacts(firm);
   await loadQuoUsers(firm);
   console.log(`[${firm.id}][startup] Caches loaded`);
