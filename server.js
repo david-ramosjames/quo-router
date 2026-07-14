@@ -1215,6 +1215,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   const answeredAt = call.answeredAt || null;
   const voicemail = call.voicemail || null;
   const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
+  const forwardedTo = call.forwardedTo || null;
 
   if (blockedByPhoneLineFilter(firm, from, to)) {
     console.log(`[${firm.id}][call-check] Skipped ${callId} — neither ${from} nor ${to} is a configured phone line`);
@@ -1222,11 +1223,17 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   }
 
   cacheCall(firm, callId, { from: call.from || cachedFrom, to: call.to || cachedTo, direction, answeredBy, userId: call.userId });
-  console.log(`[${firm.id}][call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}`);
+  console.log(`[${firm.id}][call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}, forwardedTo=${forwardedTo || "none"}`);
 
   if (status === "in-progress" || status === "ringing" || status === "queued" || status === "initiated") {
     console.log(`[${firm.id}][call-check] Call ${callId} still ${status} — rescheduling`);
     scheduleCallCheck(firm, callId, cachedFrom, cachedTo, cachedDirection);
+    return;
+  }
+
+  // Forwarded leg — routed to another number/line that reports it separately.
+  if (forwardedTo && !answeredAt && !hasVoicemail) {
+    console.log(`[${firm.id}][call-check] Call ${callId} forwarded to ${forwardedTo} — not a missed call, skipping`);
     return;
   }
 
@@ -1481,9 +1488,11 @@ async function handleCalls(firm, req, res) {
       return;
     }
 
+    const forwardedTo = obj.forwardedTo || null;
+
     if (callId) {
       cacheCall(firm, callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
-      console.log(`[${firm.id}][calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"})`);
+      console.log(`[${firm.id}][calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"}, forwardedTo: ${forwardedTo || "none"})`);
     }
 
     if (eventType === "call.ringing" || status === "ringing") {
@@ -1496,9 +1505,19 @@ async function handleCalls(firm, req, res) {
       return;
     }
 
+    const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
+
+    // A forwarded leg completes on this line without being answered here — the
+    // call was routed to another number/line, which handles and reports it
+    // separately. Don't flag it as missed.
+    if (forwardedTo && !answeredAt && !hasVoicemail) {
+      console.log(`[${firm.id}][calls] Call ${callId} forwarded to ${forwardedTo} — not a missed call, skipping`);
+      markCallResolved(firm, callId);
+      return;
+    }
+
     const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
     const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
-    const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
     const isMenuHangup =
       status === "completed" &&
       direction === "incoming" &&
