@@ -19,6 +19,7 @@ const CONTACTS_REFRESH_INTERVAL = 60 * 60 * 1000;
 const QUO_USERS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const SLACK_CHANNELS_REFRESH_INTERVAL = 15 * 60 * 1000;
 const SLACK_USERS_REFRESH_INTERVAL = 30 * 60 * 1000;
+const CASE_STATUS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const CALL_CHECK_DELAY_MS = 185 * 1000;
 
 // === Firm Registry ===
@@ -57,6 +58,7 @@ const SECRET_FIELDS = [
   { key: "SLACK_LEGAL_ASSISTANT_WEBHOOK_URL", label: "#legalassistant-phone webhook", secret: true },
   { key: "SLACK_LEAD_CALLS_CHANNEL_ID", label: "#lead-calls channel ID", secret: false },
   { key: "SLACK_LEGAL_ASSISTANT_CHANNEL_ID", label: "#legalassistant-phone channel ID", secret: false },
+  { key: "CASE_DB_URL", label: "Case DB connection string (Supabase Postgres, optional)", secret: true },
 ];
 
 // Resolve a firm's credentials with precedence: FIRM_<ID>_<key> env var wins,
@@ -75,6 +77,7 @@ function resolveFirmSecrets(firmId, storedSecrets) {
     slackLegalAssistantChannelId: pick("SLACK_LEGAL_ASSISTANT_CHANNEL_ID"),
     quoApiKey: pick("QUO_API_KEY"),
     slackBotToken: pick("SLACK_BOT_TOKEN"),
+    caseDbUrl: pick("CASE_DB_URL"),
     slackWebhooks: {
       textMessages: pick("SLACK_TEXT_MESSAGES_WEBHOOK_URL"),
       missedCalls: pick("SLACK_MISSED_CALLS_WEBHOOK_URL"),
@@ -103,6 +106,18 @@ function secretSources(firmId, storedSecrets) {
   return out;
 }
 
+// Normalize the case-status config from a firm's config object.
+// caseStatusQuery: SQL returning columns aliased (case_number, status).
+// caseClosedValues: lowercased status strings that mean "closed/archived".
+function normalizeCaseStatusConfig(config) {
+  const raw = config.caseStatusConfig || {};
+  const query = typeof raw.query === "string" ? raw.query.trim() : "";
+  let closed = raw.closedValues;
+  if (!Array.isArray(closed)) closed = ["archived"];
+  closed = closed.map((v) => String(v).toLowerCase().trim()).filter(Boolean);
+  return { query, closedValues: closed.length ? closed : ["archived"] };
+}
+
 function makeFirm(firmId, config, storedSecrets = {}) {
   return {
     id: firmId,
@@ -113,6 +128,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     // When true, only route events where `from` or `to` matches one of the
     // firm's phone lines (allowlist). Off by default so firms route everything.
     restrictToPhoneLines: !!config.restrictToPhoneLines,
+    caseStatusConfig: normalizeCaseStatusConfig(config),
     storedSecrets: storedSecrets || {},
     ...resolveFirmSecrets(firmId, storedSecrets),
     // Per-firm state
@@ -123,6 +139,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     callCache: new Map(),
     pendingCallChecks: new Map(),
     resolvedCalls: new Set(),
+    caseStatusCache: new Map(), // caseNumber(string) -> status(string, lowercased)
   };
 }
 
@@ -238,6 +255,7 @@ async function initFirmStore() {
         lead_thread_tag_users JSONB NOT NULL DEFAULT '[]'::jsonb,
         secrets TEXT,
         restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false,
+        case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
@@ -245,6 +263,7 @@ async function initFirmStore() {
     // Migrate older tables that predate newer columns.
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS secrets TEXT`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
@@ -259,6 +278,7 @@ function rowToConfig(row) {
     phoneLines: row.phone_lines || {},
     leadThreadTagUsers: row.lead_thread_tag_users || [],
     restrictToPhoneLines: !!row.restrict_to_phone_lines,
+    caseStatusConfig: row.case_status_config || {},
   };
 }
 
@@ -295,8 +315,8 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
@@ -304,6 +324,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
        lead_thread_tag_users = EXCLUDED.lead_thread_tag_users,
        secrets = EXCLUDED.secrets,
        restrict_to_phone_lines = EXCLUDED.restrict_to_phone_lines,
+       case_status_config = EXCLUDED.case_status_config,
        updated_at = now()`,
     [
       id,
@@ -313,6 +334,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       JSON.stringify(config.leadThreadTagUsers || []),
       encryptSecrets(storedSecrets || {}),
       !!config.restrictToPhoneLines,
+      JSON.stringify(normalizeCaseStatusConfig(config)),
     ],
   );
   return true;
@@ -644,6 +666,72 @@ async function loadQuoContacts(firm) {
 function getContactName(firm, phoneNumber) {
   if (!phoneNumber) return null;
   return firm.contactsCache.get(phoneNumber) || null;
+}
+
+// --- Case status (optional per-firm Supabase/Postgres sync) ---
+// Syncs {case_number, status} rows into firm.caseStatusCache so routing can tell
+// whether a case is open (active) or closed (archived). Only runs when the firm
+// has both a CASE_DB_URL secret and a caseStatusConfig.query configured.
+async function loadCaseStatuses(firm) {
+  const query = firm.caseStatusConfig?.query;
+  if (!firm.caseDbUrl || !query) return;
+
+  // Read-only guard: single SELECT, no statement chaining.
+  const q = query.trim().replace(/;+\s*$/, "");
+  if (!/^select\b/i.test(q) || q.includes(";")) {
+    console.error(`[${firm.id}][case-status] Query must be a single SELECT — skipping`);
+    return;
+  }
+
+  let client;
+  try {
+    const pg = await import("pg");
+    const { Client } = pg.default || pg;
+    // Supabase (and most managed Postgres) require SSL; allow sslmode=disable in
+    // the connection string to turn it off for local/self-hosted databases.
+    const disableSsl = /sslmode=disable/i.test(firm.caseDbUrl);
+    client = new Client({
+      connectionString: firm.caseDbUrl,
+      ssl: disableSsl ? false : { rejectUnauthorized: false },
+      statement_timeout: 20000,
+    });
+    await client.connect();
+    const { rows } = await client.query(q);
+    const next = new Map();
+    for (const row of rows) {
+      const num = row.case_number ?? row.caseNumber ?? row.number ?? row.id;
+      const status = row.status ?? row.state;
+      if (num == null || status == null) continue;
+      next.set(String(num).trim(), String(status).toLowerCase().trim());
+    }
+    firm.caseStatusCache = next;
+    console.log(`[${firm.id}][case-status] Loaded ${next.size} case statuses`);
+  } catch (err) {
+    console.error(`[${firm.id}][case-status] Error loading case statuses:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
+// Look up a case number's status; null if unknown / not synced.
+function getCaseStatus(firm, caseNumber) {
+  if (!caseNumber || !firm.caseStatusCache) return null;
+  return firm.caseStatusCache.get(String(caseNumber).trim()) || null;
+}
+
+function isClosedStatus(firm, status) {
+  if (!status) return false;
+  const closed = firm.caseStatusConfig?.closedValues || ["archived"];
+  return closed.includes(String(status).toLowerCase().trim());
+}
+
+// Is any phone party tied to a closed (archived) case?
+function anyCaseClosed(firm, phones) {
+  for (const phone of phones.filter(Boolean)) {
+    const caseNumber = extractCaseNumber(getContactName(firm, phone));
+    if (caseNumber && isClosedStatus(firm, getCaseStatus(firm, caseNumber))) return true;
+  }
+  return false;
 }
 
 async function loadQuoUsers(firm) {
@@ -1145,10 +1233,13 @@ async function postToCaseChannel(firm, text, phoneFrom, phoneTo, { skipMentions 
     if (!joined) continue;
     const liveTopic = skipMentions ? null : await fetchChannelTopic(firm, channel.id);
     const mentions = skipMentions ? "" : extractMentionsFromTopic(firm, liveTopic ?? channel.topic);
-    const caseText = mentions + text;
+    // Flag closed/archived cases so the team knows it's a former client.
+    const closed = isClosedStatus(firm, getCaseStatus(firm, caseNumber));
+    const closedFlag = closed ? "⚠️ *CLOSED CASE — former client*\n" : "";
+    const caseText = mentions + closedFlag + text;
     const ok = await postViaBot(firm, channel.id, caseText);
     if (ok) {
-      console.log(`[${firm.id}][case-channel] Posted to #${channel.name}${mentions ? " with mentions" : ""}`);
+      console.log(`[${firm.id}][case-channel] Posted to #${channel.name}${mentions ? " with mentions" : ""}${closed ? " [CLOSED CASE]" : ""}`);
     }
   }
 }
@@ -1267,7 +1358,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
     const externalPhone = firm.phoneLines[from] ? to : from;
-    if (!isExistingClient(firm, externalPhone)) {
+    if (!isActiveClient(firm, externalPhone)) {
       await postToLegalAssistant(firm, text, from, to);
     }
     await postToCaseChannel(firm, text, from, to);
@@ -1319,6 +1410,17 @@ function isExistingClient(firm, phoneNumber) {
   return !!extractCaseNumber(contactName);
 }
 
+// An ACTIVE client has a case number whose status isn't closed/archived.
+// When case-status sync isn't configured, every case counts as active (status
+// is unknown → not closed), so behavior is unchanged for firms without it.
+// Former clients (closed case) are treated like non-clients for intake routing
+// and lead classification, since they may be calling about a new matter.
+function isActiveClient(firm, phoneNumber) {
+  const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
+  if (!caseNumber) return false;
+  return !isClosedStatus(firm, getCaseStatus(firm, caseNumber));
+}
+
 function isKnownBusiness(firm, phoneNumber) {
   const contactName = getContactName(firm, phoneNumber);
   if (!contactName) return false;
@@ -1330,7 +1432,9 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
     if (firm.phoneLines[phone]) continue;
-    if (isExistingClient(firm, phone)) {
+    // Active clients aren't leads. A former client (closed case) is allowed
+    // through to classification — they may be calling about a new matter.
+    if (isActiveClient(firm, phone)) {
       console.log(`[${firm.id}][lead] Skipping — existing client: ${getContactName(firm, phone)}`);
       return { isLead: false, isQualified: false, label: "No (Existing Client)" };
     }
@@ -1408,7 +1512,9 @@ function shouldRouteToLegalAssistant(firm, phoneFrom, phoneTo) {
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
     if (firm.phoneLines[phone]) continue;
-    if (isExistingClient(firm, phone)) return false;
+    // Only active clients skip intake — former clients (closed case) route here
+    // as a potential new matter (Option C).
+    if (isActiveClient(firm, phone)) return false;
   }
   return true;
 }
@@ -1574,7 +1680,7 @@ async function handleCalls(firm, req, res) {
     await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
 
     const externalPhone = firm.phoneLines[from] ? to : from;
-    if (!isExistingClient(firm, externalPhone)) {
+    if (!isActiveClient(firm, externalPhone)) {
       await postToLegalAssistant(firm, text, from, to);
       console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone`);
     } else {
@@ -1942,6 +2048,11 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     phoneLines: f.phoneLines,
     leadThreadTagUsers: f.leadThreadTagUsers,
     restrictToPhoneLines: !!f.restrictToPhoneLines,
+    caseStatusConfig: {
+      query: f.caseStatusConfig?.query || "",
+      closedValues: f.caseStatusConfig?.closedValues || ["archived"],
+    },
+    caseStatusCount: f.caseStatusCache ? f.caseStatusCache.size : 0,
     source: f.source || "file",
     isDefault: f.id === DEFAULT_FIRM_ID,
     hasQuoApiKey: !!f.quoApiKey,
@@ -1976,6 +2087,13 @@ function validateFirmBody(body) {
   if (leadThreadTagUsers && !Array.isArray(leadThreadTagUsers)) {
     return { error: "leadThreadTagUsers must be an array of Slack user IDs" };
   }
+  const csc = (body && body.caseStatusConfig) || {};
+  if (csc.query && typeof csc.query === "string") {
+    const q = csc.query.trim();
+    if (q && (!/^select\b/i.test(q) || q.replace(/;+\s*$/, "").includes(";"))) {
+      return { error: "caseStatusConfig.query must be a single read-only SELECT" };
+    }
+  }
   return {
     config: {
       name: String(name).trim(),
@@ -1983,6 +2101,10 @@ function validateFirmBody(body) {
       phoneLines: phoneLines || {},
       leadThreadTagUsers: leadThreadTagUsers || [],
       restrictToPhoneLines: !!(body && body.restrictToPhoneLines),
+      caseStatusConfig: {
+        query: typeof csc.query === "string" ? csc.query.trim() : "",
+        closedValues: Array.isArray(csc.closedValues) ? csc.closedValues : undefined,
+      },
     },
   };
 }
@@ -2083,9 +2205,15 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.phoneLines = config.phoneLines;
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
+  firm.caseStatusConfig = normalizeCaseStatusConfig(config);
   firm.storedSecrets = mergedSecrets;
   applyFirmSecrets(firm); // recompute quoApiKey/slackBotToken/webhooks/channels
   console.log(`[admin] Updated firm "${id}" (${config.name}), persisted to ${persistedTo}`);
+
+  // Re-sync case statuses in the background (connection string or query may have changed).
+  loadCaseStatuses(firm).catch((err) =>
+    console.error(`[${id}][case-status] Resync error:`, err.message)
+  );
 
   res.json({ ok: true, firmId: id, config, persistedTo });
 });
@@ -2131,6 +2259,7 @@ async function loadFirmCaches(firm) {
   await ensureHubChannelsJoined(firm);
   await loadQuoContacts(firm);
   await loadQuoUsers(firm);
+  await loadCaseStatuses(firm);
   console.log(`[${firm.id}][startup] Caches loaded`);
 }
 
@@ -2169,3 +2298,7 @@ setInterval(() => {
 setInterval(() => {
   for (const firm of firms.values()) loadSlackUsers(firm);
 }, SLACK_USERS_REFRESH_INTERVAL);
+
+setInterval(() => {
+  for (const firm of firms.values()) loadCaseStatuses(firm);
+}, CASE_STATUS_REFRESH_INTERVAL);

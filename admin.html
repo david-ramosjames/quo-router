@@ -243,6 +243,20 @@
       </div>
       <div id="secret-fields"></div>
 
+      <h3 style="margin-top:24px">Case Status (optional)</h3>
+      <div class="hint" style="margin-bottom:8px">
+        Connect a case database (e.g. Supabase Postgres) so the router knows if a case is open or closed.
+        When a call/text comes in for a <strong>closed</strong> case, it's still posted to the case channel
+        (flagged <code>⚠️ CLOSED CASE</code>) <em>and</em> surfaced to intake as a possible new matter.
+        The connection string goes in the <strong>Case DB connection string</strong> field under Credentials above.
+      </div>
+      <label for="firm-case-query">Case status query</label>
+      <input id="firm-case-query" name="caseStatusQuery" placeholder="SELECT case_number, status FROM public.cases">
+      <div class="hint">A read-only <code>SELECT</code> returning two columns aliased <code>case_number</code> and <code>status</code>. The case number must match the number in your Quo contact names (e.g. "Jane Doe 1606" → 1606).</div>
+      <label for="firm-case-closed">"Closed" status values</label>
+      <input id="firm-case-closed" name="caseClosedValues" placeholder="archived">
+      <div class="hint">Comma-separated status values that mean the case is closed. Everything else counts as open. Default: <code>archived</code>.</div>
+
       <div style="margin-top:16px; display:flex; gap:8px">
         <button type="submit" id="submit-btn">Add Firm</button>
         <button type="button" id="cancel-edit" class="secondary" style="display:none">Cancel</button>
@@ -305,6 +319,19 @@ FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
 Calls:        https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/calls
 Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary</pre>
       <p>Each registered firm's exact URLs are shown in the firm card above once loaded.</p>
+    </details>
+
+    <details>
+      <summary>How does Case Status (open/closed) work?</summary>
+      <p>Quo only knows contacts, not whether a case is open or closed — that lives in your case-management database. Point the router at it (e.g. a Supabase Postgres) and it learns which cases are archived, so a call from a former client isn't buried in a dead case channel.</p>
+      <p><strong>Setup:</strong></p>
+      <ul>
+        <li>Put the database connection string in the <strong>Case DB connection string</strong> credential (for Supabase, use the connection <em>pooler</em> URI). It's stored encrypted like other secrets.</li>
+        <li>Set the <strong>Case status query</strong> to a read-only SELECT returning <code>case_number</code> and <code>status</code>, e.g. <code>SELECT case_number, status FROM public.cases</code>. The <code>case_number</code> must match the number embedded in your Quo contact names.</li>
+        <li>List which <strong>status values mean closed</strong> (default <code>archived</code>).</li>
+      </ul>
+      <p>The router syncs the table every ~30 minutes into memory (no per-call queries). When an event comes in for a <strong>closed</strong> case, it's posted to the case channel flagged <code>⚠️ CLOSED CASE — former client</code> <em>and</em> also sent to #legalassistant-phone (intake), since a former client is often calling about a new matter — and it becomes eligible for lead classification again. Open cases and firms without this configured behave exactly as before.</p>
+      <p>Tip: expose a dedicated view (e.g. <code>SELECT id AS case_number, status FROM public.cases</code>) so you can refactor your real schema without touching the router.</p>
     </details>
 
     <details>
@@ -493,7 +520,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
               <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
             </div>
           </div>
-          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}</div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}</div>
           <details>
             <summary>Webhook URLs to configure in Quo</summary>
             <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
@@ -532,6 +559,8 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       .map(([n, name]) => `${n}=${name}`).join("\n");
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
+    form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
+    form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
     renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
     $("submit-btn").textContent = "Save Changes";
@@ -646,6 +675,10 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
       restrictToPhoneLines: form.restrictToPhoneLines.checked,
+      caseStatusConfig: {
+        query: form.caseStatusQuery.value.trim(),
+        closedValues: parseTagUsers(form.caseClosedValues.value),
+      },
       secrets: collectSecrets(),
     };
 
