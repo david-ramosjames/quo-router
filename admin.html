@@ -269,7 +269,7 @@
       </label>
       <label for="firm-intake-table">Intake table</label>
       <input id="firm-intake-table" name="intakeTable" placeholder="public.intakes">
-      <div class="hint">Table to insert into. Must have columns: <code>call_id</code> (unique), <code>name</code>, <code>phone</code>, <code>accident_date</code>, <code>quo_link</code>, <code>data</code> (jsonb). Default: <code>public.intakes</code>.</div>
+      <div class="hint">Table to insert into. Must have columns: <code>call_id</code> (unique), <code>name</code>, <code>phone</code>, <code>accident_date</code>, <code>quo_link</code>, <code>transcript</code>, <code>data</code> (jsonb). Default: <code>public.intakes</code>. See the FAQ for the exact DDL.</div>
       <label for="firm-intake-channel">Notification channel ID</label>
       <input id="firm-intake-channel" name="intakeNotifyChannelId" placeholder="defaults to #lead-calls channel">
       <div class="hint">Slack channel ID for the "Intake loaded" confirmation. Leave blank to use the #lead-calls channel.</div>
@@ -355,9 +355,11 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
   phone         text,
   accident_date text,
   quo_link      text,
+  transcript    text,
   data          jsonb,
   created_at    timestamptz default now()
 );</pre>
+      <p>All intake-form fields (referral, accident, client, property damage, employment, other driver, insurance, injury, notes) are stored in the <code>data</code> JSONB — the top-level columns are just for quick querying. The raw call <code>transcript</code> is saved too. Already created the table without <code>transcript</code>? Add it with <code>alter table public.intakes add column transcript text;</code></p>
       <p>It's best-effort and runs after normal routing, so an extraction hiccup never affects the Slack call posts.</p>
     </details>
 

@@ -950,10 +950,10 @@ async function insertIntake(firm, record) {
   try {
     client = await connectCaseDb(firm);
     const res = await client.query(
-      `INSERT INTO ${table} (call_id, name, phone, accident_date, quo_link, data)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `INSERT INTO ${table} (call_id, name, phone, accident_date, quo_link, transcript, data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
        ON CONFLICT (call_id) DO NOTHING`,
-      [record.callId, record.name, record.phone, record.accidentDate, record.quoLink, JSON.stringify(record.data || {})],
+      [record.callId, record.name, record.phone, record.accidentDate, record.quoLink, record.transcript || null, JSON.stringify(record.data || {})],
     );
     return { inserted: res.rowCount > 0 };
   } catch (err) {
@@ -966,7 +966,7 @@ async function insertIntake(firm, record) {
 
 // Extract → insert → notify. Best-effort: any failure is logged and swallowed so
 // it never affects normal call routing. Only runs for qualified leads.
-async function runIntake(firm, { callId, deepLink, text, isQualified }) {
+async function runIntake(firm, { callId, deepLink, text, transcript, isQualified }) {
   if (!firm.intakeConfig?.enabled || !isQualified) return;
   if (!callId || !text) return;
   if (!firm.caseDbUrl) {
@@ -983,7 +983,8 @@ async function runIntake(firm, { callId, deepLink, text, isQualified }) {
   const accidentDate = extracted.accident?.date || null;
 
   const { inserted, error } = await insertIntake(firm, {
-    callId, name, phone, accidentDate, quoLink: deepLink || null, data: extracted,
+    callId, name, phone, accidentDate, quoLink: deepLink || null,
+    transcript: transcript || text, data: extracted,
   });
   if (error) return;
   if (!inserted) {
@@ -2035,9 +2036,9 @@ async function handleCallSummary(firm, req, res) {
     const transcript = extractField(payload, "data.object.transcript", "data.transcript", "transcript");
     const transcriptText = Array.isArray(transcript) ? transcript.join(" ") : (transcript || "");
     const intakeText = [summaryText, transcriptText].filter(Boolean).join("\n\n");
-    await runIntake(firm, { callId, deepLink, text: intakeText, isQualified }).catch((err) =>
-      console.error(`[${firm.id}][intake] Error:`, err.message),
-    );
+    await runIntake(firm, {
+      callId, deepLink, text: intakeText, transcript: transcriptText || summaryText, isQualified,
+    }).catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
   } catch (err) {
     console.error(`[${firm.id}][call-summary] Error:`, err.message);
   }
