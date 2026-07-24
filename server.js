@@ -404,6 +404,33 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// fetch with retry on transient failures: network errors (fetch throws), HTTP
+// 429, and 5xx (e.g. OpenPhone's Cloudflare 522 origin timeouts). Respects
+// Retry-After; otherwise exponential backoff. Returns the final Response, or
+// throws if the network error persists past all attempts.
+async function fetchWithRetry(url, options = {}, { attempts = 4, label = "fetch" } = {}) {
+  for (let i = 0; ; i++) {
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (err) {
+      if (i >= attempts - 1) throw err;
+      const backoff = (2 ** i) * 2000;
+      console.warn(`[${label}] ${err.message} — retrying in ${backoff / 1000}s (attempt ${i + 1}/${attempts})`);
+      await sleep(backoff);
+      continue;
+    }
+    if ((res.status === 429 || res.status >= 500) && i < attempts - 1) {
+      const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+      const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** i) * 2000;
+      console.warn(`[${label}] HTTP ${res.status} — retrying in ${backoff / 1000}s (attempt ${i + 1}/${attempts})`);
+      await sleep(backoff);
+      continue;
+    }
+    return res;
+  }
+}
+
 function safe(val) {
   if (val === null || val === undefined) return "N/A";
   if (Array.isArray(val)) return val.join(" ") || "N/A";
@@ -652,15 +679,7 @@ async function loadQuoContacts(firm) {
       const url = new URL("https://api.openphone.com/v1/contacts");
       url.searchParams.set("maxResults", "50");
       if (pageToken) url.searchParams.set("pageToken", pageToken);
-      let res;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        res = await fetch(url.toString(), { headers: { Authorization: firm.quoApiKey } });
-        if (res.status !== 429) break;
-        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
-        const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
-        console.warn(`[${firm.id}][contacts] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
-        await sleep(backoff);
-      }
+      const res = await fetchWithRetry(url.toString(), { headers: { Authorization: firm.quoApiKey } }, { label: `${firm.id}][contacts` });
       if (!res.ok) {
         console.error(`[${firm.id}][contacts] Quo API responded ${res.status}: ${await res.text()}`);
         break;
@@ -762,17 +781,9 @@ async function loadQuoUsers(firm) {
   if (!firm.quoApiKey) return;
   console.log(`[${firm.id}][quo-users] Fetching users from Quo API...`);
   try {
-    let res;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      res = await fetch("https://api.openphone.com/v1/users", {
-        headers: { Authorization: firm.quoApiKey },
-      });
-      if (res.status !== 429) break;
-      const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
-      const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
-      console.warn(`[${firm.id}][quo-users] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
-      await sleep(backoff);
-    }
+    const res = await fetchWithRetry("https://api.openphone.com/v1/users", {
+      headers: { Authorization: firm.quoApiKey },
+    }, { label: `${firm.id}][quo-users` });
     if (!res.ok) {
       console.error(`[${firm.id}][quo-users] Quo API responded ${res.status}: ${await res.text()}`);
       return;
@@ -798,17 +809,9 @@ function getQuoUserName(firm, userId) {
 async function fetchCallFromQuo(firm, callId) {
   if (!firm.quoApiKey || !callId) return null;
   try {
-    let res;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      res = await fetch(`https://api.openphone.com/v1/calls/${callId}`, {
-        headers: { Authorization: firm.quoApiKey },
-      });
-      if (res.status !== 429) break;
-      const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
-      const backoff = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 2000;
-      console.warn(`[${firm.id}][call-check] Rate limited (429), retrying in ${backoff / 1000}s (attempt ${attempt + 1}/4)`);
-      await sleep(backoff);
-    }
+    const res = await fetchWithRetry(`https://api.openphone.com/v1/calls/${callId}`, {
+      headers: { Authorization: firm.quoApiKey },
+    }, { label: `${firm.id}][call-check` });
     if (!res.ok) {
       console.error(`[${firm.id}][call-check] Quo API responded ${res.status}`);
       return null;
@@ -835,9 +838,9 @@ async function loadSlackChannels(firm) {
       url.searchParams.set("limit", "200");
       url.searchParams.set("exclude_archived", "true");
       if (cursor) url.searchParams.set("cursor", cursor);
-      const res = await fetch(url.toString(), {
+      const res = await fetchWithRetry(url.toString(), {
         headers: { Authorization: `Bearer ${firm.slackBotToken}` },
-      });
+      }, { label: `${firm.id}][slack` });
       const json = await res.json();
       if (!json.ok) {
         console.error(`[${firm.id}][slack] channels error: ${json.error}`);
@@ -865,9 +868,9 @@ async function loadSlackUsers(firm) {
       const url = new URL("https://slack.com/api/users.list");
       url.searchParams.set("limit", "200");
       if (cursor) url.searchParams.set("cursor", cursor);
-      const res = await fetch(url.toString(), {
+      const res = await fetchWithRetry(url.toString(), {
         headers: { Authorization: `Bearer ${firm.slackBotToken}` },
-      });
+      }, { label: `${firm.id}][slack` });
       const json = await res.json();
       if (!json.ok) {
         console.error(`[${firm.id}][slack] users error: ${json.error}`);
@@ -1141,14 +1144,14 @@ async function postToLegalAssistant(firm, text, phoneFrom, phoneTo) {
 
 async function joinChannel(firm, channelId) {
   try {
-    const res = await fetch("https://slack.com/api/conversations.join", {
+    const res = await fetchWithRetry("https://slack.com/api/conversations.join", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${firm.slackBotToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ channel: channelId }),
-    });
+    }, { label: `${firm.id}][case-channel` });
     const json = await res.json();
     if (!json.ok && json.error !== "already_in_channel") {
       console.error(`[${firm.id}][case-channel] Failed to join channel: ${json.error}`);
