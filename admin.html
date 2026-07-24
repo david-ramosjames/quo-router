@@ -257,6 +257,23 @@
       <input id="firm-case-closed" name="caseClosedValues" placeholder="archived">
       <div class="hint">Comma-separated status values that mean the case is closed. Everything else counts as open. Default: <code>archived</code>.</div>
 
+      <h3 style="margin-top:24px">Intake Extraction (optional)</h3>
+      <div class="hint" style="margin-bottom:8px">
+        For <strong>qualified-lead</strong> calls, parse the transcript with Claude into a structured intake row
+        and write it to the case database (uses the same <strong>Case DB connection string</strong> above — the DB role
+        needs <code>INSERT</code> on the intake table). Then posts a Slack confirmation.
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="firm-intake-enabled" name="intakeEnabled">
+        <span>Enable intake extraction for qualified leads</span>
+      </label>
+      <label for="firm-intake-table">Intake table</label>
+      <input id="firm-intake-table" name="intakeTable" placeholder="public.intakes">
+      <div class="hint">Table to insert into. Must have columns: <code>call_id</code> (unique), <code>name</code>, <code>phone</code>, <code>accident_date</code>, <code>quo_link</code>, <code>data</code> (jsonb). Default: <code>public.intakes</code>.</div>
+      <label for="firm-intake-channel">Notification channel ID</label>
+      <input id="firm-intake-channel" name="intakeNotifyChannelId" placeholder="defaults to #lead-calls channel">
+      <div class="hint">Slack channel ID for the "Intake loaded" confirmation. Leave blank to use the #lead-calls channel.</div>
+
       <div style="margin-top:16px; display:flex; gap:8px">
         <button type="submit" id="submit-btn">Add Firm</button>
         <button type="button" id="cancel-edit" class="secondary" style="display:none">Cancel</button>
@@ -319,6 +336,29 @@ FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
 Calls:        https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/calls
 Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary</pre>
       <p>Each registered firm's exact URLs are shown in the firm card above once loaded.</p>
+    </details>
+
+    <details>
+      <summary>How does Intake Extraction work?</summary>
+      <p>When enabled, every <strong>qualified-lead</strong> call summary is parsed by Claude into a structured intake record (client, accident, injuries, insurance, vehicle, etc.) and written as one row to your intake table, with the Quo call link saved alongside it. Then it posts <code>📝 Intake loaded for [Name]</code> to the notification channel (default #lead-calls).</p>
+      <ul>
+        <li><strong>Trigger:</strong> qualified leads only — spam/vendor/existing-client calls are skipped.</li>
+        <li><strong>Where it writes:</strong> the same case database (<code>CASE_DB_URL</code>). The DB role needs <code>INSERT</code> on the intake table — e.g. <code>GRANT INSERT ON public.intakes TO your_role;</code></li>
+        <li><strong>Dedup:</strong> rows are keyed by <code>call_id</code> with <code>ON CONFLICT DO NOTHING</code>, so a call is never recorded (or announced) twice.</li>
+        <li><strong>Fields:</strong> only what the caller actually says is filled in; everything else is left null for staff to complete. The full extraction lands in the <code>data</code> JSONB column.</li>
+      </ul>
+      <p>Recommended table:</p>
+      <pre>create table public.intakes (
+  id            uuid primary key default gen_random_uuid(),
+  call_id       text unique,
+  name          text,
+  phone         text,
+  accident_date text,
+  quo_link      text,
+  data          jsonb,
+  created_at    timestamptz default now()
+);</pre>
+      <p>It's best-effort and runs after normal routing, so an extraction hiccup never affects the Slack call posts.</p>
     </details>
 
     <details>
@@ -520,7 +560,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
               <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
             </div>
           </div>
-          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}</div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}${f.intakeConfig?.enabled ? ' · <span class="src-tag stored">intake extraction ON</span>' : ""}</div>
           <details>
             <summary>Webhook URLs to configure in Quo</summary>
             <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
@@ -561,6 +601,9 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
     form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
+    form.intakeEnabled.checked = !!f.intakeConfig?.enabled;
+    form.intakeTable.value = f.intakeConfig?.table || "";
+    form.intakeNotifyChannelId.value = f.intakeConfig?.notifyChannelId || "";
     renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
     $("submit-btn").textContent = "Save Changes";
@@ -678,6 +721,11 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       caseStatusConfig: {
         query: form.caseStatusQuery.value.trim(),
         closedValues: parseTagUsers(form.caseClosedValues.value),
+      },
+      intakeConfig: {
+        enabled: form.intakeEnabled.checked,
+        table: form.intakeTable.value.trim(),
+        notifyChannelId: form.intakeNotifyChannelId.value.trim(),
       },
       secrets: collectSecrets(),
     };

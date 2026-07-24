@@ -126,6 +126,16 @@ function normalizeCaseStatusConfig(config) {
   return { query, closedValues: closed.length ? closed : ["archived"] };
 }
 
+// Intake extraction config. When enabled, qualified-lead call summaries are
+// parsed into structured intake data and written to `table` in the case DB
+// (CASE_DB_URL), with a Slack confirmation to notifyChannelId.
+function normalizeIntakeConfig(config) {
+  const raw = config.intakeConfig || {};
+  const table = typeof raw.table === "string" && raw.table.trim() ? raw.table.trim() : "public.intakes";
+  const notifyChannelId = typeof raw.notifyChannelId === "string" ? raw.notifyChannelId.trim() : "";
+  return { enabled: !!raw.enabled, table, notifyChannelId };
+}
+
 function makeFirm(firmId, config, storedSecrets = {}) {
   return {
     id: firmId,
@@ -137,6 +147,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     // firm's phone lines (allowlist). Off by default so firms route everything.
     restrictToPhoneLines: !!config.restrictToPhoneLines,
     caseStatusConfig: normalizeCaseStatusConfig(config),
+    intakeConfig: normalizeIntakeConfig(config),
     storedSecrets: storedSecrets || {},
     ...resolveFirmSecrets(firmId, storedSecrets),
     // Per-firm state
@@ -264,6 +275,7 @@ async function initFirmStore() {
         secrets TEXT,
         restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false,
         case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        intake_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
@@ -272,6 +284,7 @@ async function initFirmStore() {
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS secrets TEXT`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS intake_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
@@ -287,6 +300,7 @@ function rowToConfig(row) {
     leadThreadTagUsers: row.lead_thread_tag_users || [],
     restrictToPhoneLines: !!row.restrict_to_phone_lines,
     caseStatusConfig: row.case_status_config || {},
+    intakeConfig: row.intake_config || {},
   };
 }
 
@@ -313,6 +327,7 @@ async function loadFirmsFromDb() {
           leadThreadTagUsers: existing.leadThreadTagUsers,
           restrictToPhoneLines: existing.restrictToPhoneLines,
           caseStatusConfig: existing.caseStatusConfig,
+          intakeConfig: existing.intakeConfig,
         } : {};
         const merged = { ...base, ...dbConfig };
         if (!dbConfig.phoneLines || Object.keys(dbConfig.phoneLines).length === 0) {
@@ -339,8 +354,8 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, intake_config, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
@@ -349,6 +364,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
        secrets = EXCLUDED.secrets,
        restrict_to_phone_lines = EXCLUDED.restrict_to_phone_lines,
        case_status_config = EXCLUDED.case_status_config,
+       intake_config = EXCLUDED.intake_config,
        updated_at = now()`,
     [
       id,
@@ -359,6 +375,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       encryptSecrets(storedSecrets || {}),
       !!config.restrictToPhoneLines,
       JSON.stringify(normalizeCaseStatusConfig(config)),
+      JSON.stringify(normalizeIntakeConfig(config)),
     ],
   );
   return true;
@@ -775,6 +792,219 @@ function anyCaseClosed(firm, phones) {
     if (caseNumber && isClosedStatus(firm, getCaseStatus(firm, caseNumber))) return true;
   }
   return false;
+}
+
+// Short-lived Postgres client to the firm's case DB (Supabase). Shared by the
+// case-status sync and the intake writer. SSL on by default; sslmode=disable in
+// the URL turns it off for local/self-hosted databases.
+async function connectCaseDb(firm) {
+  const pg = await import("pg");
+  const { Client } = pg.default || pg;
+  const disableSsl = /sslmode=disable/i.test(firm.caseDbUrl);
+  const client = new Client({
+    connectionString: firm.caseDbUrl,
+    ssl: disableSsl ? false : { rejectUnauthorized: false },
+    statement_timeout: 20000,
+  });
+  await client.connect();
+  return client;
+}
+
+// --- Intake extraction (qualified-lead calls → structured intake row) ---
+
+// Form-shaped extraction schema (Ramos James new-client MVA intake). All fields
+// optional; the model fills what the call actually contains and leaves the rest null.
+const INTAKE_TOOL_SCHEMA = {
+  type: "object",
+  properties: {
+    referral: { type: "object", properties: {
+      how_found: { type: ["string", "null"] },
+      map_location: { type: ["string", "null"] },
+    } },
+    accident: { type: "object", properties: {
+      date: { type: ["string", "null"], description: "date of accident" },
+      time: { type: ["string", "null"] },
+      representation_date: { type: ["string", "null"] },
+      location: { type: ["string", "null"] },
+      city: { type: ["string", "null"] },
+      county: { type: ["string", "null"] },
+      description: { type: ["string", "null"], description: "brief description of how the accident happened" },
+      police_department: { type: ["string", "null"] },
+      police_report_no: { type: ["string", "null"] },
+      ticket_issued: { type: ["boolean", "null"] },
+      ticket_who: { type: ["string", "null"] },
+      ticket_reason: { type: ["string", "null"] },
+    } },
+    client: { type: "object", properties: {
+      name: { type: ["string", "null"] },
+      phone: { type: ["string", "null"] },
+      email: { type: ["string", "null"] },
+      address: { type: ["string", "null"] },
+      dob: { type: ["string", "null"] },
+      sex: { type: ["string", "null"] },
+      dl_number: { type: ["string", "null"] },
+      spouse_name: { type: ["string", "null"] },
+      emergency_contact: { type: ["string", "null"] },
+      passengers: { type: "array", items: { type: "string" } },
+    } },
+    property_damage: { type: "object", properties: {
+      vehicle: { type: ["string", "null"], description: "client's car year make model" },
+      owner: { type: ["string", "null"] },
+      drivable: { type: ["boolean", "null"] },
+      towed: { type: ["boolean", "null"] },
+      towed_by: { type: ["string", "null"] },
+      vehicle_location: { type: ["string", "null"] },
+      has_loan: { type: ["boolean", "null"] },
+      lienholder: { type: ["string", "null"] },
+      rental_needed: { type: ["boolean", "null"] },
+      body_shop: { type: ["string", "null"] },
+    } },
+    employment: { type: "object", properties: {
+      employer: { type: ["string", "null"] },
+      job_description: { type: ["string", "null"] },
+      missed_work: { type: ["boolean", "null"] },
+      salary_rate: { type: ["string", "null"] },
+    } },
+    other_driver: { type: "object", properties: {
+      name: { type: ["string", "null"] },
+      sex: { type: ["string", "null"] },
+      dob: { type: ["string", "null"] },
+      address: { type: ["string", "null"] },
+      phone: { type: ["string", "null"] },
+      dl_number: { type: ["string", "null"] },
+      car_owner: { type: ["string", "null"] },
+    } },
+    insurance: { type: "object", properties: {
+      client_company: { type: ["string", "null"] },
+      client_policy_number: { type: ["string", "null"] },
+      client_claim_number: { type: ["string", "null"] },
+      third_party_company: { type: ["string", "null"] },
+      third_party_policy_number: { type: ["string", "null"] },
+      third_party_claim_number: { type: ["string", "null"] },
+      pip: { type: ["boolean", "null"] },
+      med_pay: { type: ["boolean", "null"] },
+      um_uim: { type: ["boolean", "null"] },
+    } },
+    injury: { type: "object", properties: {
+      ems: { type: ["boolean", "null"] },
+      hospital_bill: { type: ["boolean", "null"] },
+      hospital: { type: ["string", "null"] },
+      treating_doctor: { type: ["string", "null"] },
+      injury_types: { type: "array", items: { type: "string" } },
+      medicaid: { type: ["boolean", "null"] },
+      medicare: { type: ["boolean", "null"] },
+      health_insurance: { type: ["string", "null"] },
+    } },
+    notes: { type: ["string", "null"] },
+  },
+  required: [],
+};
+
+async function extractIntake(firm, text) {
+  if (!ANTHROPIC_API_KEY) {
+    console.warn(`[${firm.id}][intake] ANTHROPIC_API_KEY not set — cannot extract`);
+    return null;
+  }
+  try {
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1500,
+        tools: [{
+          name: "save_intake",
+          description: "Save the client intake details extracted from the call.",
+          input_schema: INTAKE_TOOL_SCHEMA,
+        }],
+        tool_choice: { type: "tool", name: "save_intake" },
+        system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call summary/transcript. Only include facts EXPLICITLY stated in the call. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If the call is not an accident intake, return mostly nulls.`,
+        messages: [{ role: "user", content: `Call summary / transcript:\n${text}` }],
+      }),
+    }, { label: `${firm.id}][intake` });
+    if (!res.ok) {
+      console.error(`[${firm.id}][intake] Anthropic API error ${res.status}: ${await res.text()}`);
+      return null;
+    }
+    const json = await res.json();
+    const toolUse = (json.content || []).find((c) => c.type === "tool_use");
+    return toolUse?.input || null;
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Extraction error:`, err.message);
+    return null;
+  }
+}
+
+async function insertIntake(firm, record) {
+  const table = firm.intakeConfig?.table || "public.intakes";
+  // Table name is interpolated (identifiers can't be parameterized) — validate strictly.
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) {
+    console.error(`[${firm.id}][intake] Invalid intake table name "${table}"`);
+    return { inserted: false, error: "invalid table name" };
+  }
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const res = await client.query(
+      `INSERT INTO ${table} (call_id, name, phone, accident_date, quo_link, data)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       ON CONFLICT (call_id) DO NOTHING`,
+      [record.callId, record.name, record.phone, record.accidentDate, record.quoLink, JSON.stringify(record.data || {})],
+    );
+    return { inserted: res.rowCount > 0 };
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Insert error:`, err.message);
+    return { inserted: false, error: err.message };
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
+// Extract → insert → notify. Best-effort: any failure is logged and swallowed so
+// it never affects normal call routing. Only runs for qualified leads.
+async function runIntake(firm, { callId, deepLink, text, isQualified }) {
+  if (!firm.intakeConfig?.enabled || !isQualified) return;
+  if (!callId || !text) return;
+  if (!firm.caseDbUrl) {
+    console.warn(`[${firm.id}][intake] enabled but no case DB connection (CASE_DB_URL) — skipping`);
+    return;
+  }
+  const extracted = await extractIntake(firm, text);
+  if (!extracted) {
+    console.warn(`[${firm.id}][intake] Nothing extracted for ${callId}`);
+    return;
+  }
+  const name = extracted.client?.name || null;
+  const phone = extracted.client?.phone || null;
+  const accidentDate = extracted.accident?.date || null;
+
+  const { inserted, error } = await insertIntake(firm, {
+    callId, name, phone, accidentDate, quoLink: deepLink || null, data: extracted,
+  });
+  if (error) return;
+  if (!inserted) {
+    console.log(`[${firm.id}][intake] ${callId} already recorded — skipping`);
+    return;
+  }
+  console.log(`[${firm.id}][intake] Loaded intake for ${name || "unknown"} (${callId})`);
+
+  // Slack confirmation to the configured channel (default: #lead-calls).
+  const detail = extracted.accident?.description
+    ? `— ${extracted.accident.description}`
+    : (accidentDate ? `— accident ${accidentDate}` : "");
+  const line = `${name || "Unknown caller"}${phone ? ` (${phone})` : ""} ${detail}`.trim();
+  const link = deepLink ? `\n<${deepLink}|View call in Quo>` : "";
+  const msg = `📝 *Intake loaded* for ${line}${link}`;
+  const channelId = firm.intakeConfig.notifyChannelId || firm.slackLeadCallsChannelId;
+  if (channelId && firm.slackBotToken) {
+    await postViaBot(firm, channelId, msg);
+  } else if (firm.slackWebhooks.leadCalls) {
+    await postToSlack(firm.slackWebhooks.leadCalls, msg);
+  }
 }
 
 async function loadQuoUsers(firm) {
@@ -1798,6 +2028,16 @@ async function handleCallSummary(firm, req, res) {
     }
 
     await postToCaseChannel(firm, text, from, to);
+
+    // Intake extraction (opt-in, qualified leads only). Best-effort — after
+    // routing so it can't affect the Slack posts above. Uses the fullest text
+    // available (summary + transcript if present).
+    const transcript = extractField(payload, "data.object.transcript", "data.transcript", "transcript");
+    const transcriptText = Array.isArray(transcript) ? transcript.join(" ") : (transcript || "");
+    const intakeText = [summaryText, transcriptText].filter(Boolean).join("\n\n");
+    await runIntake(firm, { callId, deepLink, text: intakeText, isQualified }).catch((err) =>
+      console.error(`[${firm.id}][intake] Error:`, err.message),
+    );
   } catch (err) {
     console.error(`[${firm.id}][call-summary] Error:`, err.message);
   }
@@ -2080,6 +2320,11 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
       closedValues: f.caseStatusConfig?.closedValues || ["archived"],
     },
     caseStatusCount: f.caseStatusCache ? f.caseStatusCache.size : 0,
+    intakeConfig: {
+      enabled: !!f.intakeConfig?.enabled,
+      table: f.intakeConfig?.table || "public.intakes",
+      notifyChannelId: f.intakeConfig?.notifyChannelId || "",
+    },
     source: f.source || "file",
     isDefault: f.id === DEFAULT_FIRM_ID,
     hasQuoApiKey: !!f.quoApiKey,
@@ -2121,6 +2366,11 @@ function validateFirmBody(body) {
       return { error: "caseStatusConfig.query must be a single read-only SELECT" };
     }
   }
+  const ic = (body && body.intakeConfig) || {};
+  if (ic.table && typeof ic.table === "string" && ic.table.trim()
+      && !/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(ic.table.trim())) {
+    return { error: "intakeConfig.table must be a valid table name like public.intakes" };
+  }
   return {
     config: {
       name: String(name).trim(),
@@ -2131,6 +2381,11 @@ function validateFirmBody(body) {
       caseStatusConfig: {
         query: typeof csc.query === "string" ? csc.query.trim() : "",
         closedValues: Array.isArray(csc.closedValues) ? csc.closedValues : undefined,
+      },
+      intakeConfig: {
+        enabled: !!ic.enabled,
+        table: typeof ic.table === "string" ? ic.table.trim() : "",
+        notifyChannelId: typeof ic.notifyChannelId === "string" ? ic.notifyChannelId.trim() : "",
       },
     },
   };
@@ -2236,6 +2491,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.caseStatusConfig = normalizeCaseStatusConfig(config);
+  firm.intakeConfig = normalizeIntakeConfig(config);
   firm.storedSecrets = mergedSecrets;
   firm.source = persistedTo === "postgres" ? "db" : "file";
   applyFirmSecrets(firm); // recompute quoApiKey/slackBotToken/webhooks/channels
