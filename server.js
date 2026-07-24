@@ -298,13 +298,29 @@ async function loadFirmsFromDb() {
     for (const row of rows) {
       if (row.id.startsWith("_")) continue;
       const secrets = decryptSecrets(row.secrets);
-      // The default firm always comes from firms.json — never let the DB shadow it.
+      // The default firm's base comes from firms.json (so it always exists, even
+      // with an empty DB). If a DB row also exists — written when it's edited in
+      // the admin UI — overlay it so UI config (incl. case-status + CASE_DB_URL)
+      // persists across redeploys. firms.json phone lines are kept if the DB row
+      // has none, so a partial row can't wipe the default firm.
       if (row.id === DEFAULT_FIRM_ID) {
-        if (!firms.has(row.id)) {
-          const f = makeFirm(row.id, rowToConfig(row), secrets);
-          f.source = "db";
-          firms.set(row.id, f);
+        const existing = firms.get(row.id);
+        const dbConfig = rowToConfig(row);
+        const base = existing ? {
+          name: existing.name,
+          practiceArea: existing.practiceArea,
+          phoneLines: existing.phoneLines,
+          leadThreadTagUsers: existing.leadThreadTagUsers,
+          restrictToPhoneLines: existing.restrictToPhoneLines,
+          caseStatusConfig: existing.caseStatusConfig,
+        } : {};
+        const merged = { ...base, ...dbConfig };
+        if (!dbConfig.phoneLines || Object.keys(dbConfig.phoneLines).length === 0) {
+          merged.phoneLines = base.phoneLines || {};
         }
+        const f = makeFirm(row.id, merged, { ...(existing?.storedSecrets || {}), ...secrets });
+        f.source = "db";
+        firms.set(row.id, f);
         continue;
       }
       const firm = makeFirm(row.id, rowToConfig(row), secrets);
@@ -2133,8 +2149,12 @@ function extractSecretsFromBody(body) {
 // firms go to Postgres (with secrets); file-backed firms go to firms.json on
 // disk (config ONLY — secrets are never written to the git-tracked file).
 // Returns the label used in the response ("postgres" or "disk").
-async function persistFirm(id, config, source, storedSecrets) {
-  if (source === "db" && pgPool) {
+// Persist a firm to Postgres when a database is configured (survives redeploys),
+// otherwise to firms.json on disk. This applies to the default firm too, so its
+// UI-entered config and secrets persist rather than being lost on redeploy.
+// Secrets are NEVER written to the git-tracked firms.json — only to the DB.
+async function persistFirm(id, config, storedSecrets) {
+  if (pgPool) {
     await saveFirmToDb(id, config, storedSecrets);
     return "postgres";
   }
@@ -2156,10 +2176,9 @@ app.post("/admin/api/firms", requireAuth, async (req, res) => {
   const storedSecrets = extractSecretsFromBody(req.body);
 
   // New firms go to Postgres when configured, else firms.json on disk.
-  const source = pgPool ? "db" : "file";
   let persistedTo;
   try {
-    persistedTo = await persistFirm(id, config, source, storedSecrets);
+    persistedTo = await persistFirm(id, config, storedSecrets);
   } catch (err) {
     console.error(`[admin] Failed to persist firm "${id}":`, err.message);
     return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
@@ -2167,7 +2186,7 @@ app.post("/admin/api/firms", requireAuth, async (req, res) => {
 
   // Register in-memory so it's live immediately
   const firm = makeFirm(id, config, storedSecrets);
-  firm.source = source;
+  firm.source = persistedTo === "postgres" ? "db" : "file";
   firms.set(id, firm);
   const secretsNote = !pgPool && Object.keys(storedSecrets).length
     ? " (secrets held in memory only — no DATABASE_URL, they won't survive restart)"
@@ -2201,7 +2220,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
 
   let persistedTo;
   try {
-    persistedTo = await persistFirm(id, config, firm.source || "file", mergedSecrets);
+    persistedTo = await persistFirm(id, config, mergedSecrets);
   } catch (err) {
     console.error(`[admin] Failed to persist edit for firm "${id}":`, err.message);
     return res.status(500).json({ error: `Failed to persist firm: ${err.message}` });
@@ -2215,6 +2234,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.caseStatusConfig = normalizeCaseStatusConfig(config);
   firm.storedSecrets = mergedSecrets;
+  firm.source = persistedTo === "postgres" ? "db" : "file";
   applyFirmSecrets(firm); // recompute quoApiKey/slackBotToken/webhooks/channels
   console.log(`[admin] Updated firm "${id}" (${config.name}), persisted to ${persistedTo}`);
 
