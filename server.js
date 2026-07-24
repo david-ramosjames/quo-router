@@ -2,7 +2,15 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import dns from "node:dns";
 import { fileURLToPath } from "url";
+
+// Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
+// outbound IPv6 route, and Node 18+ returns DNS results verbatim — so a
+// dual-stack host like Supabase's pooler can resolve to an unreachable IPv6
+// address (ENETUNREACH). Preferring IPv4 avoids that; all our upstreams
+// (Slack, Quo, Anthropic, Supabase pooler) are reachable over IPv4.
+dns.setDefaultResultOrder("ipv4first");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
