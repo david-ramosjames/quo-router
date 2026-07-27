@@ -274,6 +274,13 @@
       <input id="firm-intake-channel" name="intakeNotifyChannelId" placeholder="defaults to #lead-calls channel">
       <div class="hint">Slack channel ID for the "Intake loaded" confirmation. Leave blank to use the #lead-calls channel.</div>
 
+      <label for="firm-intake-followup">Follow-up window (hours)</label>
+      <input id="firm-intake-followup" name="intakeFollowUpHours" type="number" min="1" placeholder="72">
+      <div class="hint">After the intake, calls/texts/voicemails on the same number for this many hours are logged and their details merged into the intake. Default: <code>72</code>.</div>
+      <label for="firm-intake-interactions">Interactions table</label>
+      <input id="firm-intake-interactions" name="intakeInteractionsTable" placeholder="public.intake_interactions">
+      <div class="hint">Table where follow-up calls/texts are logged. See the FAQ for the DDL. Default: <code>public.intake_interactions</code>.</div>
+
       <div style="margin-top:16px; display:flex; gap:8px">
         <button type="submit" id="submit-btn">Add Firm</button>
         <button type="button" id="cancel-edit" class="secondary" style="display:none">Cancel</button>
@@ -361,6 +368,37 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
 );</pre>
       <p>All intake-form fields (referral, accident, client, property damage, employment, other driver, insurance, injury, notes) are stored in the <code>data</code> JSONB — the top-level columns are just for quick querying. The raw call <code>transcript</code> is saved too. Already created the table without <code>transcript</code>? Add it with <code>alter table public.intakes add column transcript text;</code></p>
       <p>It's best-effort and runs after normal routing, so an extraction hiccup never affects the Slack call posts.</p>
+    </details>
+
+    <details>
+      <summary>How do follow-up calls/texts get captured? (72h window)</summary>
+      <p>When an intake is created, a follow-up window opens on that caller's number (default 72h, configurable). During the window, every call, text, voicemail, and Sona call on that number is:</p>
+      <ul>
+        <li>logged as a row in the <strong>interactions table</strong> (linked to the intake by <code>intake_call_id</code>, deduped by the Quo message/call id), and</li>
+        <li>if it has any text (text body, call transcript, voicemail transcription), run through the extractor and <strong>merged into the intake</strong> — filling any fields that were still empty (existing values are never overwritten; lists are unioned).</li>
+      </ul>
+      <p>You get a brief <code>📝 Intake updated — filled N fields</code> Slack note whenever a follow-up adds something. Windows survive redeploys (rehydrated from recent intakes on startup).</p>
+      <p>Create the interactions table:</p>
+      <pre>create table public.intake_interactions (
+  id             uuid primary key default gen_random_uuid(),
+  intake_call_id text,
+  phone          text,
+  type           text,          -- text | call | sona_call | missed_call | voicemail
+  direction      text,          -- inbound | outbound
+  source_id      text unique,   -- Quo message/call id (dedup)
+  content        text,
+  transcript     text,
+  quo_link       text,
+  data           jsonb,
+  occurred_at    timestamptz default now()
+);
+grant insert, select on public.intake_interactions to your_role;  -- if not the owner</pre>
+      <p>Pull a full lead later by joining on <code>intake_call_id</code>:</p>
+      <pre>select i.name, i.phone, x.type, x.direction, x.content, x.occurred_at
+from public.intakes i
+left join public.intake_interactions x on x.intake_call_id = i.call_id
+where i.call_id = '...'
+order by x.occurred_at;</pre>
     </details>
 
     <details>
@@ -605,7 +643,9 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
     form.intakeEnabled.checked = !!f.intakeConfig?.enabled;
     form.intakeTable.value = f.intakeConfig?.table || "";
+    form.intakeInteractionsTable.value = f.intakeConfig?.interactionsTable || "";
     form.intakeNotifyChannelId.value = f.intakeConfig?.notifyChannelId || "";
+    form.intakeFollowUpHours.value = f.intakeConfig?.followUpHours || "";
     renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
     $("submit-btn").textContent = "Save Changes";
@@ -727,7 +767,9 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       intakeConfig: {
         enabled: form.intakeEnabled.checked,
         table: form.intakeTable.value.trim(),
+        interactionsTable: form.intakeInteractionsTable.value.trim(),
         notifyChannelId: form.intakeNotifyChannelId.value.trim(),
+        followUpHours: form.intakeFollowUpHours.value ? parseInt(form.intakeFollowUpHours.value, 10) : undefined,
       },
       secrets: collectSecrets(),
     };

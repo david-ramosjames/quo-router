@@ -132,8 +132,12 @@ function normalizeCaseStatusConfig(config) {
 function normalizeIntakeConfig(config) {
   const raw = config.intakeConfig || {};
   const table = typeof raw.table === "string" && raw.table.trim() ? raw.table.trim() : "public.intakes";
+  const interactionsTable = typeof raw.interactionsTable === "string" && raw.interactionsTable.trim()
+    ? raw.interactionsTable.trim() : "public.intake_interactions";
   const notifyChannelId = typeof raw.notifyChannelId === "string" ? raw.notifyChannelId.trim() : "";
-  return { enabled: !!raw.enabled, table, notifyChannelId };
+  let followUpHours = parseInt(raw.followUpHours, 10);
+  if (!Number.isFinite(followUpHours) || followUpHours <= 0) followUpHours = 72;
+  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, followUpHours };
 }
 
 function makeFirm(firmId, config, storedSecrets = {}) {
@@ -159,6 +163,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     pendingCallChecks: new Map(),
     resolvedCalls: new Set(),
     caseStatusCache: new Map(), // caseNumber(string) -> status(string, lowercased)
+    followUpWindows: new Map(), // phoneLast10 -> { intakeCallId, expiresAt }
   };
 }
 
@@ -964,9 +969,16 @@ async function insertIntake(firm, record) {
   }
 }
 
-// Extract → insert → notify. Best-effort: any failure is logged and swallowed so
-// it never affects normal call routing. Only runs for qualified leads.
-async function runIntake(firm, { callId, deepLink, summaryText, isQualified }) {
+function intakeNotify(firm, msg) {
+  const channelId = firm.intakeConfig.notifyChannelId || firm.slackLeadCallsChannelId;
+  if (channelId && firm.slackBotToken) return postViaBot(firm, channelId, msg);
+  if (firm.slackWebhooks.leadCalls) return postToSlack(firm.slackWebhooks.leadCalls, msg);
+  return Promise.resolve();
+}
+
+// Extract → insert → notify, then open a follow-up window on the caller's phone.
+// Best-effort: any failure is logged and swallowed so it never affects routing.
+async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified }) {
   if (!firm.intakeConfig?.enabled || !isQualified) return;
   if (!callId) return;
   if (!firm.caseDbUrl) {
@@ -990,8 +1002,10 @@ async function runIntake(firm, { callId, deepLink, summaryText, isQualified }) {
     return;
   }
   const name = extracted.client?.name || null;
-  const phone = extracted.client?.phone || null;
   const accidentDate = extracted.accident?.date || null;
+  // Store the actual Quo caller number (reliable for follow-up matching), not the
+  // model-extracted one. The extracted client phone stays inside data.client.phone.
+  const phone = externalPhone || extracted.client?.phone || null;
 
   const { inserted, error } = await insertIntake(firm, {
     callId, name, phone, accidentDate, quoLink: deepLink || null,
@@ -1004,18 +1018,172 @@ async function runIntake(firm, { callId, deepLink, summaryText, isQualified }) {
   }
   console.log(`[${firm.id}][intake] Loaded intake for ${name || "unknown"} (${callId})`);
 
-  // Slack confirmation to the configured channel (default: #lead-calls).
+  // Open the 72h (configurable) follow-up window on this caller's number.
+  openFollowUpWindow(firm, externalPhone, callId);
+
   const detail = extracted.accident?.description
     ? `— ${extracted.accident.description}`
     : (accidentDate ? `— accident ${accidentDate}` : "");
   const line = `${name || "Unknown caller"}${phone ? ` (${phone})` : ""} ${detail}`.trim();
   const link = deepLink ? `\n<${deepLink}|View call in Quo>` : "";
-  const msg = `📝 *Intake loaded* for ${line}${link}`;
-  const channelId = firm.intakeConfig.notifyChannelId || firm.slackLeadCallsChannelId;
-  if (channelId && firm.slackBotToken) {
-    await postViaBot(firm, channelId, msg);
-  } else if (firm.slackWebhooks.leadCalls) {
-    await postToSlack(firm.slackWebhooks.leadCalls, msg);
+  await intakeNotify(firm, `📝 *Intake loaded* for ${line}${link}`);
+}
+
+// --- Follow-up window: capture calls/texts/voicemails for N hours after intake ---
+
+function phoneKey(phone) {
+  return lastTenDigits(phone || "");
+}
+
+function openFollowUpWindow(firm, phone, intakeCallId) {
+  const key = phoneKey(phone);
+  if (!key) return;
+  const hours = firm.intakeConfig?.followUpHours || 72;
+  firm.followUpWindows.set(key, { intakeCallId, expiresAt: Date.now() + hours * 3600 * 1000 });
+}
+
+function getFollowUpWindow(firm, phone) {
+  const key = phoneKey(phone);
+  if (!key) return null;
+  const entry = firm.followUpWindows.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    firm.followUpWindows.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+// Deep "fill empty" merge: fills null/empty fields in base from incoming, keeps
+// existing non-empty scalars, unions arrays. Returns { merged, added } where
+// `added` counts newly-filled scalar fields.
+function deepFillMerge(base, incoming) {
+  let added = 0;
+  const out = { ...(base || {}) };
+  for (const [k, v] of Object.entries(incoming || {})) {
+    if (v === null || v === undefined || v === "") continue;
+    const cur = out[k];
+    if (Array.isArray(v)) {
+      const set = new Set([...(Array.isArray(cur) ? cur : []), ...v.filter(Boolean)]);
+      const before = Array.isArray(cur) ? cur.length : 0;
+      out[k] = [...set];
+      if (out[k].length > before) added += out[k].length - before;
+    } else if (typeof v === "object") {
+      const r = deepFillMerge(cur && typeof cur === "object" ? cur : {}, v);
+      out[k] = r.merged;
+      added += r.added;
+    } else if (cur === null || cur === undefined || cur === "") {
+      out[k] = v;
+      added += 1;
+    }
+  }
+  return { merged: out, added };
+}
+
+// Read the intake row, merge new extraction into its data (fill-empty), write back.
+// Also backfills empty top-level name/accident_date. Returns fields-added count.
+async function mergeIntoIntake(firm, intakeCallId, extracted) {
+  const table = firm.intakeConfig?.table || "public.intakes";
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) return 0;
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const { rows } = await client.query(`SELECT name, accident_date, data FROM ${table} WHERE call_id = $1`, [intakeCallId]);
+    if (!rows.length) return 0;
+    const current = rows[0].data || {};
+    const { merged, added } = deepFillMerge(current, extracted);
+    if (added === 0) return 0;
+    const newName = rows[0].name || merged.client?.name || null;
+    const newDate = rows[0].accident_date || merged.accident?.date || null;
+    await client.query(
+      `UPDATE ${table} SET data = $1::jsonb, name = $2, accident_date = $3 WHERE call_id = $4`,
+      [JSON.stringify(merged), newName, newDate, intakeCallId],
+    );
+    return added;
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Merge error:`, err.message);
+    return 0;
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
+async function insertInteraction(firm, rec) {
+  const table = firm.intakeConfig?.interactionsTable || "public.intake_interactions";
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) {
+    console.error(`[${firm.id}][follow-up] Invalid interactions table "${table}"`);
+    return { inserted: false };
+  }
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const res = await client.query(
+      `INSERT INTO ${table} (intake_call_id, phone, type, direction, source_id, content, transcript, quo_link, data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+       ON CONFLICT (source_id) DO NOTHING`,
+      [rec.intakeCallId, rec.phone, rec.type, rec.direction, rec.sourceId,
+       rec.content || null, rec.transcript || null, rec.quoLink || null, JSON.stringify(rec.data || {})],
+    );
+    return { inserted: res.rowCount > 0 };
+  } catch (err) {
+    console.error(`[${firm.id}][follow-up] Insert error:`, err.message);
+    return { inserted: false, error: err.message };
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
+// Capture a follow-up interaction on a tracked number: log it, then (if it has
+// text) extract and merge new details into the intake. Best-effort.
+async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, extractText }) {
+  const window = getFollowUpWindow(firm, phone);
+  if (!window || !sourceId) return;
+
+  const { inserted } = await insertInteraction(firm, {
+    intakeCallId: window.intakeCallId, phone: phoneKey(phone), type, direction,
+    sourceId, content, transcript, quoLink,
+  });
+  if (!inserted) return; // already logged (dedup)
+  console.log(`[${firm.id}][follow-up] Logged ${type} for intake ${window.intakeCallId} (${sourceId})`);
+
+  const text = extractText && extractText.trim();
+  if (!text) return;
+  const extracted = await extractIntake(firm, text);
+  if (!extracted) return;
+  const added = await mergeIntoIntake(firm, window.intakeCallId, extracted);
+  if (added > 0) {
+    console.log(`[${firm.id}][follow-up] Merged ${added} field(s) into intake ${window.intakeCallId}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${quoLink ? `\n<${quoLink}|View in Quo>` : ""}`);
+  }
+}
+
+// On startup, rehydrate follow-up windows from recent intakes so a redeploy
+// doesn't drop active windows.
+async function loadFollowUpWindows(firm) {
+  if (!firm.intakeConfig?.enabled || !firm.caseDbUrl) return;
+  const table = firm.intakeConfig?.table || "public.intakes";
+  const hours = firm.intakeConfig?.followUpHours || 72;
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) return;
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const { rows } = await client.query(
+      `SELECT call_id, phone, extract(epoch from created_at) * 1000 as created_ms
+       FROM ${table} WHERE created_at > now() - ($1 || ' hours')::interval`,
+      [String(hours)],
+    );
+    let n = 0;
+    for (const r of rows) {
+      const key = phoneKey(r.phone);
+      if (!key) continue;
+      firm.followUpWindows.set(key, { intakeCallId: r.call_id, expiresAt: Number(r.created_ms) + hours * 3600 * 1000 });
+      n++;
+    }
+    if (n) console.log(`[${firm.id}][follow-up] Rehydrated ${n} active window(s)`);
+  } catch (err) {
+    console.error(`[${firm.id}][follow-up] Rehydrate error:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
   }
 }
 
@@ -1873,6 +2041,17 @@ async function handleMessages(firm, req, res) {
     }
 
     await postToCaseChannel(firm, text, from, to, { skipMentions: isOutbound });
+
+    // Follow-up capture: if this number is in an intake follow-up window, log the
+    // text and merge any new details into the intake. Best-effort.
+    const externalPhone = firm.phoneLines[from] ? to : from;
+    if (getFollowUpWindow(firm, externalPhone)) {
+      const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
+      await captureFollowUp(firm, {
+        phone: externalPhone, type: "text", direction: isOutbound ? "outbound" : "inbound",
+        sourceId: msgId, content: body, quoLink: null, extractText: body,
+      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
+    }
   } catch (err) {
     console.error(`[${firm.id}][messages] Error:`, err.message);
   }
@@ -1991,6 +2170,18 @@ async function handleCalls(firm, req, res) {
     }
 
     await postToCaseChannel(firm, text, from, to);
+
+    // Follow-up capture: missed calls and voicemails on a tracked number. A
+    // voicemail with a transcript feeds the extractor; a bare missed call is
+    // logged as an interaction only (no text to extract).
+    if (getFollowUpWindow(firm, externalPhone)) {
+      const vmTranscript = voicemail && typeof voicemail === "object" ? (voicemail.transcript || voicemail.transcription || "") : "";
+      await captureFollowUp(firm, {
+        phone: externalPhone, type: hasVoicemail ? "voicemail" : "missed_call",
+        direction: "inbound", sourceId: callId, content: text,
+        transcript: vmTranscript || null, extractText: vmTranscript,
+      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
+    }
   } catch (err) {
     console.error(`[${firm.id}][calls] Error:`, err.message);
   }
@@ -2075,11 +2266,22 @@ async function handleCallSummary(firm, req, res) {
 
     await postToCaseChannel(firm, text, from, to);
 
-    // Intake extraction (opt-in, qualified leads only). Best-effort — after
-    // routing so it can't affect the Slack posts above. runIntake fetches the
-    // full verbatim transcript from Quo and extracts from that.
-    await runIntake(firm, { callId, deepLink, summaryText, isQualified })
-      .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
+    // Intake (opt-in). Best-effort, after routing. If this caller is already in
+    // a follow-up window, treat the call as a follow-up (log + merge into the
+    // existing intake); otherwise a qualified lead opens a new intake.
+    const externalPhone = firm.phoneLines[from] ? to : from;
+    if (getFollowUpWindow(firm, externalPhone)) {
+      const transcript = await fetchCallTranscript(firm, callId);
+      await captureFollowUp(firm, {
+        phone: externalPhone, type: sona ? "sona_call" : "call",
+        direction: isInbound ? "inbound" : "outbound", sourceId: callId,
+        content: summaryText, transcript, quoLink: deepLink,
+        extractText: [transcript, summaryText].filter(Boolean).join("\n\n"),
+      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
+    } else {
+      await runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified })
+        .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
+    }
   } catch (err) {
     console.error(`[${firm.id}][call-summary] Error:`, err.message);
   }
@@ -2365,7 +2567,9 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     intakeConfig: {
       enabled: !!f.intakeConfig?.enabled,
       table: f.intakeConfig?.table || "public.intakes",
+      interactionsTable: f.intakeConfig?.interactionsTable || "public.intake_interactions",
       notifyChannelId: f.intakeConfig?.notifyChannelId || "",
+      followUpHours: f.intakeConfig?.followUpHours || 72,
     },
     source: f.source || "file",
     isDefault: f.id === DEFAULT_FIRM_ID,
@@ -2409,9 +2613,13 @@ function validateFirmBody(body) {
     }
   }
   const ic = (body && body.intakeConfig) || {};
-  if (ic.table && typeof ic.table === "string" && ic.table.trim()
-      && !/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(ic.table.trim())) {
+  const validTable = (t) => /^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(t);
+  if (ic.table && typeof ic.table === "string" && ic.table.trim() && !validTable(ic.table.trim())) {
     return { error: "intakeConfig.table must be a valid table name like public.intakes" };
+  }
+  if (ic.interactionsTable && typeof ic.interactionsTable === "string" && ic.interactionsTable.trim()
+      && !validTable(ic.interactionsTable.trim())) {
+    return { error: "intakeConfig.interactionsTable must be a valid table name" };
   }
   return {
     config: {
@@ -2427,7 +2635,9 @@ function validateFirmBody(body) {
       intakeConfig: {
         enabled: !!ic.enabled,
         table: typeof ic.table === "string" ? ic.table.trim() : "",
+        interactionsTable: typeof ic.interactionsTable === "string" ? ic.interactionsTable.trim() : "",
         notifyChannelId: typeof ic.notifyChannelId === "string" ? ic.notifyChannelId.trim() : "",
+        followUpHours: ic.followUpHours,
       },
     },
   };
@@ -2589,6 +2799,7 @@ async function loadFirmCaches(firm) {
   await loadQuoContacts(firm);
   await loadQuoUsers(firm);
   await loadCaseStatuses(firm);
+  await loadFollowUpWindows(firm);
   console.log(`[${firm.id}][startup] Caches loaded`);
 }
 
