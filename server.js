@@ -966,14 +966,25 @@ async function insertIntake(firm, record) {
 
 // Extract → insert → notify. Best-effort: any failure is logged and swallowed so
 // it never affects normal call routing. Only runs for qualified leads.
-async function runIntake(firm, { callId, deepLink, text, transcript, isQualified }) {
+async function runIntake(firm, { callId, deepLink, summaryText, isQualified }) {
   if (!firm.intakeConfig?.enabled || !isQualified) return;
-  if (!callId || !text) return;
+  if (!callId) return;
   if (!firm.caseDbUrl) {
     console.warn(`[${firm.id}][intake] enabled but no case DB connection (CASE_DB_URL) — skipping`);
     return;
   }
-  const extracted = await extractIntake(firm, text);
+
+  // Extract from the full verbatim transcript (the summary drops detail). If the
+  // transcript isn't available, fall back to the summary so we still capture the basics.
+  const transcript = await fetchCallTranscript(firm, callId);
+  const sourceText = [transcript, summaryText].filter(Boolean).join("\n\n");
+  if (!sourceText) {
+    console.warn(`[${firm.id}][intake] No transcript or summary for ${callId} — skipping`);
+    return;
+  }
+  console.log(`[${firm.id}][intake] Extracting from ${transcript ? "transcript" : "summary only"} for ${callId}`);
+
+  const extracted = await extractIntake(firm, sourceText);
   if (!extracted) {
     console.warn(`[${firm.id}][intake] Nothing extracted for ${callId}`);
     return;
@@ -984,7 +995,7 @@ async function runIntake(firm, { callId, deepLink, text, transcript, isQualified
 
   const { inserted, error } = await insertIntake(firm, {
     callId, name, phone, accidentDate, quoLink: deepLink || null,
-    transcript: transcript || text, data: extracted,
+    transcript: transcript || summaryText, data: extracted,
   });
   if (error) return;
   if (!inserted) {
@@ -1051,6 +1062,40 @@ async function fetchCallFromQuo(firm, callId) {
     return json.data || json;
   } catch (err) {
     console.error(`[${firm.id}][call-check] Error fetching call:`, err.message);
+    return null;
+  }
+}
+
+// Fetch the verbatim call transcript from Quo. The /call-summary webhook only
+// carries the AI summary (lossy), so intake extraction reads this instead.
+// Returns the transcript as speaker-labeled text, or null if unavailable/not ready.
+async function fetchCallTranscript(firm, callId) {
+  if (!firm.quoApiKey || !callId) return null;
+  try {
+    const res = await fetchWithRetry(`https://api.openphone.com/v1/call-transcripts/${callId}`, {
+      headers: { Authorization: firm.quoApiKey },
+    }, { label: `${firm.id}][transcript` });
+    if (!res.ok) {
+      console.warn(`[${firm.id}][transcript] Quo API responded ${res.status} for ${callId}`);
+      return null;
+    }
+    const json = await res.json();
+    const data = json.data || json;
+    const dialogue = data.dialogue || data.segments || [];
+    if (!Array.isArray(dialogue) || dialogue.length === 0) {
+      console.warn(`[${firm.id}][transcript] No transcript dialogue for ${callId} (status: ${data.status || "?"})`);
+      return null;
+    }
+    return dialogue
+      .map((seg) => {
+        const who = seg.identifier || seg.speaker || seg.userId || "";
+        const content = seg.content || seg.text || "";
+        return who ? `${who}: ${content}` : content;
+      })
+      .filter(Boolean)
+      .join("\n");
+  } catch (err) {
+    console.error(`[${firm.id}][transcript] Error fetching transcript:`, err.message);
     return null;
   }
 }
@@ -2031,14 +2076,10 @@ async function handleCallSummary(firm, req, res) {
     await postToCaseChannel(firm, text, from, to);
 
     // Intake extraction (opt-in, qualified leads only). Best-effort — after
-    // routing so it can't affect the Slack posts above. Uses the fullest text
-    // available (summary + transcript if present).
-    const transcript = extractField(payload, "data.object.transcript", "data.transcript", "transcript");
-    const transcriptText = Array.isArray(transcript) ? transcript.join(" ") : (transcript || "");
-    const intakeText = [summaryText, transcriptText].filter(Boolean).join("\n\n");
-    await runIntake(firm, {
-      callId, deepLink, text: intakeText, transcript: transcriptText || summaryText, isQualified,
-    }).catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
+    // routing so it can't affect the Slack posts above. runIntake fetches the
+    // full verbatim transcript from Quo and extracts from that.
+    await runIntake(firm, { callId, deepLink, summaryText, isQualified })
+      .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
   } catch (err) {
     console.error(`[${firm.id}][call-summary] Error:`, err.message);
   }
