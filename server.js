@@ -1027,6 +1027,11 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
   const line = `${name || "Unknown caller"}${phone ? ` (${phone})` : ""} ${detail}`.trim();
   const link = deepLink ? `\n<${deepLink}|View call in Quo>` : "";
   await intakeNotify(firm, `📝 *Intake loaded* for ${line}${link}`);
+
+  // Backfill anything from this caller BEFORE the qualifying call (e.g. a text
+  // sent an hour earlier), then merge it in.
+  await backfillFollowUps(firm, { externalPhone, intakeCallId: callId })
+    .catch((err) => console.error(`[${firm.id}][backfill] Error:`, err.message));
 }
 
 // --- Follow-up window: capture calls/texts/voicemails for N hours after intake ---
@@ -1157,6 +1162,80 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   }
 }
 
+// Backfill: pull messages/calls with this caller from BEFORE the intake call
+// (within the same look-back window) so texts sent ahead of the qualifying call
+// aren't missed. Logs each as an interaction, then does ONE extraction over the
+// combined text and merges it into the intake. Best-effort.
+async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
+  if (!firm.quoApiKey || !externalPhone) return;
+  const hours = firm.intakeConfig?.followUpHours || 72;
+  const sinceMs = Date.now() - hours * 3600 * 1000;
+  const phoneIds = await loadQuoPhoneNumberIds(firm);
+  if (!phoneIds.length) return;
+
+  const items = [];
+  for (const pid of phoneIds) {
+    const [messages, calls] = await Promise.all([
+      fetchQuoHistory(firm, "messages", pid, externalPhone),
+      fetchQuoHistory(firm, "calls", pid, externalPhone),
+    ]);
+    for (const m of messages) {
+      const at = Date.parse(m.createdAt || m.sentAt || 0);
+      if (!Number.isFinite(at) || at < sinceMs) continue;
+      items.push({
+        type: "text", sourceId: m.id, at,
+        direction: m.direction === "outgoing" ? "outbound" : "inbound",
+        content: m.text || m.body || "",
+      });
+    }
+    for (const c of calls) {
+      if (c.id === intakeCallId) continue; // the qualifying call itself
+      const at = Date.parse(c.createdAt || c.answeredAt || 0);
+      if (!Number.isFinite(at) || at < sinceMs) continue;
+      items.push({
+        type: "call", sourceId: c.id, at,
+        direction: c.direction === "outgoing" ? "outbound" : "inbound",
+        content: "", needsTranscript: true,
+      });
+    }
+  }
+  if (!items.length) return;
+
+  // Oldest first; cap transcript fetches to keep this bounded.
+  items.sort((a, b) => a.at - b.at);
+  let transcriptBudget = 5;
+  const texts = [];
+  let logged = 0;
+
+  for (const it of items) {
+    let transcript = null;
+    if (it.needsTranscript && transcriptBudget > 0) {
+      transcript = await fetchCallTranscript(firm, it.sourceId);
+      transcriptBudget--;
+    }
+    const { inserted } = await insertInteraction(firm, {
+      intakeCallId, phone: phoneKey(externalPhone), type: it.type,
+      direction: it.direction, sourceId: it.sourceId,
+      content: it.content || null, transcript, quoLink: null,
+    });
+    if (!inserted) continue; // already captured live
+    logged++;
+    const t = (transcript || it.content || "").trim();
+    if (t) texts.push(t);
+  }
+  if (!logged) return;
+  console.log(`[${firm.id}][backfill] Logged ${logged} prior interaction(s) for intake ${intakeCallId}`);
+
+  if (!texts.length) return;
+  const extracted = await extractIntake(firm, texts.join("\n\n"));
+  if (!extracted) return;
+  const added = await mergeIntoIntake(firm, intakeCallId, extracted);
+  if (added > 0) {
+    console.log(`[${firm.id}][backfill] Merged ${added} field(s) from prior messages into ${intakeCallId}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${logged} earlier message${logged === 1 ? "" : "s"} — filled ${added} field${added === 1 ? "" : "s"}`);
+  }
+}
+
 // On startup, rehydrate follow-up windows from recent intakes so a redeploy
 // doesn't drop active windows.
 async function loadFollowUpWindows(firm) {
@@ -1265,6 +1344,54 @@ async function fetchCallTranscript(firm, callId) {
   } catch (err) {
     console.error(`[${firm.id}][transcript] Error fetching transcript:`, err.message);
     return null;
+  }
+}
+
+// --- Quo history (used to backfill interactions from BEFORE the intake call) ---
+
+// Quo's /v1/messages and /v1/calls require the firm's own phoneNumberId, not the
+// E.164 number — fetch and cache the account's phone number IDs.
+async function loadQuoPhoneNumberIds(firm) {
+  if (!firm.quoApiKey) return [];
+  if (firm.quoPhoneNumberIds?.length) return firm.quoPhoneNumberIds;
+  try {
+    const res = await fetchWithRetry("https://api.openphone.com/v1/phone-numbers", {
+      headers: { Authorization: firm.quoApiKey },
+    }, { label: `${firm.id}][quo-numbers` });
+    if (!res.ok) {
+      console.warn(`[${firm.id}][quo-numbers] Quo API responded ${res.status}`);
+      return [];
+    }
+    const json = await res.json();
+    const ids = (json.data || []).map((p) => p.id).filter(Boolean);
+    firm.quoPhoneNumberIds = ids;
+    console.log(`[${firm.id}][quo-numbers] Loaded ${ids.length} phone number id(s)`);
+    return ids;
+  } catch (err) {
+    console.error(`[${firm.id}][quo-numbers] Error:`, err.message);
+    return [];
+  }
+}
+
+// List recent messages or calls between one of the firm's lines and `participant`.
+async function fetchQuoHistory(firm, kind, phoneNumberId, participant, maxResults = 25) {
+  try {
+    const url = new URL(`https://api.openphone.com/v1/${kind}`);
+    url.searchParams.set("phoneNumberId", phoneNumberId);
+    url.searchParams.append("participants[]", participant);
+    url.searchParams.set("maxResults", String(maxResults));
+    const res = await fetchWithRetry(url.toString(), {
+      headers: { Authorization: firm.quoApiKey },
+    }, { label: `${firm.id}][backfill` });
+    if (!res.ok) {
+      console.warn(`[${firm.id}][backfill] ${kind} responded ${res.status}`);
+      return [];
+    }
+    const json = await res.json();
+    return json.data || [];
+  } catch (err) {
+    console.error(`[${firm.id}][backfill] Error fetching ${kind}:`, err.message);
+    return [];
   }
 }
 

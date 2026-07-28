@@ -378,6 +378,7 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
         <li>if it has any text (text body, call transcript, voicemail transcription), run through the extractor and <strong>merged into the intake</strong> — filling any fields that were still empty (existing values are never overwritten; lists are unioned).</li>
       </ul>
       <p>You get a brief <code>📝 Intake updated — filled N fields</code> Slack note whenever a follow-up adds something. Windows survive redeploys (rehydrated from recent intakes on startup).</p>
+      <p><strong>It also looks backwards.</strong> Right after the intake is created, the router queries Quo history for messages/calls with that same number from the <em>same</em> look-back window (e.g. a text they sent an hour before the qualifying call), logs them as interactions, and merges their details in too. Items already captured live are skipped via the <code>source_id</code> dedup, so nothing is double-counted.</p>
       <p>Create the interactions table:</p>
       <pre>create table public.intake_interactions (
   id             uuid primary key default gen_random_uuid(),
