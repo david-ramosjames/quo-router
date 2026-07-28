@@ -1066,6 +1066,27 @@ async function extractIntake(firm, text) {
   }
 }
 
+// Which columns actually exist on a table (cached per firm+table). Used so the
+// router degrades gracefully when the shared intake table is missing a column.
+async function tableColumns(firm, client, table) {
+  firm._tableColumnCache = firm._tableColumnCache || new Map();
+  const cached = firm._tableColumnCache.get(table);
+  if (cached) return cached;
+  const [schema, name] = table.includes(".") ? table.split(".") : ["public", table];
+  try {
+    const { rows } = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2`,
+      [schema, name],
+    );
+    const set = new Set(rows.map((r) => r.column_name));
+    if (set.size) firm._tableColumnCache.set(table, set);
+    return set;
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Could not read columns for ${table}:`, err.message);
+    return new Set(); // empty = "unknown", callers fall back to writing everything
+  }
+}
+
 async function insertIntake(firm, record) {
   const table = firm.intakeConfig?.table || "public.intakes";
   // Table name is interpolated (identifiers can't be parameterized) — validate strictly.
@@ -1082,16 +1103,31 @@ async function insertIntake(firm, record) {
   // The Quo caller number is more reliable than the model-extracted one.
   if (record.phone) cols.phone = record.phone;
 
-  const names = Object.keys(cols);
-  const params = names.map((_, i) => `$${i + 1}`);
-  const values = names.map((n) => cols[n]);
-  names.push("data");
-  params.push(`$${names.length}::jsonb`);
-  values.push(JSON.stringify(record.data || {}));
-
   let client;
   try {
     client = await connectCaseDb(firm);
+
+    // Only write columns that actually exist. The intake table is shared with
+    // other apps, so a column we extract may not have been added yet — dropping
+    // the field is far better than failing the whole insert and losing the intake.
+    const existing = await tableColumns(firm, client, table);
+    const dropped = [];
+    for (const name of Object.keys(cols)) {
+      if (existing.size && !existing.has(name)) { dropped.push(name); delete cols[name]; }
+    }
+    if (dropped.length) {
+      console.warn(`[${firm.id}][intake] Table ${table} is missing column(s): ${dropped.join(", ")} — value(s) kept in data JSONB only`);
+    }
+
+    const names = Object.keys(cols);
+    const params = names.map((_, i) => `$${i + 1}`);
+    const values = names.map((n) => cols[n]);
+    if (!existing.size || existing.has("data")) {
+      names.push("data");
+      params.push(`$${names.length}::jsonb`);
+      values.push(JSON.stringify(record.data || {}));
+    }
+
     const res = await client.query(
       `INSERT INTO ${table} (${names.join(", ")}) VALUES (${params.join(", ")})
        ON CONFLICT (call_id) DO NOTHING`,
