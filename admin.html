@@ -352,21 +352,22 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
         <li><strong>Trigger:</strong> qualified leads only — spam/vendor/existing-client calls are skipped.</li>
         <li><strong>Where it writes:</strong> the same case database (<code>CASE_DB_URL</code>). The DB role needs <code>INSERT</code> on the intake table — e.g. <code>GRANT INSERT ON public.intakes TO your_role;</code></li>
         <li><strong>Dedup:</strong> rows are keyed by <code>call_id</code> with <code>ON CONFLICT DO NOTHING</code>, so a call is never recorded (or announced) twice.</li>
-        <li><strong>Fields:</strong> only what the caller actually says is filled in; everything else is left null for staff to complete. The full extraction lands in the <code>data</code> JSONB column.</li>
+        <li><strong>Fields:</strong> only what the caller actually says is filled in; everything else is left null for staff to complete.</li>
+        <li><strong>Shape:</strong> every intake-form field is its own <strong>flat column</strong> (63 of them — referral, accident, client, property damage, employment, other driver, insurance, injury, notes), so the table is directly readable and editable by other apps. The raw extraction is also archived in a <code>data</code> JSONB column for debugging.</li>
       </ul>
-      <p>Recommended table:</p>
+      <p>Base table:</p>
       <pre>create table public.intakes (
   id            uuid primary key default gen_random_uuid(),
   call_id       text unique,
   name          text,
   phone         text,
-  accident_date text,
   quo_link      text,
   transcript    text,
   data          jsonb,
   created_at    timestamptz default now()
 );</pre>
-      <p>All intake-form fields (referral, accident, client, property damage, employment, other driver, insurance, injury, notes) are stored in the <code>data</code> JSONB — the top-level columns are just for quick querying. The raw call <code>transcript</code> is saved too. Already created the table without <code>transcript</code>? Add it with <code>alter table public.intakes add column transcript text;</code></p>
+      <p>Then run the flat-column migration (<code>MIGRATION.sql</code> in the repo) to add all the intake fields, backfill any existing JSONB rows into them, and add name/phone lookup indexes. It's safe to re-run.</p>
+      <p><strong>Editing from another app:</strong> read/write <code>public.intakes</code> keyed by <code>call_id</code>. The router only ever <em>fills empty</em> fields — it never overwrites a value that's already set, so anything staff type is safe from later follow-up calls. Connect server-side with the <code>service_role</code> key (RLS is on; the table holds client PII).</p>
       <p>It's best-effort and runs after normal routing, so an extraction hiccup never affects the Slack call posts.</p>
     </details>
 

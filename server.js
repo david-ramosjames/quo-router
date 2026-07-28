@@ -905,6 +905,128 @@ const INTAKE_TOOL_SCHEMA = {
   required: [],
 };
 
+// Maps the extraction schema onto flat table columns, so the intake row is a
+// normal editable table (readable/writable by other apps) rather than a JSONB blob.
+// `t`: text | bool | list (list is stored comma-joined for easy editing).
+const INTAKE_COLUMNS = [
+  ["how_found", ["referral", "how_found"], "text"],
+  ["map_location", ["referral", "map_location"], "text"],
+
+  ["accident_date", ["accident", "date"], "text"],
+  ["accident_time", ["accident", "time"], "text"],
+  ["representation_date", ["accident", "representation_date"], "text"],
+  ["accident_location", ["accident", "location"], "text"],
+  ["city", ["accident", "city"], "text"],
+  ["county", ["accident", "county"], "text"],
+  ["accident_description", ["accident", "description"], "text"],
+  ["police_department", ["accident", "police_department"], "text"],
+  ["police_report_no", ["accident", "police_report_no"], "text"],
+  ["ticket_issued", ["accident", "ticket_issued"], "bool"],
+  ["ticket_who", ["accident", "ticket_who"], "text"],
+  ["ticket_reason", ["accident", "ticket_reason"], "text"],
+
+  ["name", ["client", "name"], "text"],
+  ["phone", ["client", "phone"], "text"],
+  ["email", ["client", "email"], "text"],
+  ["address", ["client", "address"], "text"],
+  ["dob", ["client", "dob"], "text"],
+  ["sex", ["client", "sex"], "text"],
+  ["dl_number", ["client", "dl_number"], "text"],
+  ["spouse_name", ["client", "spouse_name"], "text"],
+  ["emergency_contact", ["client", "emergency_contact"], "text"],
+  ["passengers", ["client", "passengers"], "list"],
+
+  ["vehicle", ["property_damage", "vehicle"], "text"],
+  ["vehicle_owner", ["property_damage", "owner"], "text"],
+  ["drivable", ["property_damage", "drivable"], "bool"],
+  ["towed", ["property_damage", "towed"], "bool"],
+  ["towed_by", ["property_damage", "towed_by"], "text"],
+  ["vehicle_location", ["property_damage", "vehicle_location"], "text"],
+  ["has_loan", ["property_damage", "has_loan"], "bool"],
+  ["lienholder", ["property_damage", "lienholder"], "text"],
+  ["rental_needed", ["property_damage", "rental_needed"], "bool"],
+  ["body_shop", ["property_damage", "body_shop"], "text"],
+
+  ["employer", ["employment", "employer"], "text"],
+  ["job_description", ["employment", "job_description"], "text"],
+  ["missed_work", ["employment", "missed_work"], "bool"],
+  ["salary_rate", ["employment", "salary_rate"], "text"],
+
+  ["other_driver_name", ["other_driver", "name"], "text"],
+  ["other_driver_sex", ["other_driver", "sex"], "text"],
+  ["other_driver_dob", ["other_driver", "dob"], "text"],
+  ["other_driver_address", ["other_driver", "address"], "text"],
+  ["other_driver_phone", ["other_driver", "phone"], "text"],
+  ["other_driver_dl", ["other_driver", "dl_number"], "text"],
+  ["other_driver_car_owner", ["other_driver", "car_owner"], "text"],
+
+  ["client_insurance", ["insurance", "client_company"], "text"],
+  ["client_policy_no", ["insurance", "client_policy_number"], "text"],
+  ["client_claim_no", ["insurance", "client_claim_number"], "text"],
+  ["third_party_insurance", ["insurance", "third_party_company"], "text"],
+  ["third_party_policy_no", ["insurance", "third_party_policy_number"], "text"],
+  ["third_party_claim_no", ["insurance", "third_party_claim_number"], "text"],
+  ["pip", ["insurance", "pip"], "bool"],
+  ["med_pay", ["insurance", "med_pay"], "bool"],
+  ["um_uim", ["insurance", "um_uim"], "bool"],
+
+  ["ems", ["injury", "ems"], "bool"],
+  ["hospital_bill", ["injury", "hospital_bill"], "bool"],
+  ["hospital", ["injury", "hospital"], "text"],
+  ["treating_doctor", ["injury", "treating_doctor"], "text"],
+  ["injury_types", ["injury", "injury_types"], "list"],
+  ["medicaid", ["injury", "medicaid"], "bool"],
+  ["medicare", ["injury", "medicare"], "bool"],
+  ["health_insurance", ["injury", "health_insurance"], "text"],
+
+  ["notes", ["notes"], "text"],
+];
+
+function coerceColumnValue(raw, type) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (type === "bool") {
+    if (typeof raw === "boolean") return raw;
+    const s = String(raw).toLowerCase().trim();
+    if (["true", "yes", "y", "1"].includes(s)) return true;
+    if (["false", "no", "n", "0"].includes(s)) return false;
+    return null;
+  }
+  if (type === "list") {
+    const arr = Array.isArray(raw) ? raw : [raw];
+    const joined = arr.map((v) => String(v).trim()).filter(Boolean).join(", ");
+    return joined || null;
+  }
+  const s = String(raw).trim();
+  return s || null;
+}
+
+// Turn a nested extraction into { column: value }, dropping nulls.
+function flattenExtraction(extracted) {
+  const out = {};
+  for (const [col, path, type] of INTAKE_COLUMNS) {
+    let cur = extracted;
+    for (const key of path) {
+      if (cur == null) break;
+      cur = cur[key];
+    }
+    const val = coerceColumnValue(cur, type);
+    if (val !== null) out[col] = val;
+  }
+  return out;
+}
+
+// Union two comma-joined lists without duplicates (case-insensitive).
+function mergeListValue(existing, incoming) {
+  const seen = new Map();
+  for (const part of [existing, incoming]) {
+    for (const v of String(part || "").split(",").map((s) => s.trim()).filter(Boolean)) {
+      const k = v.toLowerCase();
+      if (!seen.has(k)) seen.set(k, v);
+    }
+  }
+  return [...seen.values()].join(", ");
+}
+
 async function extractIntake(firm, text) {
   if (!ANTHROPIC_API_KEY) {
     console.warn(`[${firm.id}][intake] ANTHROPIC_API_KEY not set — cannot extract`);
@@ -951,14 +1073,29 @@ async function insertIntake(firm, record) {
     console.error(`[${firm.id}][intake] Invalid intake table name "${table}"`);
     return { inserted: false, error: "invalid table name" };
   }
+  // Flat columns from the extraction, plus the call metadata. `data` keeps the
+  // raw extraction as an archive/debug trail; the columns are the editable truth.
+  const cols = flattenExtraction(record.data || {});
+  cols.call_id = record.callId;
+  cols.quo_link = record.quoLink || null;
+  cols.transcript = record.transcript || null;
+  // The Quo caller number is more reliable than the model-extracted one.
+  if (record.phone) cols.phone = record.phone;
+
+  const names = Object.keys(cols);
+  const params = names.map((_, i) => `$${i + 1}`);
+  const values = names.map((n) => cols[n]);
+  names.push("data");
+  params.push(`$${names.length}::jsonb`);
+  values.push(JSON.stringify(record.data || {}));
+
   let client;
   try {
     client = await connectCaseDb(firm);
     const res = await client.query(
-      `INSERT INTO ${table} (call_id, name, phone, accident_date, quo_link, transcript, data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+      `INSERT INTO ${table} (${names.join(", ")}) VALUES (${params.join(", ")})
        ON CONFLICT (call_id) DO NOTHING`,
-      [record.callId, record.name, record.phone, record.accidentDate, record.quoLink, record.transcript || null, JSON.stringify(record.data || {})],
+      values,
     );
     return { inserted: res.rowCount > 0 };
   } catch (err) {
@@ -1085,24 +1222,52 @@ function deepFillMerge(base, incoming) {
   return { merged: out, added };
 }
 
-// Read the intake row, merge new extraction into its data (fill-empty), write back.
-// Also backfills empty top-level name/accident_date. Returns fields-added count.
+// Merge a new extraction into an existing intake row, FILL-EMPTY only: a column
+// that already has a value (including anything a human typed in another app) is
+// never overwritten. List columns are unioned. Returns the count of fields filled.
 async function mergeIntoIntake(firm, intakeCallId, extracted) {
   const table = firm.intakeConfig?.table || "public.intakes";
   if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) return 0;
+  const incoming = flattenExtraction(extracted);
+  if (!Object.keys(incoming).length) return 0;
+
+  const listCols = new Set(INTAKE_COLUMNS.filter(([, , t]) => t === "list").map(([c]) => c));
   let client;
   try {
     client = await connectCaseDb(firm);
-    const { rows } = await client.query(`SELECT name, accident_date, data FROM ${table} WHERE call_id = $1`, [intakeCallId]);
+    const { rows } = await client.query(`SELECT * FROM ${table} WHERE call_id = $1`, [intakeCallId]);
     if (!rows.length) return 0;
-    const current = rows[0].data || {};
-    const { merged, added } = deepFillMerge(current, extracted);
-    if (added === 0) return 0;
-    const newName = rows[0].name || merged.client?.name || null;
-    const newDate = rows[0].accident_date || merged.accident?.date || null;
+    const current = rows[0];
+
+    const updates = {};
+    let added = 0;
+    for (const [col, val] of Object.entries(incoming)) {
+      if (!(col in current)) continue; // column not present in this table
+      const cur = current[col];
+      if (listCols.has(col)) {
+        const merged = mergeListValue(cur, val);
+        if (merged && merged !== (cur || "")) {
+          updates[col] = merged;
+          added += merged.split(",").length - String(cur || "").split(",").filter((s) => s.trim()).length;
+        }
+      } else if (cur === null || cur === undefined || cur === "") {
+        updates[col] = val;
+        added += 1;
+      }
+    }
+    if (!Object.keys(updates).length) return 0;
+
+    // Keep the raw extraction archive current too (fill-empty, same semantics).
+    const { merged: mergedData } = deepFillMerge(current.data || {}, extracted);
+    updates.data = JSON.stringify(mergedData);
+
+    const names = Object.keys(updates);
+    const sets = names.map((n, i) => (n === "data" ? `${n} = $${i + 1}::jsonb` : `${n} = $${i + 1}`));
+    const values = names.map((n) => updates[n]);
+    values.push(intakeCallId);
     await client.query(
-      `UPDATE ${table} SET data = $1::jsonb, name = $2, accident_date = $3 WHERE call_id = $4`,
-      [JSON.stringify(merged), newName, newDate, intakeCallId],
+      `UPDATE ${table} SET ${sets.join(", ")} WHERE call_id = $${values.length}`,
+      values,
     );
     return added;
   } catch (err) {
