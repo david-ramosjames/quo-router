@@ -489,7 +489,9 @@ function extractText(payload) {
   const parts = [summary, transcript, body].map((v) =>
     Array.isArray(v) ? v.join(" ") : String(v)
   );
-  return parts.join(" ").toLowerCase();
+  // Trim: joining three empty fields yields "  ", which is truthy and would slip
+  // past empty-checks and get sent to the LLM as an empty prompt.
+  return parts.join(" ").toLowerCase().trim();
 }
 
 function lastTenDigits(phone) {
@@ -1173,7 +1175,7 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
   // Extract from the full verbatim transcript (the summary drops detail). If the
   // transcript isn't available, fall back to the summary so we still capture the basics.
   const transcript = await fetchCallTranscript(firm, callId);
-  const sourceText = [transcript, summaryText].filter(Boolean).join("\n\n");
+  const sourceText = [transcript, summaryText].filter(Boolean).join("\n\n").trim();
   if (!sourceText) {
     console.warn(`[${firm.id}][intake] No transcript or summary for ${callId} — skipping`);
     return;
@@ -2298,7 +2300,13 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
   }
 
   const text = extractText(payload);
-  if (!text) return { isLead: false, isQualified: false, label: "No" };
+  if (!text) {
+    // No summary/transcript/body to classify. Log the payload's field names so a
+    // change in Quo's shape is obvious rather than silently degrading.
+    const objKeys = Object.keys(payload?.data?.object || {});
+    console.warn(`[${firm.id}][lead] No text to classify — data.object keys: [${objKeys.join(", ") || "none"}]`);
+    return { isLead: false, isQualified: false, label: "No (No Summary)" };
+  }
 
   if (!ANTHROPIC_API_KEY) {
     console.warn(`[${firm.id}][lead] ANTHROPIC_API_KEY not set — cannot classify`);
