@@ -2630,7 +2630,29 @@ async function handleCallSummary(firm, req, res) {
 
     markCallResolved(firm, callId);
 
-    const cached = callId ? getCachedCall(firm, callId) : null;
+    // from/to normally come from the in-memory cache filled by the /calls
+    // webhook. That misses when /calls isn't configured for this firm, the
+    // process restarted, or the call is older than CACHE_TTL — in which case
+    // both would be "N/A" and the summary would post useless numbers or (with
+    // the phone-line filter on) be dropped entirely. Fall back to the Quo API.
+    let cached = callId ? getCachedCall(firm, callId) : null;
+    if (callId && (!cached?.from || !cached?.to)) {
+      const call = await fetchCallFromQuo(firm, callId);
+      if (call?.from || call?.to) {
+        cached = {
+          ...(cached || {}),
+          from: cached?.from || call.from,
+          to: cached?.to || call.to,
+          direction: cached?.direction || call.direction,
+          answeredBy: cached?.answeredBy || call.answeredBy,
+          userId: cached?.userId || call.userId,
+        };
+        cacheCall(firm, callId, cached);
+        console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API`);
+      } else {
+        console.warn(`[${firm.id}][call-summary] Cache miss for ${callId} and Quo API lookup failed — from/to unknown`);
+      }
+    }
     const from = safe(cached?.from);
     const to = safe(cached?.to);
 
