@@ -135,9 +135,12 @@ function normalizeIntakeConfig(config) {
   const interactionsTable = typeof raw.interactionsTable === "string" && raw.interactionsTable.trim()
     ? raw.interactionsTable.trim() : "public.intake_interactions";
   const notifyChannelId = typeof raw.notifyChannelId === "string" ? raw.notifyChannelId.trim() : "";
+  // Base URL of the intake app (e.g. https://rjl-docket-flow.vercel.app). Slack
+  // notifications link to <appUrl>/intakes/<call_id> instead of the raw Quo call.
+  const appUrl = typeof raw.appUrl === "string" ? raw.appUrl.trim().replace(/\/+$/, "") : "";
   let followUpHours = parseInt(raw.followUpHours, 10);
   if (!Number.isFinite(followUpHours) || followUpHours <= 0) followUpHours = 72;
-  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, followUpHours };
+  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, appUrl, followUpHours };
 }
 
 function makeFirm(firmId, config, storedSecrets = {}) {
@@ -1142,6 +1145,14 @@ async function insertIntake(firm, record) {
   }
 }
 
+// Slack link to the intake's page in the intake app, keyed by the Quo call id
+// (that's the row's call_id). Falls back to empty when no app URL is configured.
+function intakeLink(firm, callId, label = "View intake") {
+  const base = firm.intakeConfig?.appUrl;
+  if (!base || !callId) return "";
+  return `\n<${base}/intakes/${encodeURIComponent(callId)}|${label}>`;
+}
+
 function intakeNotify(firm, msg) {
   const channelId = firm.intakeConfig.notifyChannelId || firm.slackLeadCallsChannelId;
   if (channelId && firm.slackBotToken) return postViaBot(firm, channelId, msg);
@@ -1198,7 +1209,8 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
     ? `— ${extracted.accident.description}`
     : (accidentDate ? `— accident ${accidentDate}` : "");
   const line = `${name || "Unknown caller"}${phone ? ` (${phone})` : ""} ${detail}`.trim();
-  const link = deepLink ? `\n<${deepLink}|View call in Quo>` : "";
+  // Prefer the intake app's page; fall back to the raw Quo call when not configured.
+  const link = intakeLink(firm, callId) || (deepLink ? `\n<${deepLink}|View call in Quo>` : "");
   await intakeNotify(firm, `📝 *Intake loaded* for ${line}${link}`);
 
   // Backfill anything from this caller BEFORE the qualifying call (e.g. a text
@@ -1323,6 +1335,19 @@ async function insertInteraction(firm, rec) {
   let client;
   try {
     client = await connectCaseDb(firm);
+
+    // The interactions table is optional — if it hasn't been created yet, say so
+    // once instead of erroring on every call/text.
+    const existing = await tableColumns(firm, client, table);
+    if (!existing.size) {
+      firm._warnedNoInteractions = firm._warnedNoInteractions || new Set();
+      if (!firm._warnedNoInteractions.has(table)) {
+        firm._warnedNoInteractions.add(table);
+        console.warn(`[${firm.id}][follow-up] Table ${table} does not exist — follow-up interactions will not be logged (see MIGRATION.sql). Intake merging still works.`);
+      }
+      return { inserted: false, missingTable: true };
+    }
+
     const res = await client.query(
       `INSERT INTO ${table} (intake_call_id, phone, type, direction, source_id, content, transcript, quo_link, data)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
@@ -1345,12 +1370,16 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   const window = getFollowUpWindow(firm, phone);
   if (!window || !sourceId) return;
 
-  const { inserted } = await insertInteraction(firm, {
+  const { inserted, missingTable } = await insertInteraction(firm, {
     intakeCallId: window.intakeCallId, phone: phoneKey(phone), type, direction,
     sourceId, content, transcript, quoLink,
   });
-  if (!inserted) return; // already logged (dedup)
-  console.log(`[${firm.id}][follow-up] Logged ${type} for intake ${window.intakeCallId} (${sourceId})`);
+  // Not inserted and the table exists → we already logged this one (dedup), so
+  // don't re-extract. If the table is simply absent, still merge into the intake.
+  if (!inserted && !missingTable) return;
+  if (inserted) {
+    console.log(`[${firm.id}][follow-up] Logged ${type} for intake ${window.intakeCallId} (${sourceId})`);
+  }
 
   const text = extractText && extractText.trim();
   if (!text) return;
@@ -1359,7 +1388,7 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   const added = await mergeIntoIntake(firm, window.intakeCallId, extracted);
   if (added > 0) {
     console.log(`[${firm.id}][follow-up] Merged ${added} field(s) into intake ${window.intakeCallId}`);
-    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${quoLink ? `\n<${quoLink}|View in Quo>` : ""}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, window.intakeCallId)}`);
   }
 }
 
@@ -1433,7 +1462,7 @@ async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
   const added = await mergeIntoIntake(firm, intakeCallId, extracted);
   if (added > 0) {
     console.log(`[${firm.id}][backfill] Merged ${added} field(s) from prior messages into ${intakeCallId}`);
-    await intakeNotify(firm, `📝 *Intake updated* from ${logged} earlier message${logged === 1 ? "" : "s"} — filled ${added} field${added === 1 ? "" : "s"}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${logged} earlier message${logged === 1 ? "" : "s"} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, intakeCallId)}`);
   }
 }
 
@@ -2155,10 +2184,18 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     }
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
-    await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
     const externalPhone = firm.phoneLines[from] ? to : from;
+    const closedClient = isClosedClient(firm, externalPhone);
+    if (closedClient) {
+      // Former client — surface in #lead-calls too; may be a new matter.
+      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+      console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
+    } else {
+      await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+    }
     if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, text, from, to);
+      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + text : text, from, to);
     }
     await postToCaseChannel(firm, text, from, to);
   } else if (isAnswered) {
@@ -2219,6 +2256,16 @@ function isActiveClient(firm, phoneNumber) {
   if (!caseNumber) return false;
   return !isClosedStatus(firm, getCaseStatus(firm, caseNumber));
 }
+
+// A former client: has a case number whose status IS closed/archived. Distinct
+// from "not an active client" (which also covers strangers with no case at all).
+function isClosedClient(firm, phoneNumber) {
+  const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
+  if (!caseNumber) return false;
+  return isClosedStatus(firm, getCaseStatus(firm, caseNumber));
+}
+
+const CLOSED_CLIENT_PREFIX = "🔁 *Closed Client Message*\n";
 
 function isKnownBusiness(firm, phoneNumber) {
   const contactName = getContactName(firm, phoneNumber);
@@ -2361,9 +2408,25 @@ async function handleMessages(firm, req, res) {
     await postToSlack(firm.slackWebhooks.textMessages, text);
     console.log(`[${firm.id}][messages] Sent to text-messages`);
 
-    const threadedInLeads = await threadInLeadChannelIfMatch(firm, text, from, to);
+    const externalPhone = firm.phoneLines[from] ? to : from;
+    // Inbound texts from a FORMER client go to #lead-calls and intake as well —
+    // a closed-case client texting in is often a new matter.
+    const closedClient = !isOutbound && isClosedClient(firm, externalPhone);
 
-    if (!isOutbound && !threadedInLeads && shouldRouteToLegalAssistant(firm, from, to)) {
+    let threadedInLeads = false;
+    if (closedClient) {
+      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+      threadedInLeads = true;
+      console.log(`[${firm.id}][messages] Closed client — ALSO sent to lead-calls`);
+    } else {
+      threadedInLeads = await threadInLeadChannelIfMatch(firm, text, from, to);
+    }
+
+    if (closedClient) {
+      await postToLegalAssistant(firm, CLOSED_CLIENT_PREFIX + text, from, to);
+      console.log(`[${firm.id}][messages] Closed client — ALSO sent to legalassistant-phone`);
+    } else if (!isOutbound && !threadedInLeads && shouldRouteToLegalAssistant(firm, from, to)) {
       await postToLegalAssistant(firm, text, from, to);
       console.log(`[${firm.id}][messages] ALSO sent to legalassistant-phone`);
     }
@@ -2372,7 +2435,6 @@ async function handleMessages(firm, req, res) {
 
     // Follow-up capture: if this number is in an intake follow-up window, log the
     // text and merge any new details into the intake. Best-effort.
-    const externalPhone = firm.phoneLines[from] ? to : from;
     if (getFollowUpWindow(firm, externalPhone)) {
       const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
       await captureFollowUp(firm, {
@@ -2487,11 +2549,19 @@ async function handleCalls(firm, req, res) {
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
 
-    await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
-
     const externalPhone = firm.phoneLines[from] ? to : from;
+    const closedClient = isClosedClient(firm, externalPhone);
+    if (closedClient) {
+      // Former client — post into #lead-calls too (may be a new matter).
+      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+      console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
+    } else {
+      await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+    }
+
     if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, text, from, to);
+      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + text : text, from, to);
       console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone`);
     } else {
       console.log(`[${firm.id}][calls] Skipping legalassistant-phone — existing client`);
@@ -2897,6 +2967,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
       table: f.intakeConfig?.table || "public.intakes",
       interactionsTable: f.intakeConfig?.interactionsTable || "public.intake_interactions",
       notifyChannelId: f.intakeConfig?.notifyChannelId || "",
+      appUrl: f.intakeConfig?.appUrl || "",
       followUpHours: f.intakeConfig?.followUpHours || 72,
     },
     source: f.source || "file",
@@ -2965,6 +3036,7 @@ function validateFirmBody(body) {
         table: typeof ic.table === "string" ? ic.table.trim() : "",
         interactionsTable: typeof ic.interactionsTable === "string" ? ic.interactionsTable.trim() : "",
         notifyChannelId: typeof ic.notifyChannelId === "string" ? ic.notifyChannelId.trim() : "",
+        appUrl: typeof ic.appUrl === "string" ? ic.appUrl.trim() : "",
         followUpHours: ic.followUpHours,
       },
     },
