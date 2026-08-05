@@ -67,6 +67,7 @@ const SECRET_FIELDS = [
   { key: "SLACK_LEAD_CALLS_CHANNEL_ID", label: "#lead-calls channel ID", secret: false },
   { key: "SLACK_LEGAL_ASSISTANT_CHANNEL_ID", label: "#legalassistant-phone channel ID", secret: false },
   { key: "CASE_DB_URL", label: "Case DB connection string (Supabase Postgres, optional)", secret: true },
+  { key: "EMAIL_WEBHOOK_TOKEN", label: "Inbound email webhook token (optional)", secret: true },
 ];
 
 // Resolve a firm's credentials with precedence: FIRM_<ID>_<key> env var wins,
@@ -86,6 +87,7 @@ function resolveFirmSecrets(firmId, storedSecrets) {
     quoApiKey: pick("QUO_API_KEY"),
     slackBotToken: pick("SLACK_BOT_TOKEN"),
     caseDbUrl: pick("CASE_DB_URL"),
+    emailWebhookToken: pick("EMAIL_WEBHOOK_TOKEN"),
     slackWebhooks: {
       textMessages: pick("SLACK_TEXT_MESSAGES_WEBHOOK_URL"),
       missedCalls: pick("SLACK_MISSED_CALLS_WEBHOOK_URL"),
@@ -140,7 +142,10 @@ function normalizeIntakeConfig(config) {
   const appUrl = typeof raw.appUrl === "string" ? raw.appUrl.trim().replace(/\/+$/, "") : "";
   let followUpHours = parseInt(raw.followUpHours, 10);
   if (!Number.isFinite(followUpHours) || followUpHours <= 0) followUpHours = 72;
-  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, appUrl, followUpHours };
+  // What to do with an inbound email we can't tie to an existing intake:
+  // "alert" (default) posts to Slack for a human; "create" opens a new intake.
+  const emailUnmatched = raw.emailUnmatched === "create" ? "create" : "alert";
+  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, appUrl, followUpHours, emailUnmatched };
 }
 
 function makeFirm(firmId, config, storedSecrets = {}) {
@@ -1403,6 +1408,149 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   if (added > 0) {
     console.log(`[${firm.id}][follow-up] Merged ${added} field(s) into intake ${window.intakeCallId}`);
     await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, window.intakeCallId)}`);
+  }
+}
+
+// --- Inbound email → intake ---
+
+// Normalize the many inbound-parse payload shapes (SendGrid, Mailgun, Postmark,
+// CloudMailin) into one flat object.
+function normalizeInboundEmail(body) {
+  const b = body || {};
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = k.split(".").reduce((o, p) => (o == null ? o : o[p]), b);
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return "";
+  };
+  const html = pick("html", "HtmlBody", "body-html", "message.html");
+  const text = pick("text", "plain", "TextBody", "body-plain", "message.plain", "message.text");
+  return {
+    from: pick("from", "From", "sender", "envelope.from", "headers.from"),
+    to: pick("to", "To", "recipient", "envelope.to", "headers.to"),
+    subject: pick("subject", "Subject", "headers.subject"),
+    // Strip tags if only HTML was supplied.
+    text: text || html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+  };
+}
+
+function extractEmailAddress(raw) {
+  const m = String(raw || "").match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  return m ? m[0].toLowerCase() : "";
+}
+
+// Find the intake this email belongs to, most reliable signal first:
+//  1. a Quo call id anywhere in the subject/body/to (plus-addressing, quoted
+//     intake link, or a pasted reference) — unambiguous
+//  2. the sender's address matching intakes.email
+//  3. a phone number in the text matching intakes.phone
+async function matchIntakeForEmail(firm, client, email) {
+  const table = firm.intakeConfig?.table || "public.intakes";
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) return null;
+  const haystack = `${email.to}\n${email.subject}\n${email.text}`;
+
+  const callIds = [...haystack.matchAll(/\bAC[0-9a-f]{24,}\b/gi)].map((m) => m[0]);
+  for (const id of callIds) {
+    const { rows } = await client.query(`SELECT call_id FROM ${table} WHERE call_id = $1`, [id]);
+    if (rows.length) return { callId: rows[0].call_id, via: "call id in email" };
+  }
+
+  const sender = extractEmailAddress(email.from);
+  if (sender) {
+    const { rows } = await client.query(
+      `SELECT call_id FROM ${table} WHERE lower(email) = $1 ORDER BY created_at DESC LIMIT 1`, [sender]);
+    if (rows.length) return { callId: rows[0].call_id, via: `sender email ${sender}` };
+  }
+
+  // Phone numbers in the body, matched on last-10 digits.
+  const digits = [...haystack.matchAll(/\+?1?[\s.(-]*(\d{3})[\s.)-]*(\d{3})[\s.-]*(\d{4})\b/g)]
+    .map((m) => m[1] + m[2] + m[3]);
+  for (const d of [...new Set(digits)]) {
+    const { rows } = await client.query(
+      `SELECT call_id FROM ${table} WHERE right(regexp_replace(phone, '\\D', '', 'g'), 10) = $1
+       ORDER BY created_at DESC LIMIT 1`, [d]);
+    if (rows.length) return { callId: rows[0].call_id, via: `phone ${d} in email` };
+  }
+  return null;
+}
+
+// Ingest one inbound email: match it to an intake, extract, fill-empty merge,
+// log the interaction, notify. Unmatched mail alerts by default rather than
+// creating a duplicate intake (these are replies to existing matters).
+async function handleInboundEmail(firm, req, res) {
+  const cfg = firm.intakeConfig || {};
+  if (!cfg.enabled || !firm.caseDbUrl) {
+    return res.status(503).json({ error: "intake not configured for this firm" });
+  }
+  const provided = req.get("x-webhook-token") || req.query.token || "";
+  if (firm.emailWebhookToken && provided !== firm.emailWebhookToken) {
+    return res.status(401).json({ error: "invalid token" });
+  }
+  res.status(200).json({ received: true });
+
+  try {
+    const email = normalizeInboundEmail(req.body);
+    if (!email.text && !email.subject) {
+      console.warn(`[${firm.id}][email] Empty email payload — keys: [${Object.keys(req.body || {}).join(", ")}]`);
+      return;
+    }
+    const sourceId = `email:${crypto.createHash("sha256")
+      .update(`${email.from}|${email.subject}|${email.text}`).digest("hex").slice(0, 32)}`;
+
+    let client;
+    let match = null;
+    try {
+      client = await connectCaseDb(firm);
+      match = await matchIntakeForEmail(firm, client, email);
+    } finally {
+      if (client) { try { await client.end(); } catch { /* ignore */ } }
+    }
+
+    if (!match) {
+      const who = extractEmailAddress(email.from) || email.from || "unknown sender";
+      if (cfg.emailUnmatched !== "create") {
+        console.warn(`[${firm.id}][email] No matching intake for ${who} — alerting`);
+        await intakeNotify(firm,
+          `📧 *Unmatched intake email* from ${who}\n_${email.subject || "(no subject)"}_\nCouldn't tie it to an existing intake — attach it manually.`);
+        return;
+      }
+      // Opt-in: treat it as a brand-new lead.
+      const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`);
+      if (!extracted) return;
+      const senderEmail = extractEmailAddress(email.from);
+      if (senderEmail) extracted.client = { ...(extracted.client || {}), email: senderEmail };
+      const { inserted } = await insertIntake(firm, {
+        callId: sourceId, phone: extracted.client?.phone || null,
+        quoLink: null, transcript: `From: ${email.from}\nSubject: ${email.subject}\n\n${email.text}`,
+        data: extracted,
+      });
+      if (inserted) {
+        console.log(`[${firm.id}][email] Created new intake from unmatched email (${sourceId})`);
+        await intakeNotify(firm, `📧 *New intake from email* — ${extracted.client?.name || who}${intakeLink(firm, sourceId)}`);
+      }
+      return;
+    }
+
+    console.log(`[${firm.id}][email] Matched intake ${match.callId} via ${match.via}`);
+    const { inserted } = await insertInteraction(firm, {
+      intakeCallId: match.callId, phone: null, type: "email", direction: "inbound",
+      sourceId, content: `Subject: ${email.subject}\n\n${email.text}`.slice(0, 20000),
+      transcript: null, quoLink: null,
+    });
+    // Dedup: already ingested this exact email.
+    if (!inserted && !firm._warnedNoInteractions?.has(cfg.interactionsTable)) return;
+
+    const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`);
+    if (!extracted) return;
+    const added = await mergeIntoIntake(firm, match.callId, extracted);
+    if (added > 0) {
+      console.log(`[${firm.id}][email] Merged ${added} field(s) into intake ${match.callId}`);
+      await intakeNotify(firm,
+        `📧 *Intake updated* from email — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, match.callId)}`);
+    }
+  } catch (err) {
+    console.error(`[${firm.id}][email] Error:`, err.message);
   }
 }
 
@@ -2763,6 +2911,9 @@ function withFirm(handler) {
 }
 
 app.post("/webhooks/quo/:firmId/messages", withFirm(handleMessages));
+// Inbound email (SendGrid/Mailgun/Postmark/CloudMailin inbound-parse → here).
+// Accepts form-encoded posts too, which most parse providers send.
+app.post("/webhooks/email/:firmId", express.urlencoded({ extended: true, limit: "10mb" }), withFirm(handleInboundEmail));
 app.post("/webhooks/quo/:firmId/calls", withFirm(handleCalls));
 app.post("/webhooks/quo/:firmId/call-summary", withFirm(handleCallSummary));
 
