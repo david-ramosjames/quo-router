@@ -1,7 +1,7 @@
 -- Migrate public.intakes to flat, editable columns.
 -- Generated from INTAKE_COLUMNS in server.js. Safe to re-run.
 --
--- Run this once in Supabase after creating the base intakes table:
+-- Base table, if it doesn't exist yet:
 --   create table public.intakes (
 --     id uuid primary key default gen_random_uuid(),
 --     call_id text unique, name text, phone text,
@@ -9,8 +9,11 @@
 --     created_at timestamptz default now()
 --   );
 --   alter table public.intakes enable row level security;
+--
+-- NOTE: `city` is the ACCIDENT city. The client's home address is split into
+--       street_address / address_city / address_state / address_zip / address_country.
 
--- 1) Add one column per intake-form field
+-- 1) One column per intake-form field
 alter table public.intakes add column if not exists how_found text;
 alter table public.intakes add column if not exists map_location text;
 alter table public.intakes add column if not exists accident_date text;
@@ -29,6 +32,11 @@ alter table public.intakes add column if not exists name text;
 alter table public.intakes add column if not exists phone text;
 alter table public.intakes add column if not exists email text;
 alter table public.intakes add column if not exists address text;
+alter table public.intakes add column if not exists street_address text;
+alter table public.intakes add column if not exists address_city text;
+alter table public.intakes add column if not exists address_state text;
+alter table public.intakes add column if not exists address_zip text;
+alter table public.intakes add column if not exists address_country text;
 alter table public.intakes add column if not exists dob text;
 alter table public.intakes add column if not exists sex text;
 alter table public.intakes add column if not exists dl_number text;
@@ -96,6 +104,11 @@ update public.intakes set
   phone = coalesce(phone, nullif(data->'client'->>'phone', '')),
   email = coalesce(email, nullif(data->'client'->>'email', '')),
   address = coalesce(address, nullif(data->'client'->>'address', '')),
+  street_address = coalesce(street_address, nullif(data->'client'->>'street_address', '')),
+  address_city = coalesce(address_city, nullif(data->'client'->>'address_city', '')),
+  address_state = coalesce(address_state, nullif(data->'client'->>'address_state', '')),
+  address_zip = coalesce(address_zip, nullif(data->'client'->>'address_zip', '')),
+  address_country = coalesce(address_country, nullif(data->'client'->>'address_country', '')),
   dob = coalesce(dob, nullif(data->'client'->>'dob', '')),
   sex = coalesce(sex, nullif(data->'client'->>'sex', '')),
   dl_number = coalesce(dl_number, nullif(data->'client'->>'dl_number', '')),
