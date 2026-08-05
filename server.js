@@ -1786,19 +1786,26 @@ async function getSlackPermalink(firm, channelId, messageTs) {
   }
 }
 
-async function postLeadToSlack(firm, text, phoneFrom, phoneTo, { mentionUsersIfThreaded = [] } = {}) {
+// skipThreadSearch: post as a standalone message without hunting for a prior
+// thread (used for closed-client alerts, which never have one — the search
+// would cost two history fetches and a 5s retry for nothing).
+// mentionUsers: always @-mention, even when not threaded.
+async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
+  { mentionUsersIfThreaded = [], skipThreadSearch = false, mentionUsers = [] } = {}) {
   if (firm.slackBotToken && firm.slackLeadCallsChannelId) {
     try {
       const phones = [phoneFrom, phoneTo].filter(Boolean);
       let threadTs = null;
-      for (const phone of phones) {
-        if (firm.phoneLines[phone]) continue;
-        threadTs = await findThreadByPhone(firm, phone);
-        if (threadTs) break;
+      if (!skipThreadSearch) {
+        for (const phone of phones) {
+          if (firm.phoneLines[phone]) continue;
+          threadTs = await findThreadByPhone(firm, phone);
+          if (threadTs) break;
+        }
       }
-      const finalText = threadTs
-        ? insertMentionsAfterTitle(text, mentionUsersIfThreaded)
-        : text;
+      const finalText = mentionUsers.length
+        ? insertMentionsAfterTitle(text, mentionUsers)
+        : (threadTs ? insertMentionsAfterTitle(text, mentionUsersIfThreaded) : text);
       const body = { channel: firm.slackLeadCallsChannelId, text: finalText };
       if (threadTs) {
         body.thread_ts = threadTs;
@@ -2189,7 +2196,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     if (closedClient) {
       // Former client — surface in #lead-calls too; may be a new matter.
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
     } else {
       await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
@@ -2416,7 +2423,7 @@ async function handleMessages(firm, req, res) {
     let threadedInLeads = false;
     if (closedClient) {
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
       threadedInLeads = true;
       console.log(`[${firm.id}][messages] Closed client — ALSO sent to lead-calls`);
     } else {
@@ -2554,7 +2561,7 @@ async function handleCalls(firm, req, res) {
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { mentionUsersIfThreaded: firm.leadThreadTagUsers });
+        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
     } else {
       await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
