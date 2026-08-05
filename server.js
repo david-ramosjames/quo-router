@@ -1546,7 +1546,9 @@ async function fetchCallFromQuo(firm, callId) {
       headers: { Authorization: firm.quoApiKey },
     }, { label: `${firm.id}][call-check` });
     if (!res.ok) {
-      console.error(`[${firm.id}][call-check] Quo API responded ${res.status}`);
+      // Include the id and body — a bare status code isn't diagnosable.
+      const body = await res.text().catch(() => "");
+      console.error(`[${firm.id}][call-check] Quo API responded ${res.status} for callId=${callId}: ${body.slice(0, 300)}`);
       return null;
     }
     const json = await res.json();
@@ -2313,10 +2315,16 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
 
   const text = extractText(payload);
   if (!text) {
-    // No summary/transcript/body to classify. Log the payload's field names so a
-    // change in Quo's shape is obvious rather than silently degrading.
-    const objKeys = Object.keys(payload?.data?.object || {});
-    console.warn(`[${firm.id}][lead] No text to classify — data.object keys: [${objKeys.join(", ") || "none"}]`);
+    // Nothing to classify. Report the summary's shape and Quo's own status so a
+    // benign "no summary generated" is distinguishable from a payload change.
+    const obj = payload?.data?.object || {};
+    const s = obj.summary;
+    const shape = s === undefined ? "absent"
+      : s === null ? "null"
+      : Array.isArray(s) ? `empty array`
+      : typeof s === "string" ? `empty string`
+      : typeof s;
+    console.warn(`[${firm.id}][lead] No text to classify — Quo status="${obj.status || "?"}", summary=${shape}, keys: [${Object.keys(obj).join(", ") || "none"}]`);
     return { isLead: false, isQualified: false, label: "No (No Summary)" };
   }
 
