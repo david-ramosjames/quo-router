@@ -1172,16 +1172,47 @@ function intakeLink(firm, callId, label = "View intake") {
   return `\n<${base}/intakes/${encodeURIComponent(callId)}|${label}>`;
 }
 
-function intakeNotify(firm, msg) {
+// Post an intake notice, threaded under the caller's lead-calls post so
+// everything about one lead stays together.
+//   threadTs — thread under this exact message (used right after we post the
+//              lead, so there's no history search and no race)
+//   phone    — otherwise, find the caller's existing thread by phone number
+async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
   const channelId = firm.intakeConfig.notifyChannelId || firm.slackLeadCallsChannelId;
-  if (channelId && firm.slackBotToken) return postViaBot(firm, channelId, msg);
-  if (firm.slackWebhooks.leadCalls) return postToSlack(firm.slackWebhooks.leadCalls, msg);
-  return Promise.resolve();
+  if (!channelId || !firm.slackBotToken) {
+    if (firm.slackWebhooks.leadCalls) return postToSlack(firm.slackWebhooks.leadCalls, msg);
+    return;
+  }
+
+  let parentTs = threadTs;
+  if (!parentTs && phone && channelId === firm.slackLeadCallsChannelId) {
+    // Only the lead-calls channel has a phone-indexed history helper.
+    const messages = await fetchLeadChannelHistory(firm);
+    parentTs = searchChannelHistoryForPhone(messages, phone);
+  }
+
+  try {
+    const body = { channel: channelId, text: msg };
+    if (parentTs) body.thread_ts = parentTs;
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${firm.slackBotToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.error(`[${firm.id}][intake] Slack error posting notice: ${json.error}`);
+      return;
+    }
+    console.log(`[${firm.id}][intake] Posted notice (threaded: ${!!parentTs})`);
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Error posting notice:`, err.message);
+  }
 }
 
 // Extract → insert → notify, then open a follow-up window on the caller's phone.
 // Best-effort: any failure is logged and swallowed so it never affects routing.
-async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified }) {
+async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null }) {
   if (!firm.intakeConfig?.enabled || !isQualified) return;
   if (!callId) return;
   if (!firm.caseDbUrl) {
@@ -1230,7 +1261,8 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
   const line = `${name || "Unknown caller"}${phone ? ` (${phone})` : ""} ${detail}`.trim();
   // Prefer the intake app's page; fall back to the raw Quo call when not configured.
   const link = intakeLink(firm, callId) || (deepLink ? `\n<${deepLink}|View call in Quo>` : "");
-  await intakeNotify(firm, `📝 *Intake loaded* for ${line}${link}`);
+  await intakeNotify(firm, `📝 *Intake loaded* for ${line}${link}`,
+    { threadTs: leadParentTs, phone: externalPhone });
 
   // Backfill anything from this caller BEFORE the qualifying call (e.g. a text
   // sent an hour earlier), then merge it in.
@@ -1407,7 +1439,8 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   const added = await mergeIntoIntake(firm, window.intakeCallId, extracted);
   if (added > 0) {
     console.log(`[${firm.id}][follow-up] Merged ${added} field(s) into intake ${window.intakeCallId}`);
-    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, window.intakeCallId)}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, window.intakeCallId)}`,
+      { phone });
   }
 }
 
@@ -1452,15 +1485,15 @@ async function matchIntakeForEmail(firm, client, email) {
 
   const callIds = [...haystack.matchAll(/\bAC[0-9a-f]{24,}\b/gi)].map((m) => m[0]);
   for (const id of callIds) {
-    const { rows } = await client.query(`SELECT call_id FROM ${table} WHERE call_id = $1`, [id]);
-    if (rows.length) return { callId: rows[0].call_id, via: "call id in email" };
+    const { rows } = await client.query(`SELECT call_id, phone FROM ${table} WHERE call_id = $1`, [id]);
+    if (rows.length) return { callId: rows[0].call_id, phone: rows[0].phone, via: "call id in email" };
   }
 
   const sender = extractEmailAddress(email.from);
   if (sender) {
     const { rows } = await client.query(
-      `SELECT call_id FROM ${table} WHERE lower(email) = $1 ORDER BY created_at DESC LIMIT 1`, [sender]);
-    if (rows.length) return { callId: rows[0].call_id, via: `sender email ${sender}` };
+      `SELECT call_id, phone FROM ${table} WHERE lower(email) = $1 ORDER BY created_at DESC LIMIT 1`, [sender]);
+    if (rows.length) return { callId: rows[0].call_id, phone: rows[0].phone, via: `sender email ${sender}` };
   }
 
   // Phone numbers in the body, matched on last-10 digits.
@@ -1468,9 +1501,9 @@ async function matchIntakeForEmail(firm, client, email) {
     .map((m) => m[1] + m[2] + m[3]);
   for (const d of [...new Set(digits)]) {
     const { rows } = await client.query(
-      `SELECT call_id FROM ${table} WHERE right(regexp_replace(phone, '\\D', '', 'g'), 10) = $1
+      `SELECT call_id, phone FROM ${table} WHERE right(regexp_replace(phone, '\\D', '', 'g'), 10) = $1
        ORDER BY created_at DESC LIMIT 1`, [d]);
-    if (rows.length) return { callId: rows[0].call_id, via: `phone ${d} in email` };
+    if (rows.length) return { callId: rows[0].call_id, phone: rows[0].phone, via: `phone ${d} in email` };
   }
   return null;
 }
@@ -1547,7 +1580,8 @@ async function handleInboundEmail(firm, req, res) {
     if (added > 0) {
       console.log(`[${firm.id}][email] Merged ${added} field(s) into intake ${match.callId}`);
       await intakeNotify(firm,
-        `📧 *Intake updated* from email — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, match.callId)}`);
+        `📧 *Intake updated* from email — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, match.callId)}`,
+        { phone: match.phone });
     }
   } catch (err) {
     console.error(`[${firm.id}][email] Error:`, err.message);
@@ -1624,7 +1658,8 @@ async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
   const added = await mergeIntoIntake(firm, intakeCallId, extracted);
   if (added > 0) {
     console.log(`[${firm.id}][backfill] Merged ${added} field(s) from prior messages into ${intakeCallId}`);
-    await intakeNotify(firm, `📝 *Intake updated* from ${logged} earlier message${logged === 1 ? "" : "s"} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, intakeCallId)}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${logged} earlier message${logged === 1 ? "" : "s"} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, intakeCallId)}`,
+      { phone: externalPhone });
   }
 }
 
@@ -1994,7 +2029,9 @@ async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
       if (msgTs) {
         const permalink = await getSlackPermalink(firm, firm.slackLeadCallsChannelId, msgTs);
         console.log(`[${firm.id}][lead-calls] Permalink: ${permalink || "null"}`);
-        return permalink;
+        // parentTs is what later messages should thread under: the existing
+        // thread if we replied into one, otherwise this new top-level post.
+        return { permalink, ts: msgTs, parentTs: threadTs || msgTs };
       }
       console.warn(`[${firm.id}][lead-calls] No ts in Slack response — cannot build permalink`);
       return null;
@@ -2826,12 +2863,15 @@ async function handleCallSummary(firm, req, res) {
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
 
     let leadPermalink = null;
+    let leadParentTs = null;   // thread the intake confirmation under the lead post
     if (isLead) {
       const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
       const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
       const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
-      leadPermalink = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
+      const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
+      leadPermalink = leadPost?.permalink || null;
+      leadParentTs = leadPost?.parentTs || null;
       console.log(`[${firm.id}][call-summary] Sent to lead-calls (${leadLabel})`);
     }
 
@@ -2882,7 +2922,7 @@ async function handleCallSummary(firm, req, res) {
         extractText: [transcript, summaryText].filter(Boolean).join("\n\n"),
       }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
     } else {
-      await runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified })
+      await runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs })
         .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
     }
   } catch (err) {
