@@ -278,6 +278,14 @@
       <input id="firm-intake-appurl" name="intakeAppUrl" placeholder="https://rjl-docket-flow.vercel.app">
       <div class="hint">Base URL of the app that displays intakes. Slack notifications link to <code>&lt;url&gt;/intakes/&lt;call_id&gt;</code> instead of the raw Quo call. Leave blank to link to Quo.</div>
 
+      <label for="firm-intake-emailnotify">Slack notices for email updates</label>
+      <select id="firm-intake-emailnotify" name="intakeEmailNotify">
+        <option value="all">All — notify on every email that updates an intake</option>
+        <option value="errors">Errors only — just unmatched emails needing attention</option>
+        <option value="off">Off — never notify</option>
+      </select>
+      <div class="hint">Client email replies can be frequent. "Errors only" keeps intakes updating silently but still flags email the router couldn't tie to an intake.</div>
+
       <label for="firm-intake-followup">Follow-up window (hours)</label>
       <input id="firm-intake-followup" name="intakeFollowUpHours" type="number" min="1" placeholder="72">
       <div class="hint">After the intake, calls/texts/voicemails on the same number for this many hours are logged and their details merged into the intake. Default: <code>72</code>.</div>
@@ -652,6 +660,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.intakeInteractionsTable.value = f.intakeConfig?.interactionsTable || "";
     form.intakeNotifyChannelId.value = f.intakeConfig?.notifyChannelId || "";
     form.intakeAppUrl.value = f.intakeConfig?.appUrl || "";
+    form.intakeEmailNotify.value = f.intakeConfig?.emailNotify || "all";
     form.intakeFollowUpHours.value = f.intakeConfig?.followUpHours || "";
     renderSecretFields(f.secretSources || {});
     $("add-title").textContent = `Edit Firm: ${f.name}`;
@@ -777,6 +786,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
         interactionsTable: form.intakeInteractionsTable.value.trim(),
         notifyChannelId: form.intakeNotifyChannelId.value.trim(),
         appUrl: form.intakeAppUrl.value.trim(),
+        emailNotify: form.intakeEmailNotify.value,
         followUpHours: form.intakeFollowUpHours.value ? parseInt(form.intakeFollowUpHours.value, 10) : undefined,
       },
       secrets: collectSecrets(),

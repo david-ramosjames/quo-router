@@ -145,7 +145,12 @@ function normalizeIntakeConfig(config) {
   // What to do with an inbound email we can't tie to an existing intake:
   // "alert" (default) posts to Slack for a human; "create" opens a new intake.
   const emailUnmatched = raw.emailUnmatched === "create" ? "create" : "alert";
-  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, appUrl, followUpHours, emailUnmatched };
+  // Slack noise control for email-sourced updates:
+  //   all    — notify on every merge/creation (default)
+  //   errors — only when an email can't be matched (needs a human)
+  //   off    — never notify
+  const emailNotify = ["errors", "off"].includes(raw.emailNotify) ? raw.emailNotify : "all";
+  return { enabled: !!raw.enabled, table, interactionsTable, notifyChannelId, appUrl, followUpHours, emailUnmatched, emailNotify };
 }
 
 function makeFirm(firmId, config, storedSecrets = {}) {
@@ -1544,8 +1549,10 @@ async function handleInboundEmail(firm, req, res) {
       const who = extractEmailAddress(email.from) || email.from || "unknown sender";
       if (cfg.emailUnmatched !== "create") {
         console.warn(`[${firm.id}][email] No matching intake for ${who} — alerting`);
-        await intakeNotify(firm,
-          `📧 *Unmatched intake email* from ${who}\n_${email.subject || "(no subject)"}_\nCouldn't tie it to an existing intake — attach it manually.`);
+        if (cfg.emailNotify !== "off") {
+          await intakeNotify(firm,
+            `📧 *Unmatched intake email* from ${who}\n_${email.subject || "(no subject)"}_\nCouldn't tie it to an existing intake — attach it manually.`);
+        }
         return;
       }
       // Opt-in: treat it as a brand-new lead.
@@ -1560,7 +1567,9 @@ async function handleInboundEmail(firm, req, res) {
       });
       if (inserted) {
         console.log(`[${firm.id}][email] Created new intake from unmatched email (${sourceId})`);
-        await intakeNotify(firm, `📧 *New intake from email* — ${extracted.client?.name || who}${intakeLink(firm, sourceId)}`);
+        if (cfg.emailNotify === "all") {
+          await intakeNotify(firm, `📧 *New intake from email* — ${extracted.client?.name || who}${intakeLink(firm, sourceId)}`);
+        }
       }
       return;
     }
@@ -1579,9 +1588,11 @@ async function handleInboundEmail(firm, req, res) {
     const added = await mergeIntoIntake(firm, match.callId, extracted);
     if (added > 0) {
       console.log(`[${firm.id}][email] Merged ${added} field(s) into intake ${match.callId}`);
-      await intakeNotify(firm,
-        `📧 *Intake updated* from email — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, match.callId)}`,
-        { phone: match.phone });
+      if (cfg.emailNotify === "all") {
+        await intakeNotify(firm,
+          `📧 *Intake updated* from email — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, match.callId)}`,
+          { phone: match.phone });
+      }
     }
   } catch (err) {
     console.error(`[${firm.id}][email] Error:`, err.message);
@@ -3216,6 +3227,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
       interactionsTable: f.intakeConfig?.interactionsTable || "public.intake_interactions",
       notifyChannelId: f.intakeConfig?.notifyChannelId || "",
       appUrl: f.intakeConfig?.appUrl || "",
+      emailNotify: f.intakeConfig?.emailNotify || "all",
       followUpHours: f.intakeConfig?.followUpHours || 72,
     },
     source: f.source || "file",
@@ -3285,6 +3297,7 @@ function validateFirmBody(body) {
         interactionsTable: typeof ic.interactionsTable === "string" ? ic.interactionsTable.trim() : "",
         notifyChannelId: typeof ic.notifyChannelId === "string" ? ic.notifyChannelId.trim() : "",
         appUrl: typeof ic.appUrl === "string" ? ic.appUrl.trim() : "",
+        emailNotify: ic.emailNotify,
         followUpHours: ic.followUpHours,
       },
     },
