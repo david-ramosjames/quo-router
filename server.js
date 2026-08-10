@@ -125,7 +125,12 @@ function normalizeCaseStatusConfig(config) {
   let closed = raw.closedValues;
   if (!Array.isArray(closed)) closed = ["archived"];
   closed = closed.map((v) => String(v).toLowerCase().trim()).filter(Boolean);
-  return { query, closedValues: closed.length ? closed : ["archived"] };
+  // How long after a case closes before a message from that former client is
+  // treated as a possible NEW matter (and alerted into #lead-calls). Before
+  // that, they're most likely still following up on the case just closed.
+  let closedGraceDays = parseInt(raw.closedGraceDays, 10);
+  if (!Number.isFinite(closedGraceDays) || closedGraceDays < 0) closedGraceDays = 30;
+  return { query, closedValues: closed.length ? closed : ["archived"], closedGraceDays };
 }
 
 // Intake extraction config. When enabled, qualified-lead call summaries are
@@ -782,7 +787,13 @@ async function loadCaseStatuses(firm) {
       const num = row.case_number ?? row.caseNumber ?? row.number ?? row.id;
       const status = row.status ?? row.state;
       if (num == null || status == null) continue;
-      next.set(String(num).trim(), String(status).toLowerCase().trim());
+      // closed_at is optional — include it in the query to enable the grace period.
+      const rawClosed = row.closed_at ?? row.closedAt ?? null;
+      const closedAt = rawClosed ? Date.parse(rawClosed instanceof Date ? rawClosed.toISOString() : rawClosed) : null;
+      next.set(String(num).trim(), {
+        status: String(status).toLowerCase().trim(),
+        closedAt: Number.isFinite(closedAt) ? closedAt : null,
+      });
     }
     firm.caseStatusCache = next;
     console.log(`[${firm.id}][case-status] Loaded ${next.size} case statuses`);
@@ -794,9 +805,18 @@ async function loadCaseStatuses(firm) {
 }
 
 // Look up a case number's status; null if unknown / not synced.
-function getCaseStatus(firm, caseNumber) {
+function getCaseEntry(firm, caseNumber) {
   if (!caseNumber || !firm.caseStatusCache) return null;
   return firm.caseStatusCache.get(String(caseNumber).trim()) || null;
+}
+
+function getCaseStatus(firm, caseNumber) {
+  return getCaseEntry(firm, caseNumber)?.status || null;
+}
+
+// When the case closed, in epoch ms — null if unknown or not supplied by the query.
+function getCaseClosedAt(firm, caseNumber) {
+  return getCaseEntry(firm, caseNumber)?.closedAt ?? null;
 }
 
 function isClosedStatus(firm, status) {
@@ -2404,7 +2424,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     const externalPhone = firm.phoneLines[from] ? to : from;
-    const closedClient = isClosedClient(firm, externalPhone);
+    const closedClient = shouldAlertClosedClient(firm, externalPhone);
     if (closedClient) {
       // Former client — surface in #lead-calls too; may be a new matter.
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
@@ -2485,6 +2505,23 @@ function isClosedClient(firm, phoneNumber) {
 }
 
 const CLOSED_CLIENT_PREFIX = "🔁 *Closed Client Message*\n";
+
+// Should a message from this former client be alerted into #lead-calls?
+// Only once the case has been closed longer than the grace period — before
+// that they're most likely still following up on the case that just closed.
+// If closed_at is unknown (not selected by the query, or null), we alert
+// rather than silently dropping it.
+function shouldAlertClosedClient(firm, phoneNumber) {
+  if (!isClosedClient(firm, phoneNumber)) return false;
+  const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
+  const closedAt = getCaseClosedAt(firm, caseNumber);
+  if (!closedAt) return true;
+  const days = firm.caseStatusConfig?.closedGraceDays ?? 30;
+  const ageDays = (Date.now() - closedAt) / 86400000;
+  if (ageDays >= days) return true;
+  console.log(`[${firm.id}][closed-client] Case ${caseNumber} closed ${ageDays.toFixed(1)}d ago (< ${days}d) — not alerting lead-calls`);
+  return false;
+}
 
 function isKnownBusiness(firm, phoneNumber) {
   const contactName = getContactName(firm, phoneNumber);
@@ -2642,7 +2679,7 @@ async function handleMessages(firm, req, res) {
     const externalPhone = firm.phoneLines[from] ? to : from;
     // Inbound texts from a FORMER client go to #lead-calls and intake as well —
     // a closed-case client texting in is often a new matter.
-    const closedClient = !isOutbound && isClosedClient(firm, externalPhone);
+    const closedClient = !isOutbound && shouldAlertClosedClient(firm, externalPhone);
 
     let threadedInLeads = false;
     if (closedClient) {
@@ -2781,7 +2818,7 @@ async function handleCalls(firm, req, res) {
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
 
     const externalPhone = firm.phoneLines[from] ? to : from;
-    const closedClient = isClosedClient(firm, externalPhone);
+    const closedClient = shouldAlertClosedClient(firm, externalPhone);
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
@@ -3219,6 +3256,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     caseStatusConfig: {
       query: f.caseStatusConfig?.query || "",
       closedValues: f.caseStatusConfig?.closedValues || ["archived"],
+      closedGraceDays: f.caseStatusConfig?.closedGraceDays ?? 30,
     },
     caseStatusCount: f.caseStatusCache ? f.caseStatusCache.size : 0,
     intakeConfig: {
@@ -3290,6 +3328,7 @@ function validateFirmBody(body) {
       caseStatusConfig: {
         query: typeof csc.query === "string" ? csc.query.trim() : "",
         closedValues: Array.isArray(csc.closedValues) ? csc.closedValues : undefined,
+        closedGraceDays: csc.closedGraceDays,
       },
       intakeConfig: {
         enabled: !!ic.enabled,

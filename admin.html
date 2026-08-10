@@ -257,6 +257,10 @@
       <input id="firm-case-closed" name="caseClosedValues" placeholder="archived">
       <div class="hint">Comma-separated status values that mean the case is closed. Everything else counts as open. Default: <code>archived</code>.</div>
 
+      <label for="firm-case-grace">Closed-client alert delay (days)</label>
+      <input id="firm-case-grace" name="caseClosedGraceDays" type="number" min="0" placeholder="30">
+      <div class="hint">A former client's calls/texts only alert <code>#lead-calls</code> once their case has been closed this long — before that they're probably still following up on the case that just closed. Needs <code>closed_at</code> in the query above. Default: <code>30</code>.</div>
+
       <h3 style="margin-top:24px">Intake Extraction (optional)</h3>
       <div class="hint" style="margin-bottom:8px">
         For <strong>qualified-lead</strong> calls, parse the transcript with Claude into a structured intake row
@@ -655,6 +659,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
     form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
+    form.caseClosedGraceDays.value = f.caseStatusConfig?.closedGraceDays ?? "";
     form.intakeEnabled.checked = !!f.intakeConfig?.enabled;
     form.intakeTable.value = f.intakeConfig?.table || "";
     form.intakeInteractionsTable.value = f.intakeConfig?.interactionsTable || "";
@@ -779,6 +784,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       caseStatusConfig: {
         query: form.caseStatusQuery.value.trim(),
         closedValues: parseTagUsers(form.caseClosedValues.value),
+        closedGraceDays: form.caseClosedGraceDays.value ? parseInt(form.caseClosedGraceDays.value, 10) : undefined,
       },
       intakeConfig: {
         enabled: form.intakeEnabled.checked,
