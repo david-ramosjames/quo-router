@@ -129,7 +129,7 @@ function normalizeCaseStatusConfig(config) {
   // treated as a possible NEW matter (and alerted into #lead-calls). Before
   // that, they're most likely still following up on the case just closed.
   let closedGraceDays = parseInt(raw.closedGraceDays, 10);
-  if (!Number.isFinite(closedGraceDays) || closedGraceDays < 0) closedGraceDays = 30;
+  if (!Number.isFinite(closedGraceDays) || closedGraceDays < 0) closedGraceDays = 21;
   return { query, closedValues: closed.length ? closed : ["archived"], closedGraceDays };
 }
 
@@ -1979,13 +1979,17 @@ async function fetchLeadChannelHistory(firm) {
   }
 }
 
-async function findThreadByPhone(firm, phoneNumber) {
+async function findThreadByPhone(firm, phoneNumber, { retry = true } = {}) {
   if (!firm.slackBotToken || !firm.slackLeadCallsChannelId || !phoneNumber) return null;
   const last10 = lastTenDigits(phoneNumber);
   console.log(`[${firm.id}][lead-thread] Searching for phone ${phoneNumber} (last10: ${last10})`);
   let messages = await fetchLeadChannelHistory(firm);
   let threadTs = searchChannelHistoryForPhone(messages, phoneNumber);
   if (threadTs) return threadTs;
+  if (!retry) {
+    console.log(`[${firm.id}][lead-thread] No thread found for ${phoneNumber} — posting standalone`);
+    return null;
+  }
   console.log(`[${firm.id}][lead-thread] No thread found for ${phoneNumber}, retrying in 5s...`);
   await sleep(5000);
   messages = await fetchLeadChannelHistory(firm);
@@ -2021,7 +2025,7 @@ async function getSlackPermalink(firm, channelId, messageTs) {
 // would cost two history fetches and a 5s retry for nothing).
 // mentionUsers: always @-mention, even when not threaded.
 async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
-  { mentionUsersIfThreaded = [], skipThreadSearch = false, mentionUsers = [] } = {}) {
+  { mentionUsersIfThreaded = [], skipThreadSearch = false, mentionUsers = [], threadRetry = true } = {}) {
   if (firm.slackBotToken && firm.slackLeadCallsChannelId) {
     try {
       const phones = [phoneFrom, phoneTo].filter(Boolean);
@@ -2029,7 +2033,7 @@ async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
       if (!skipThreadSearch) {
         for (const phone of phones) {
           if (firm.phoneLines[phone]) continue;
-          threadTs = await findThreadByPhone(firm, phone);
+          threadTs = await findThreadByPhone(firm, phone, { retry: threadRetry });
           if (threadTs) break;
         }
       }
@@ -2428,7 +2432,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     if (closedClient) {
       // Former client — surface in #lead-calls too; may be a new matter.
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
+        { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
     } else {
       await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
@@ -2516,7 +2520,7 @@ function shouldAlertClosedClient(firm, phoneNumber) {
   const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
   const closedAt = getCaseClosedAt(firm, caseNumber);
   if (!closedAt) return true;
-  const days = firm.caseStatusConfig?.closedGraceDays ?? 30;
+  const days = firm.caseStatusConfig?.closedGraceDays ?? 21;
   const ageDays = (Date.now() - closedAt) / 86400000;
   if (ageDays >= days) return true;
   console.log(`[${firm.id}][closed-client] Case ${caseNumber} closed ${ageDays.toFixed(1)}d ago (< ${days}d) — not alerting lead-calls`);
@@ -2684,7 +2688,7 @@ async function handleMessages(firm, req, res) {
     let threadedInLeads = false;
     if (closedClient) {
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
+        { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       threadedInLeads = true;
       console.log(`[${firm.id}][messages] Closed client — ALSO sent to lead-calls`);
     } else {
@@ -2822,7 +2826,7 @@ async function handleCalls(firm, req, res) {
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
       await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
-        { skipThreadSearch: true, mentionUsers: firm.leadThreadTagUsers });
+        { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
     } else {
       await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
@@ -3256,7 +3260,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     caseStatusConfig: {
       query: f.caseStatusConfig?.query || "",
       closedValues: f.caseStatusConfig?.closedValues || ["archived"],
-      closedGraceDays: f.caseStatusConfig?.closedGraceDays ?? 30,
+      closedGraceDays: f.caseStatusConfig?.closedGraceDays ?? 21,
     },
     caseStatusCount: f.caseStatusCache ? f.caseStatusCache.size : 0,
     intakeConfig: {
