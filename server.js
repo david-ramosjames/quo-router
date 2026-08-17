@@ -531,8 +531,23 @@ function isOwnLine(firm, number) {
 // When a firm has restrictToPhoneLines on, an event is only routed if one of its
 // parties is a configured line. Returns true if the event should be SKIPPED.
 function blockedByPhoneLineFilter(firm, from, to) {
-  if (!firm.restrictToPhoneLines) return false;
-  return !isOwnLine(firm, from) && !isOwnLine(firm, to);
+  const foreign = !isOwnLine(firm, from) && !isOwnLine(firm, to);
+  if (firm.restrictToPhoneLines) return foreign;
+  // Filter off: still flag events where neither party is one of this firm's
+  // lines. With several firms on one Quo account (or webhooks pointed at more
+  // than one firm endpoint), that means another firm's traffic is being routed
+  // into this firm's Slack — turn on "Only route events for the phone lines
+  // above" for this firm.
+  if (foreign && Object.keys(firm.phoneLines || {}).length) {
+    firm._warnedForeign = firm._warnedForeign || new Set();
+    const key = `${from}|${to}`;
+    if (!firm._warnedForeign.has(key)) {
+      firm._warnedForeign.add(key);
+      if (firm._warnedForeign.size > 500) firm._warnedForeign.clear();
+      console.warn(`[${firm.id}] Routing ${from} → ${to}, but neither is a configured phone line for this firm — enable the phone-line filter if this is another firm's traffic`);
+    }
+  }
+  return false;
 }
 
 function insertMentionsAfterTitle(text, userIds) {
@@ -1844,7 +1859,10 @@ async function fetchQuoHistory(firm, kind, phoneNumberId, participant, maxResult
       headers: { Authorization: firm.quoApiKey },
     }, { label: `${firm.id}][backfill` });
     if (!res.ok) {
-      console.warn(`[${firm.id}][backfill] ${kind} responded ${res.status}`);
+      // Log the body — Quo's 400s name the offending param (as the contacts
+      // maxResults cap did), which a bare status code can't tell us.
+      const body = await res.text().catch(() => "");
+      console.warn(`[${firm.id}][backfill] ${kind} responded ${res.status}: ${body.slice(0, 300)}`);
       return [];
     }
     const json = await res.json();
