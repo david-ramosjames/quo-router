@@ -2266,27 +2266,37 @@ async function fetchChannelTopic(firm, channelId) {
   }
 }
 
-function extractMentionsFromTopic(firm, topic) {
+// Channel topics list roles in a fixed order: Attorney | Paralegal | LA.
+// includeLA=false drops the 3rd mention (the legal assistant) so they aren't
+// pinged on posts a human already handled. Topics with only 2 names are
+// unaffected.
+const TOPIC_LA_INDEX = 2;
+
+function extractMentionsFromTopic(firm, topic, { includeLA = true } = {}) {
   if (!topic) return "";
+  const trim = (list) => (includeLA ? list : list.slice(0, TOPIC_LA_INDEX));
+
   const userIdMatches = topic.match(/<@(U[A-Z0-9]+)>/g);
   if (userIdMatches && userIdMatches.length > 0) {
-    console.log(`[${firm.id}][mentions] Found ${userIdMatches.length} user mentions in topic`);
-    return userIdMatches.join(" ") + "\n";
+    const kept = trim(userIdMatches);
+    console.log(`[${firm.id}][mentions] Found ${userIdMatches.length} user mentions in topic, tagging ${kept.length}${includeLA ? "" : " (LA excluded)"}`);
+    return kept.length ? kept.join(" ") + "\n" : "";
   }
   const atMatches = topic.match(/@(\w+)/g);
   if (!atMatches) {
     console.log(`[${firm.id}][mentions] No mentions found in topic: "${topic}"`);
     return "";
   }
-  const mentions = [];
-  for (const atName of atMatches) {
+  // Resolve names first so positions still line up when one fails to resolve.
+  const resolved = atMatches.map((atName) => {
     const name = atName.slice(1).toLowerCase();
     const userId = firm.slackUsers.get(name);
-    if (userId) mentions.push(`<@${userId}>`);
-    else console.log(`[${firm.id}][mentions] Could not resolve "${name}" to a Slack user`);
-  }
+    if (!userId) console.log(`[${firm.id}][mentions] Could not resolve "${name}" to a Slack user`);
+    return userId ? `<@${userId}>` : null;
+  });
+  const mentions = trim(resolved).filter(Boolean);
   if (mentions.length > 0) {
-    console.log(`[${firm.id}][mentions] Resolved ${mentions.length}/${atMatches.length} mentions`);
+    console.log(`[${firm.id}][mentions] Resolved ${mentions.length}/${atMatches.length} mentions${includeLA ? "" : " (LA excluded)"}`);
   }
   return mentions.length > 0 ? mentions.join(" ") + "\n" : "";
 }
@@ -2300,7 +2310,7 @@ function findChannelByCaseNumber(firm, caseNumber) {
   return null;
 }
 
-async function postToCaseChannel(firm, text, phoneFrom, phoneTo, { skipMentions = false } = {}) {
+async function postToCaseChannel(firm, text, phoneFrom, phoneTo, { skipMentions = false, includeLA = true } = {}) {
   if (!firm.slackBotToken) return;
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
@@ -2321,7 +2331,7 @@ async function postToCaseChannel(firm, text, phoneFrom, phoneTo, { skipMentions 
     const joined = await joinChannel(firm, channel.id);
     if (!joined) continue;
     const liveTopic = skipMentions ? null : await fetchChannelTopic(firm, channel.id);
-    const mentions = skipMentions ? "" : extractMentionsFromTopic(firm, liveTopic ?? channel.topic);
+    const mentions = skipMentions ? "" : extractMentionsFromTopic(firm, liveTopic ?? channel.topic, { includeLA });
     // Flag closed/archived cases so the team knows it's a former client.
     const closed = isClosedStatus(firm, getCaseStatus(firm, caseNumber));
     const closedFlag = closed ? "⚠️ *CLOSED CASE — former client*\n" : "";
@@ -2476,7 +2486,9 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       await postToLegalAssistant(firm, text, from, to);
     }
     await threadInLeadChannelIfMatch(firm, text, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
-    await postToCaseChannel(firm, text, from, to);
+    // Sona answered (AI) — LA still needs to follow up. Human-answered was
+    // already handled by a person, so don't ping the LA.
+    await postToCaseChannel(firm, text, from, to, { includeLA: isSona });
   } else {
     console.log(`[${firm.id}][call-check] Call ${callId} has unexpected status "${status}" — skipping`);
   }
@@ -2977,7 +2989,9 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Skipping legalassistant-phone — outbound (to=${to})`);
     }
 
-    await postToCaseChannel(firm, text, from, to);
+    // Tag the LA on Sona calls (AI answered, needs follow-up) but not on
+    // human-answered call summaries.
+    await postToCaseChannel(firm, text, from, to, { includeLA: sona });
 
     // Intake (opt-in). Best-effort, after routing. If this caller is already in
     // a follow-up window, treat the call as a follow-up (log + merge into the
