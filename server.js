@@ -2527,7 +2527,7 @@ function isExistingClient(firm, phoneNumber) {
 function isActiveClient(firm, phoneNumber) {
   const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
   if (!caseNumber) return false;
-  return !isClosedStatus(firm, getCaseStatus(firm, caseNumber));
+  return !isClosedClient(firm, phoneNumber);
 }
 
 // A former client: has a case number whose status IS closed/archived. Distinct
@@ -2535,7 +2535,15 @@ function isActiveClient(firm, phoneNumber) {
 function isClosedClient(firm, phoneNumber) {
   const caseNumber = extractCaseNumber(getContactName(firm, phoneNumber));
   if (!caseNumber) return false;
-  return isClosedStatus(firm, getCaseStatus(firm, caseNumber));
+  const entry = getCaseEntry(firm, caseNumber);
+  if (entry) return isClosedStatus(firm, entry.status);
+  // Has a case number, but the case isn't in the tracker at all — an old matter
+  // that aged out. Treat it as long-closed (no closed_at → past the grace period).
+  // Guarded on a populated cache: with the sync unconfigured or a failed refresh
+  // every case would look "missing" and every client would become a former one.
+  if (!(firm.caseStatusCache?.size > 0)) return false;
+  console.log(`[${firm.id}][closed-client] Case ${caseNumber} not in tracker — treating as long-closed`);
+  return true;
 }
 
 const CLOSED_CLIENT_PREFIX = "🔁 *Closed Client Message*\n";
