@@ -583,21 +583,61 @@ function isSpanish(text) {
   return hasSpecialChars || wordCount >= 2;
 }
 
+// Google's translate_a/single is the undocumented endpoint the Translate widget
+// uses — free, but rate-limited and frequently blocked from datacenter IPs, so
+// it fails intermittently. Fall back to Claude, which we already have a key for.
+async function translateViaGoogle(text) {
+  const url = new URL("https://translate.googleapis.com/translate_a/single");
+  url.searchParams.set("client", "gtx");
+  url.searchParams.set("sl", "es");
+  url.searchParams.set("tl", "en");
+  url.searchParams.set("dt", "t");
+  url.searchParams.set("q", text);
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    console.warn(`[translate] Google responded ${res.status} — falling back to Claude`);
+    return null;
+  }
+  const json = await res.json();
+  const translated = (json[0] || []).map((part) => part[0]).join("");
+  return translated || null;
+}
+
+async function translateViaClaude(text) {
+  if (!ANTHROPIC_API_KEY) return null;
+  const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1000,
+      system: "Translate the user's Spanish text to English. Reply with ONLY the translation — no preamble, quotes, or notes. Keep phone numbers, names and formatting as-is.",
+      messages: [{ role: "user", content: text }],
+    }),
+  }, { label: "translate" });
+  if (!res.ok) {
+    console.error(`[translate] Claude responded ${res.status}`);
+    return null;
+  }
+  const json = await res.json();
+  return (json.content?.[0]?.text || "").trim() || null;
+}
+
 async function translateToEnglish(text) {
   try {
-    const url = new URL("https://translate.googleapis.com/translate_a/single");
-    url.searchParams.set("client", "gtx");
-    url.searchParams.set("sl", "es");
-    url.searchParams.set("tl", "en");
-    url.searchParams.set("dt", "t");
-    url.searchParams.set("q", text);
-    const res = await fetch(url.toString());
-    if (!res.ok) return null;
-    const json = await res.json();
-    const translated = (json[0] || []).map((part) => part[0]).join("");
-    return translated || null;
+    const viaGoogle = await translateViaGoogle(text);
+    if (viaGoogle) return viaGoogle;
   } catch (err) {
-    console.error("[translate] Error:", err.message);
+    console.warn("[translate] Google error:", err.message, "— falling back to Claude");
+  }
+  try {
+    return await translateViaClaude(text);
+  } catch (err) {
+    console.error("[translate] Claude error:", err.message);
     return null;
   }
 }
