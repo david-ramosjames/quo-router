@@ -385,8 +385,8 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, intake_config, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, intake_config, callback_bot_id, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, $10, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
