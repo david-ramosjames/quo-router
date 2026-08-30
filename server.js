@@ -165,6 +165,9 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     practiceArea: config.practiceArea || "personal injury",
     phoneLines: config.phoneLines || {},
     leadThreadTagUsers: config.leadThreadTagUsers || [],
+    // Slack app/bot to tag when a client asks for a call back. Accepts an App ID
+    // (A…, resolved to the bot's member id via users.list) or a member id directly.
+    callbackBotId: (config.callbackBotId || "").trim(),
     // When true, only route events where `from` or `to` matches one of the
     // firm's phone lines (allowlist). Off by default so firms route everything.
     restrictToPhoneLines: !!config.restrictToPhoneLines,
@@ -177,6 +180,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     quoUsersCache: new Map(),
     slackChannels: new Map(),
     slackUsers: new Map(),
+    slackBots: new Map(), // app id (A…) and bot name → bot member id (U…)
     callCache: new Map(),
     pendingCallChecks: new Map(),
     resolvedCalls: new Set(),
@@ -297,6 +301,7 @@ async function initFirmStore() {
         lead_thread_tag_users JSONB NOT NULL DEFAULT '[]'::jsonb,
         secrets TEXT,
         restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false,
+        callback_bot_id TEXT,
         case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         intake_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -308,6 +313,7 @@ async function initFirmStore() {
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS restrict_to_phone_lines BOOLEAN NOT NULL DEFAULT false`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS intake_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS callback_bot_id TEXT`);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
@@ -322,6 +328,7 @@ function rowToConfig(row) {
     phoneLines: row.phone_lines || {},
     leadThreadTagUsers: row.lead_thread_tag_users || [],
     restrictToPhoneLines: !!row.restrict_to_phone_lines,
+    callbackBotId: row.callback_bot_id || "",
     caseStatusConfig: row.case_status_config || {},
     intakeConfig: row.intake_config || {},
   };
@@ -349,6 +356,7 @@ async function loadFirmsFromDb() {
           phoneLines: existing.phoneLines,
           leadThreadTagUsers: existing.leadThreadTagUsers,
           restrictToPhoneLines: existing.restrictToPhoneLines,
+          callbackBotId: existing.callbackBotId,
           caseStatusConfig: existing.caseStatusConfig,
           intakeConfig: existing.intakeConfig,
         } : {};
@@ -388,6 +396,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
        restrict_to_phone_lines = EXCLUDED.restrict_to_phone_lines,
        case_status_config = EXCLUDED.case_status_config,
        intake_config = EXCLUDED.intake_config,
+       callback_bot_id = EXCLUDED.callback_bot_id,
        updated_at = now()`,
     [
       id,
@@ -399,6 +408,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       !!config.restrictToPhoneLines,
       JSON.stringify(normalizeCaseStatusConfig(config)),
       JSON.stringify(normalizeIntakeConfig(config)),
+      config.callbackBotId || null,
     ],
   );
   return true;
@@ -1966,7 +1976,18 @@ async function loadSlackUsers(firm) {
         break;
       }
       for (const user of json.members || []) {
-        if (user.deleted || user.is_bot) continue;
+        if (user.deleted) continue;
+        if (user.is_bot) {
+          // Bot users are excluded from slackUsers (they're not staff), but we
+          // index them separately so an app can be @-mentioned. Slack exposes
+          // the owning app on profile.api_app_id, which is how an App ID (A…)
+          // resolves to the member ID (U…) that <@…> actually needs.
+          const appId = user.profile?.api_app_id;
+          if (appId) firm.slackBots.set(appId, user.id);
+          const botName = (user.profile?.display_name || user.real_name || user.name || "").toLowerCase().trim();
+          if (botName) firm.slackBots.set(botName, user.id);
+          continue;
+        }
         const displayName = (user.profile?.display_name || "").toLowerCase().trim();
         const realName = (user.real_name || "").toLowerCase().trim();
         const firstName = (user.profile?.first_name || "").toLowerCase().trim();
@@ -1977,7 +1998,7 @@ async function loadSlackUsers(firm) {
       total += (json.members || []).length;
       cursor = json.response_metadata?.next_cursor || "";
     } while (cursor);
-    console.log(`[${firm.id}][slack] Loaded ${total} users, ${firm.slackUsers.size} name mappings`);
+    console.log(`[${firm.id}][slack] Loaded ${total} users, ${firm.slackUsers.size} name mappings, ${firm.slackBots.size} bot mappings`);
   } catch (err) {
     console.error(`[${firm.id}][slack] Error loading users:`, err.message);
   }
@@ -2612,6 +2633,72 @@ function isKnownBusiness(firm, phoneNumber) {
   return true;
 }
 
+// Resolve the configured callback bot to a Slack mention. Accepts an App ID
+// (A…) — looked up via the bot index built from users.list — or a member id
+// (U…/B…) used as-is. Returns "<@Uxxx>" or null.
+function resolveCallbackBotMention(firm) {
+  const id = firm.callbackBotId;
+  if (!id) return null;
+  if (/^[UB][A-Z0-9]+$/i.test(id)) return `<@${id}>`;
+  const resolved = firm.slackBots.get(id) || firm.slackBots.get(id.toLowerCase());
+  if (resolved) return `<@${resolved}>`;
+  if (!firm._warnedCallbackBot) {
+    firm._warnedCallbackBot = true;
+    console.warn(`[${firm.id}][callback] Could not resolve callback bot "${id}" — is the app installed in this workspace and does the bot token have users:read?`);
+  }
+  return null;
+}
+
+// Did the caller ask for someone to call them back? Deliberately narrow: this
+// fires an automation, so a false positive creates real work. Missed calls are
+// excluded upstream — this only runs on calls a human or Sona actually took.
+async function detectCallbackRequest(firm, text) {
+  if (!ANTHROPIC_API_KEY || !text) return false;
+  try {
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 10,
+        system: `You read summaries/transcripts of phone calls to a law firm and decide ONE thing: does the caller need someone from the firm to CALL THEM BACK?
+
+Answer "yes" only when the call clearly leaves a return call outstanding, e.g.:
+- the caller asks to be called back, or asks for someone specific to call them
+- they were told someone will call them back / follow up by phone
+- they could not reach the person they needed and left a request to be reached
+- the person they needed was unavailable and the call ended unresolved
+
+Answer "no" for everything else, including:
+- the matter was fully handled on the call with nothing left to return
+- the caller only wanted information and got it
+- follow-up is by text, email, or mail rather than a phone call
+- the firm is calling the client (outbound) with nothing requested back
+- sales, vendors, insurers, other firms, spam, wrong numbers
+
+If it is ambiguous or the summary is too thin to tell, answer "no".
+
+Respond with ONLY "yes" or "no".`,
+        messages: [{ role: "user", content: `Call summary / transcript:\n${text}` }],
+      }),
+    }, { label: `${firm.id}][callback` });
+    if (!res.ok) {
+      console.error(`[${firm.id}][callback] Anthropic API error ${res.status}`);
+      return false;
+    }
+    const json = await res.json();
+    const reply = (json.content?.[0]?.text || "").toLowerCase().trim();
+    return reply.startsWith("yes");
+  } catch (err) {
+    console.error(`[${firm.id}][callback] Detection error:`, err.message);
+    return false;
+  }
+}
+
 async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   for (const phone of phones) {
@@ -3037,9 +3124,23 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Skipping legalassistant-phone — outbound (to=${to})`);
     }
 
+    // Callback request: a client (case open OR closed) spoke to someone and is
+    // still owed a return call. Tag the callback app so it can pick it up.
+    // Missed calls never reach here — this is only calls that were answered.
+    let caseText = text;
+    const clientPhone = firm.phoneLines[from] ? to : from;
+    const isClient = !!extractCaseNumber(getContactName(firm, clientPhone));
+    if (isClient && firm.callbackBotId) {
+      const botMention = resolveCallbackBotMention(firm);
+      if (botMention && await detectCallbackRequest(firm, summaryText)) {
+        caseText = `${botMention} request a call back\n${text}`;
+        console.log(`[${firm.id}][callback] Call-back requested for ${clientPhone} — tagged callback app`);
+      }
+    }
+
     // Tag the LA on Sona calls (AI answered, needs follow-up) but not on
     // human-answered call summaries.
-    await postToCaseChannel(firm, text, from, to, { includeLA: sona });
+    await postToCaseChannel(firm, caseText, from, to, { includeLA: sona });
 
     // Intake (opt-in). Best-effort, after routing. If this caller is already in
     // a follow-up window, treat the call as a follow-up (log + merge into the
@@ -3336,6 +3437,8 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     practiceArea: f.practiceArea,
     phoneLines: f.phoneLines,
     leadThreadTagUsers: f.leadThreadTagUsers,
+    callbackBotId: f.callbackBotId || "",
+    callbackBotResolved: !!resolveCallbackBotMention(f),
     restrictToPhoneLines: !!f.restrictToPhoneLines,
     caseStatusConfig: {
       query: f.caseStatusConfig?.query || "",
@@ -3408,6 +3511,7 @@ function validateFirmBody(body) {
       practiceArea: String(practiceArea || "personal injury").trim(),
       phoneLines: phoneLines || {},
       leadThreadTagUsers: leadThreadTagUsers || [],
+      callbackBotId: typeof body?.callbackBotId === "string" ? body.callbackBotId.trim() : "",
       restrictToPhoneLines: !!(body && body.restrictToPhoneLines),
       caseStatusConfig: {
         query: typeof csc.query === "string" ? csc.query.trim() : "",
@@ -3525,6 +3629,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.practiceArea = config.practiceArea;
   firm.phoneLines = config.phoneLines;
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
+  firm.callbackBotId = config.callbackBotId || "";
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.caseStatusConfig = normalizeCaseStatusConfig(config);
   firm.intakeConfig = normalizeIntakeConfig(config);

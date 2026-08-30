@@ -227,6 +227,10 @@
 +15551234568=Outbound"></textarea>
       <div class="hint">One per line: <code>+1XXXXXXXXXX=Line Name</code>. Use full E.164 format with the <code>+1</code> country code. These are the firm's own Quo numbers.</div>
 
+      <label for="firm-callback-bot">Call-back request app</label>
+      <input id="firm-callback-bot" name="callbackBotId" placeholder="A0B59C0C01X">
+      <div class="hint">Slack <strong>App ID</strong> (starts with <code>A</code>) or bot member ID. When a client who has a case — open or closed — speaks to someone and is still owed a return call, the case-channel post is prefixed with <code>@app request a call back</code>. Leave blank to disable.</div>
+
       <label class="checkbox-row">
         <input type="checkbox" id="firm-restrict" name="restrictToPhoneLines">
         <span>Only route events for the phone lines above</span>
@@ -618,7 +622,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
               <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
             </div>
           </div>
-          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}${f.intakeConfig?.enabled ? ' · <span class="src-tag stored">intake extraction ON</span>' : ""}</div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}${f.intakeConfig?.enabled ? ' · <span class="src-tag stored">intake extraction ON</span>' : ""}${f.callbackBotId ? ` · <span class="src-tag ${f.callbackBotResolved ? "stored" : "none"}">call-back app ${f.callbackBotResolved ? "OK" : "UNRESOLVED"}</span>` : ""}</div>
           <details>
             <summary>Webhook URLs to configure in Quo</summary>
             <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
@@ -656,6 +660,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.phoneLines.value = Object.entries(f.phoneLines || {})
       .map(([n, name]) => `${n}=${name}`).join("\n");
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
+    form.callbackBotId.value = f.callbackBotId || "";
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
     form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
@@ -780,6 +785,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       practiceArea: form.practiceArea.value.trim(),
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
+      callbackBotId: form.callbackBotId.value.trim(),
       restrictToPhoneLines: form.restrictToPhoneLines.checked,
       caseStatusConfig: {
         query: form.caseStatusQuery.value.trim(),
