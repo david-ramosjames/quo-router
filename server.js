@@ -186,6 +186,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     resolvedCalls: new Set(),
     caseStatusCache: new Map(), // caseNumber(string) -> status(string, lowercased)
     followUpWindows: new Map(), // phoneLast10 -> { intakeCallId, expiresAt }
+    pendingCallbacks: new Map(), // phoneLast10 -> { callId, expiresAt }
   };
 }
 
@@ -2649,6 +2650,42 @@ function resolveCallbackBotMention(firm) {
   return null;
 }
 
+// A reported call-back request stays "outstanding" for this long even if the
+// number never calls again — a safety valve so the map can't grow forever.
+const CALLBACK_PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function hasPendingCallback(firm, phone) {
+  const key = phoneKey(phone);
+  if (!key) return false;
+  const entry = firm.pendingCallbacks.get(key);
+  if (!entry) return false;
+  if (entry.expiresAt <= Date.now()) {
+    firm.pendingCallbacks.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markPendingCallback(firm, phone, callId) {
+  const key = phoneKey(phone);
+  if (!key) return;
+  firm.pendingCallbacks.set(key, { callId, expiresAt: Date.now() + CALLBACK_PENDING_TTL_MS });
+}
+
+// A later call for this number means the client has been spoken to again, so
+// the outstanding request no longer needs reporting. `callId` guards against
+// the call that raised the request clearing itself: /calls and /call-summary
+// both fire for it, in either order.
+function clearPendingCallback(firm, phone, callId) {
+  const key = phoneKey(phone);
+  if (!key) return;
+  const entry = firm.pendingCallbacks.get(key);
+  if (!entry) return;
+  if (callId && entry.callId === callId) return;
+  firm.pendingCallbacks.delete(key);
+  console.log(`[${firm.id}][callback] Later call for ${phone} — outstanding call-back request cleared`);
+}
+
 // Did the caller ask for someone to call them back? Deliberately narrow: this
 // fires an automation, so a false positive creates real work. Missed calls are
 // excluded upstream — this only runs on calls a human or Sona actually took.
@@ -2908,6 +2945,7 @@ async function handleCalls(firm, req, res) {
     if (callId) {
       cacheCall(firm, callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
       console.log(`[${firm.id}][calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"}, forwardedTo: ${forwardedTo || "none"})`);
+      clearPendingCallback(firm, firm.phoneLines[from] ? to : from, callId);
     }
 
     if (eventType === "call.ringing" || status === "ringing") {
@@ -3131,10 +3169,24 @@ async function handleCallSummary(firm, req, res) {
     const clientPhone = firm.phoneLines[from] ? to : from;
     const isClient = !!extractCaseNumber(getContactName(firm, clientPhone));
     if (isClient && firm.callbackBotId) {
+      clearPendingCallback(firm, clientPhone, callId);
       const botMention = resolveCallbackBotMention(firm);
       if (botMention && await detectCallbackRequest(firm, summaryText)) {
         caseText = `${botMention} request a call back\n${text}`;
         console.log(`[${firm.id}][callback] Call-back requested for ${clientPhone} — tagged callback app`);
+        // Also surface it in the missed-calls report — an outstanding return
+        // call is work the same people are working off that list. Sona calls
+        // already report in #sona-calls, so don't list those twice.
+        if (sona) {
+          console.log(`[${firm.id}][callback] Sona call — not adding to missed-calls`);
+        } else if (hasPendingCallback(firm, clientPhone)) {
+          console.log(`[${firm.id}][callback] Request already outstanding for ${clientPhone} — not reposting`);
+        } else {
+          const callbackText = `↩️ *Call Back Requested*\nFrom: ${fromDisplay}\nTo: ${toDisplay}${linkLine}`;
+          await postToSlack(firm.slackWebhooks.missedCalls, callbackText);
+          markPendingCallback(firm, clientPhone, callId);
+          console.log(`[${firm.id}][callback] Sent to missed-calls`);
+        }
       }
     }
 
