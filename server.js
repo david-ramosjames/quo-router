@@ -3175,11 +3175,9 @@ async function handleCallSummary(firm, req, res) {
         caseText = `${botMention} request a call back\n${text}`;
         console.log(`[${firm.id}][callback] Call-back requested for ${clientPhone} — tagged callback app`);
         // Also surface it in the missed-calls report — an outstanding return
-        // call is work the same people are working off that list. Sona calls
-        // already report in #sona-calls, so don't list those twice.
-        if (sona) {
-          console.log(`[${firm.id}][callback] Sona call — not adding to missed-calls`);
-        } else if (hasPendingCallback(firm, clientPhone)) {
+        // call is work the same people are working off that list. Sona-answered
+        // calls count the same; only an already-outstanding request is skipped.
+        if (hasPendingCallback(firm, clientPhone)) {
           console.log(`[${firm.id}][callback] Request already outstanding for ${clientPhone} — not reposting`);
         } else {
           const callbackText = `↩️ *Call Back Requested*\nFrom: ${fromDisplay}\nTo: ${toDisplay}${linkLine}`;
