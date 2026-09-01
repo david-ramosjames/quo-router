@@ -2776,25 +2776,50 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     const systemPrompt = `You classify call summaries for a ${firm.practiceArea} law firm (${firm.name}).
 
 Classify each call into ONE of these categories:
-- "qualified_lead": A NEW potential client seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury case.
-- "lead": A NEW potential client seeking legal help, but for something OUTSIDE ${firm.practiceArea} (family law, divorce, child support, criminal, immigration, etc.) OR a vague legal inquiry.
-- "not_lead": Anything else, including:
-  * Calls about an EXISTING case or existing client (even if the caller mentions injuries, accidents, etc.)
-  * Calls from insurance adjusters / insurance companies (Progressive, USAA, GEICO, State Farm, etc.) about claims, demands, subrogation
-  * Calls from other law firms about case management, mediation, opposing counsel, co-counsel
-  * Calls from medical providers (doctors, clinics, physiotherapy) about appointments, records, payments
-  * Sales calls, marketing, recruiting, vendors
-  * Press / media inquiries
-  * Wrong numbers, spam
-  * Automated phone systems
+- "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury.
+- "lead": someone seeking legal help for something OUTSIDE ${firm.practiceArea} (family law, divorce, child support, criminal, immigration, etc.) OR a vague legal inquiry.
+- "not_lead": anything else.
+
+Signals that this IS a lead — any one of these is enough:
+- The caller describes an accident or injury and wants the firm to look at it
+- They ask for an appointment, consultation, case evaluation, or "to speak with an attorney"
+- Someone calls ON BEHALF OF an injured person — a spouse, parent, child, relative, friend, coworker, or employer. The caller does not have to be the injured party.
+- The summary reports accident details typical of a new intake: a date of accident, how the crash happened, injuries, hospital or medical treatment, a police report, insurance information
+- A FORMER client whose prior matter is closed is calling about a NEW incident
+
+"not_lead" is for:
+- Calls from insurance adjusters / insurance companies (Progressive, USAA, GEICO, State Farm, etc.) about claims, demands, subrogation
+- Calls from other law firms about case management, mediation, opposing counsel, co-counsel
+- Calls from medical providers (doctors, clinics, physiotherapy) about appointments, records, payments
+- Sales calls, marketing, recruiting, vendors
+- Press / media inquiries
+- Wrong numbers, spam, automated phone systems
+- Someone with an OPEN matter at this firm calling about that matter
 
 CRITICAL RULES:
-- If the summary mentions "existing case", "their case", "the case", "client [name]", or references an ongoing matter — it's NOT a new lead
-- If the caller is calling FROM an insurance company or law firm (not as a victim) — it's NOT a lead
-- A new lead is someone calling for the FIRST TIME because they need legal help with their own situation
-- If a caller's situation is explicitly outside ${firm.practiceArea} (e.g., "child support", "divorce") and the intake explicitly declined them, it's still a "lead" (just not qualified)
+- Only treat it as an existing matter when there is real evidence of an existing relationship WITH THIS FIRM: a case number, a named attorney or paralegal here, questions about their settlement / status / lien / disbursement / medical records on a case the firm is already handling, or the summary says they are a current client.
+- Ordinary phrases like "the accident", "her accident", "the injured party", or "the police report" are NOT evidence of an existing case. A first-time caller naturally says "the accident". Do not classify on those words alone.
+- A caller relaying a third party's accident is a lead, not an existing-case call. Two or more names in the summary (caller + injured person) is normal for a new intake.
+- The call being answered by staff, or an appointment being scheduled, does not make it an existing case — that is what intake does with a new lead.
+- Language does not matter. Calls in Spanish or any other language are classified the same way as English.
+- TIE-BREAK: if the summary describes an accident or injury and there is no clear evidence of an existing relationship with this firm and the caller is not an adjuster/law firm/provider/vendor, answer "qualified_lead". A missed lead costs the firm far more than an extra one to review.
 
 Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No explanation.`;
+
+    // Give the model the routing facts it can't infer from the summary: which of
+    // the firm's lines was dialed (a line named "Leads"/"Intake" is a strong
+    // prior) and whether the outside number is already a saved contact. Without
+    // these it guesses at the caller's relationship to the firm from wording.
+    const outside = phones.find((p) => !firm.phoneLines[p]);
+    const lineLabel = firm.phoneLines[phoneTo] || firm.phoneLines[phoneFrom] || null;
+    const contactName = outside ? getContactName(firm, outside) : null;
+    const contextLines = [
+      lineLabel ? `Firm line involved: "${lineLabel}"` : null,
+      contactName
+        ? `The outside number is a saved contact named "${contactName}". A saved contact whose matter is closed may still be a new lead.`
+        : `The outside number is NOT a saved contact — the firm has no record of this caller.`,
+    ].filter(Boolean);
+    const context = contextLines.length ? `Context:\n${contextLines.join("\n")}\n\n` : "";
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -2807,7 +2832,7 @@ Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No exp
         model: "claude-haiku-4-5-20251001",
         max_tokens: 10,
         system: systemPrompt,
-        messages: [{ role: "user", content: `Call summary:\n${text}` }],
+        messages: [{ role: "user", content: `${context}Call summary:\n${text}` }],
       }),
     });
     if (!res.ok) {
