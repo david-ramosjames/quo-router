@@ -2688,9 +2688,11 @@ function clearPendingCallback(firm, phone, callId) {
   console.log(`[${firm.id}][callback] Firm called ${phone} back — outstanding request cleared`);
 }
 
-// Did the caller ask for someone to call them back? Deliberately narrow: this
-// fires an automation, so a false positive creates real work. Missed calls are
-// excluded upstream — this only runs on calls a human or Sona actually took.
+// Does this client need a return call from an attorney or paralegal? This
+// fires an automation that creates a task someone has to work and close, so it
+// is deliberately narrow: routine follow-up actions do not qualify, and only
+// one of four labels triggers it. Missed calls are excluded upstream — this
+// only runs on calls a human or Sona actually took.
 async function detectCallbackRequest(firm, text) {
   if (!ANTHROPIC_API_KEY || !text) return false;
   try {
@@ -2703,25 +2705,32 @@ async function detectCallbackRequest(firm, text) {
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 10,
-        system: `You read summaries/transcripts of phone calls to a law firm and decide ONE thing: does the caller need someone from the firm to CALL THEM BACK?
+        max_tokens: 16,
+        system: `You read summaries/transcripts of calls at a law firm and label each one. The label decides whether an attorney or paralegal gets assigned a task to phone this client back, so the bar is HIGH.
 
-Answer "yes" only when the call clearly leaves a return call outstanding, e.g.:
-- the caller asks to be called back, or asks for someone specific to call them
-- they were told someone will call them back / follow up by phone
-- they could not reach the person they needed and left a request to be reached
-- the person they needed was unavailable and the call ended unresolved
+Reply with exactly one of these labels:
 
-Answer "no" for everything else, including:
-- the matter was fully handled on the call with nothing left to return
-- the caller only wanted information and got it
-- follow-up is by text, email, or mail rather than a phone call
-- the firm is calling the client (outbound) with nothing requested back
-- sales, vendors, insurers, other firms, spam, wrong numbers
+"callback_owed" — the firm owes this client a PHONE CALL from an attorney, paralegal, legal assistant, or case manager. Use this ONLY when at least one is clearly true:
+- the client asked to speak with their attorney, paralegal, or a specific person at the firm
+- the client asked to be called back
+- the client was told an attorney or paralegal would call them
+- the client raised a substantive question or complaint about their case — settlement, treatment authorization, medical bills, liens, case status, a decision they need — that the person on the call could NOT answer and that needs an attorney or paralegal
+- the client says they have been trying to reach someone and no one has called them back
 
-If it is ambiguous or the summary is too thin to tell, answer "no".
+"client_owes" — the outstanding action belongs to the CLIENT, not the firm: send a driver's license, ID, insurance card, photos, records; sign or return a document; call their doctor or adjuster; provide information the firm asked for.
 
-Respond with ONLY "yes" or "no".`,
+"handled" — whoever took the call dealt with it. Includes intake gathering information, giving an update, confirming an appointment, sending a document by text or email, answering the question asked.
+
+"other" — anything else: adjusters, other law firms, medical providers, sales, vendors, spam, wrong numbers, automated systems, or a summary too thin to tell.
+
+RULES:
+- A follow-up action is NOT a callback. "Will send the contract", "needs to send their ID", "will email the records", "someone will look into it" are not phone calls owed.
+- Being told the firm "will follow up" is not enough on its own. There must be a phone call owed BY the firm, from an attorney or paralegal.
+- The firm calling the client (outbound) is usually "handled" or "client_owes" — the firm already made the call. Label it "callback_owed" only if the client asked during that call to speak with someone who was not available.
+- A client who is frustrated or complaining, but whose issue was addressed on the call, is "handled".
+- If you are unsure between two labels, pick the one that is NOT "callback_owed".
+
+Reply with ONLY the label. No explanation.`,
         messages: [{ role: "user", content: `Call summary / transcript:\n${text}` }],
       }),
     }, { label: `${firm.id}][callback` });
@@ -2731,7 +2740,11 @@ Respond with ONLY "yes" or "no".`,
     }
     const json = await res.json();
     const reply = (json.content?.[0]?.text || "").toLowerCase().trim();
-    return reply.startsWith("yes");
+    const owed = reply.includes("callback_owed");
+    // Logged on every call so the labels can be reviewed and the prompt tuned
+    // against real traffic rather than guesses.
+    console.log(`[${firm.id}][callback] Detector label: "${reply}"${owed ? "" : " — no tag"}`);
+    return owed;
   } catch (err) {
     console.error(`[${firm.id}][callback] Detection error:`, err.message);
     return false;
