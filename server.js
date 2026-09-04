@@ -2719,19 +2719,21 @@ Reply with exactly one of these labels:
 
 "client_owes" — the outstanding action belongs to the CLIENT, not the firm: send a driver's license, ID, insurance card, photos, records; sign or return a document; call their doctor or adjuster; provide information the firm asked for.
 
-"handled" — whoever took the call dealt with it. Includes intake gathering information, giving an update, confirming an appointment, sending a document by text or email, answering the question asked.
+"handled" — whoever took the call dealt with it. Includes intake gathering information, giving an update, confirming an appointment, sending a document by text or email, answering the question asked, or the FIRM asking the CLIENT to call back.
 
 "other" — anything else: adjusters, other law firms, medical providers, sales, vendors, spam, wrong numbers, automated systems, or a summary too thin to tell.
 
 RULES:
-- A follow-up action is NOT a callback. "Will send the contract", "needs to send their ID", "will email the records", "someone will look into it" are not phone calls owed.
+- Check WHO owes the call. The firm asking the client to call back — "Roman called and requested a return call", "left a message asking the client to call the office", "we have been trying to reach them" — is the firm chasing the CLIENT. That is "handled", never "callback_owed". "callback_owed" is only for a call the FIRM owes the CLIENT.
+- A follow-up action is NOT a callback. "Will send the contract", "needs to send their ID", "will email the records", "someone will look into it", "will prepare a document to sign" are not phone calls owed.
+- Someone at the firm wanting to renegotiate or discuss something further is not a callback owed unless the client asked to be called about it.
 - Being told the firm "will follow up" is not enough on its own. There must be a phone call owed BY the firm, from an attorney or paralegal.
-- The firm calling the client (outbound) is usually "handled" or "client_owes" — the firm already made the call. Label it "callback_owed" only if the client asked during that call to speak with someone who was not available.
+- These are all calls the CLIENT placed to the firm and someone answered. The client being on the phone already is not itself a reason to call them back — something must still be owed to them.
 - A client who is frustrated or complaining, but whose issue was addressed on the call, is "handled".
 - If you are unsure between two labels, pick the one that is NOT "callback_owed".
 
 Reply with ONLY the label. No explanation.`,
-        messages: [{ role: "user", content: `Call summary / transcript:\n${text}` }],
+        messages: [{ role: "user", content: `This was an INBOUND call: the client dialed the firm and someone at the firm answered.\n\nCall summary / transcript:\n${text}` }],
       }),
     }, { label: `${firm.id}][callback` });
     if (!res.ok) {
@@ -3208,10 +3210,19 @@ async function handleCallSummary(firm, req, res) {
     const clientPhone = firm.phoneLines[from] ? to : from;
     const isClient = !!extractCaseNumber(getContactName(firm, clientPhone));
     if (isClient && firm.callbackBotId) {
+      const outbound = isOwnLine(firm, from);
       // The firm calling the client is the one thing that settles a request.
-      if (isOwnLine(firm, from)) clearPendingCallback(firm, clientPhone, callId);
+      if (outbound) clearPendingCallback(firm, clientPhone, callId);
       const botMention = resolveCallbackBotMention(firm);
-      if (botMention && hasPendingCallback(firm, clientPhone)) {
+      if (botMention && outbound) {
+        // Someone at the firm just spoke to this client by phone, so the firm
+        // does not owe them a call. These summaries read as if it did: "Roman
+        // called and requested a return call" is the firm chasing the CLIENT,
+        // and leftover items ("will prepare a document", "wants to negotiate")
+        // are work in hand, not a call owed. Whoever placed the call is on the
+        // phone with them and can raise a real callback by hand.
+        console.log(`[${firm.id}][callback] Outbound call to ${clientPhone} — the firm placed this call, not a call back owed`);
+      } else if (botMention && hasPendingCallback(firm, clientPhone)) {
         // Still owed the same return call — tagging again would open a second
         // task for one outstanding callback. Skips the detection call too.
         console.log(`[${firm.id}][callback] Request already outstanding for ${clientPhone} — not tagging again`);
