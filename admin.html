@@ -348,7 +348,7 @@ FIRM_SMITHLAW_SLACK_LEAD_CALLS_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_LEAD_CALLS_CHANNEL_ID
 FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
-      <p><code>ANTHROPIC_API_KEY</code> is shared across all firms (used only for lead classification) and stays an env var — there's no per-firm version.</p>
+      <p>The LLM key is shared across all firms and stays an env var — there's no per-firm version. Set <code>OPENAI_API_KEY</code> to use OpenAI, or <code>ANTHROPIC_API_KEY</code> to use Claude; if both are set, OpenAI wins. Override the model with <code>OPENAI_MODEL</code> (default <code>gpt-4o-mini</code>) or <code>ANTHROPIC_MODEL</code>. It powers lead classification, call-back detection, intake extraction, and the translation fallback — all of which quietly switch off if no key is set. The boot log line starting <code>[llm]</code> says which provider is live.</p>
     </details>
 
     <details>
@@ -468,7 +468,7 @@ order by x.occurred_at;</pre>
 
     <details>
       <summary>How is data isolated between firms?</summary>
-      <p>Each firm has its own contacts cache, users cache, Slack channel cache, call cache, pending-call-check timers, and resolved-call set. A rate-limit or bug affecting one firm's cache load does not affect another. Secrets (Quo API key, Slack bot token, webhook URLs) come from env vars named <code>FIRM_&lt;ID&gt;_*</code> and are never shared. The only shared piece is <code>ANTHROPIC_API_KEY</code>.</p>
+      <p>Each firm has its own contacts cache, users cache, Slack channel cache, call cache, pending-call-check timers, and resolved-call set. A rate-limit or bug affecting one firm's cache load does not affect another. Secrets (Quo API key, Slack bot token, webhook URLs) come from env vars named <code>FIRM_&lt;ID&gt;_*</code> and are never shared. The only shared piece is the LLM key (<code>OPENAI_API_KEY</code> or <code>ANTHROPIC_API_KEY</code>).</p>
     </details>
 
     <details>

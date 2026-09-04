@@ -1,26 +1,17 @@
 // Exercises the real classifyLead() prompt out of server.js against a set of
 // labeled calls, so a change to the classifier can be checked before it ships.
 //
-//   ANTHROPIC_API_KEY=sk-ant-... node test-lead-classifier.mjs
+//   OPENAI_API_KEY=sk-... node test-lead-classifier.mjs
 //
 // The deterministic guards ahead of the LLM (existing client / known business)
 // are stubbed per-case, so what this measures is the prompt itself.
 
-import fs from "node:fs";
+import { grab, llmPrelude, requireKey, activeProvider } from "./test-harness.mjs";
 
-const src = fs.readFileSync(new URL("./server.js", import.meta.url), "utf8");
-
-function grab(name) {
-  const re = new RegExp(`^(?:async )?function ${name}\\([\\s\\S]*?\\n\\}`, "m");
-  const m = src.match(re);
-  if (!m) throw new Error(`could not extract ${name} from server.js`);
-  return m[0];
-}
-
-// The real classifier + the real text extraction, with the surrounding helpers
-// stubbed so each case can state its own premises.
+// The real classifier + the real text extraction and provider layer, with the
+// surrounding helpers stubbed so each case can state its own premises.
 const harness = [
-  `const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;`,
+  llmPrelude(),
   `let STUB = {};`,
   `function isActiveClient() { return !!STUB.activeClient; }`,
   `function isKnownBusiness() { return !!STUB.knownBusiness; }`,
@@ -84,10 +75,8 @@ const CASES = [
     summary: "Caller was trying to reach a dentist office and had the wrong number." },
 ];
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("ANTHROPIC_API_KEY is not set — this test calls the real model. Aborting.");
-  process.exit(2);
-}
+requireKey();
+console.log(`Provider: ${activeProvider()}\n`);
 
 let pass = 0;
 const failures = [];

@@ -2,25 +2,14 @@
 // labeled calls, so tuning the "does this client need a call back" bar can be
 // checked before it ships.
 //
-//   ANTHROPIC_API_KEY=sk-ant-... node test-callback-detector.mjs
+//   OPENAI_API_KEY=sk-... node test-callback-detector.mjs
 //
 // Only "callback_owed" tags the app. Everything else must not.
 
-import fs from "node:fs";
-
-const src = fs.readFileSync(new URL("./server.js", import.meta.url), "utf8");
-
-function grab(name) {
-  const re = new RegExp(`^(?:async )?function ${name}\\([\\s\\S]*?\\n\\}`, "m");
-  const m = src.match(re);
-  if (!m) throw new Error(`could not extract ${name} from server.js`);
-  return m[0];
-}
+import { grab, llmPrelude, requireKey, activeProvider } from "./test-harness.mjs";
 
 const harness = [
-  `const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;`,
-  // Retry behavior isn't under test; go straight to fetch.
-  `const fetchWithRetry = (url, opts) => fetch(url, opts);`,
+  llmPrelude(),
   grab("detectCallbackRequest"),
   `export { detectCallbackRequest };`,
 ].join("\n\n");
@@ -80,10 +69,8 @@ const CASES = [
     text: `Client expressed frustration about her treatment and the lack of support from the firm regarding her cast and care. She was told last week to handle her care independently due to the firm's reluctance to cover costs, which she found unfair. She wants someone to explain the firm's position on covering her cast removal.` },
 ];
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("ANTHROPIC_API_KEY is not set — this test calls the real model. Aborting.");
-  process.exit(2);
-}
+requireKey();
+console.log(`Provider: ${activeProvider()}\n`);
 
 let pass = 0;
 const falsePositives = [];

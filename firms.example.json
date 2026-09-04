@@ -14,7 +14,7 @@
       "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL",
       "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_CHANNEL_ID"
     ],
-    "globalEnvVars": ["ANTHROPIC_API_KEY", "DEFAULT_FIRM_ID", "PORT"]
+    "globalEnvVars": ["OPENAI_API_KEY (or ANTHROPIC_API_KEY)", "OPENAI_MODEL (optional)", "DEFAULT_FIRM_ID", "PORT"]
   },
   "examplefirm": {
     "name": "Example Law Firm",

@@ -20,6 +20,12 @@ app.use(express.json());
 // === Globals (shared across firms) ===
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// OpenAI wins when both are set, so switching providers is one env var. Model
+// names are overridable — the defaults are the cheap ones these calls need.
+const LLM_PROVIDER = OPENAI_API_KEY ? "openai" : ANTHROPIC_API_KEY ? "anthropic" : null;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
 const DEFAULT_FIRM_ID = process.env.DEFAULT_FIRM_ID || "ramosjames";
 
 const CACHE_TTL = 10 * 60 * 1000;
@@ -614,8 +620,50 @@ async function translateViaGoogle(text) {
   return translated || null;
 }
 
-async function translateViaClaude(text) {
-  if (!ANTHROPIC_API_KEY) return null;
+// === LLM (provider-agnostic) ===
+//
+// Every model call in this file goes through llmText or llmExtract so the
+// provider is one env var, not a rewrite. Both return null on any failure —
+// callers treat the model as best-effort and must degrade without it.
+
+function llmConfigured() {
+  return !!LLM_PROVIDER;
+}
+
+// OpenAI renamed max_tokens to max_completion_tokens, and models disagree about
+// which they accept: older ones reject the new name, reasoning models reject
+// the old one. Try the new name first and remember what the account's model
+// actually took, so at most one request pays for the discovery.
+let openaiTokenParam = "max_completion_tokens";
+
+async function callOpenAI(body, label) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { maxTokens, ...rest } = body;
+    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${OPENAI_API_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...rest, model: OPENAI_MODEL, [openaiTokenParam]: maxTokens }),
+    }, { label });
+    if (res.ok) return res.json();
+    const errText = await res.text();
+    // Swap the token parameter once and retry; anything else is a real error.
+    const wrongParam = res.status === 400 && errText.includes(openaiTokenParam) && attempt === 0;
+    if (wrongParam) {
+      openaiTokenParam = openaiTokenParam === "max_completion_tokens" ? "max_tokens" : "max_completion_tokens";
+      console.warn(`[${label}] OpenAI rejected the token limit parameter — retrying with ${openaiTokenParam}`);
+      continue;
+    }
+    console.error(`[${label}] OpenAI API error ${res.status}: ${errText.slice(0, 400)}`);
+    return null;
+  }
+  return null;
+}
+
+async function callAnthropic(body, label) {
+  const { maxTokens, system, messages, tools, toolName } = body;
   const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -624,18 +672,83 @@ async function translateViaClaude(text) {
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1000,
-      system: "Translate the user's Spanish text to English. Reply with ONLY the translation — no preamble, quotes, or notes. Keep phone numbers, names and formatting as-is.",
-      messages: [{ role: "user", content: text }],
+      model: ANTHROPIC_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages,
+      ...(tools ? { tools, tool_choice: { type: "tool", name: toolName } } : {}),
     }),
-  }, { label: "translate" });
+  }, { label });
   if (!res.ok) {
-    console.error(`[translate] Claude responded ${res.status}`);
+    console.error(`[${label}] Anthropic API error ${res.status}: ${(await res.text()).slice(0, 400)}`);
     return null;
   }
-  const json = await res.json();
-  return (json.content?.[0]?.text || "").trim() || null;
+  return res.json();
+}
+
+// Plain text completion. Returns the reply, or null.
+async function llmText({ system, user, maxTokens, label }) {
+  if (!llmConfigured()) return null;
+  try {
+    if (LLM_PROVIDER === "openai") {
+      const json = await callOpenAI({
+        maxTokens,
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      }, label);
+      return json?.choices?.[0]?.message?.content?.trim() || null;
+    }
+    const json = await callAnthropic({
+      maxTokens, system, messages: [{ role: "user", content: user }],
+    }, label);
+    return (json?.content?.[0]?.text || "").trim() || null;
+  } catch (err) {
+    console.error(`[${label}] LLM error:`, err.message);
+    return null;
+  }
+}
+
+// Structured extraction against a JSON Schema, via the provider's tool calling
+// with the tool forced. Returns the parsed object, or null.
+async function llmExtract({ system, user, maxTokens, name, description, schema, label }) {
+  if (!llmConfigured()) return null;
+  try {
+    if (LLM_PROVIDER === "openai") {
+      const json = await callOpenAI({
+        maxTokens,
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
+        tools: [{ type: "function", function: { name, description, parameters: schema } }],
+        tool_choice: { type: "function", function: { name } },
+      }, label);
+      const args = json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+      if (!args) return null;
+      try {
+        return JSON.parse(args);
+      } catch {
+        // A truncated response yields unparseable JSON — usually maxTokens.
+        console.error(`[${label}] OpenAI returned unparseable tool arguments (${args.length} chars)`);
+        return null;
+      }
+    }
+    const json = await callAnthropic({
+      maxTokens, system,
+      messages: [{ role: "user", content: user }],
+      tools: [{ name, description, input_schema: schema }],
+      toolName: name,
+    }, label);
+    return (json?.content || []).find((c) => c.type === "tool_use")?.input || null;
+  } catch (err) {
+    console.error(`[${label}] LLM extraction error:`, err.message);
+    return null;
+  }
+}
+
+async function translateViaLLM(text) {
+  return llmText({
+    system: "Translate the user's Spanish text to English. Reply with ONLY the translation — no preamble, quotes, or notes. Keep phone numbers, names and formatting as-is.",
+    user: text,
+    maxTokens: 1000,
+    label: "translate",
+  });
 }
 
 async function translateToEnglish(text) {
@@ -643,12 +756,12 @@ async function translateToEnglish(text) {
     const viaGoogle = await translateViaGoogle(text);
     if (viaGoogle) return viaGoogle;
   } catch (err) {
-    console.warn("[translate] Google error:", err.message, "— falling back to Claude");
+    console.warn("[translate] Google error:", err.message, "— falling back to the LLM");
   }
   try {
-    return await translateViaClaude(text);
+    return await translateViaLLM(text);
   } catch (err) {
-    console.error("[translate] Claude error:", err.message);
+    console.error("[translate] LLM error:", err.message);
     return null;
   }
 }
@@ -1139,44 +1252,21 @@ function mergeListValue(existing, incoming) {
 }
 
 async function extractIntake(firm, text) {
-  if (!ANTHROPIC_API_KEY) {
-    console.warn(`[${firm.id}][intake] ANTHROPIC_API_KEY not set — cannot extract`);
+  if (!llmConfigured()) {
+    console.warn(`[${firm.id}][intake] No LLM API key set — cannot extract`);
     return null;
   }
-  try {
-    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1500,
-        tools: [{
-          name: "save_intake",
-          description: "Save the client intake details extracted from the call.",
-          input_schema: INTAKE_TOOL_SCHEMA,
-        }],
-        tool_choice: { type: "tool", name: "save_intake" },
-        system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call summary/transcript. Only include facts EXPLICITLY stated in the call. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If the call is not an accident intake, return mostly nulls.
+  return llmExtract({
+    label: `${firm.id}][intake`,
+    maxTokens: 1500,
+    name: "save_intake",
+    description: "Save the client intake details extracted from the call.",
+    schema: INTAKE_TOOL_SCHEMA,
+    system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call summary/transcript. Only include facts EXPLICITLY stated in the call. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If the call is not an accident intake, return mostly nulls.
 
 For the client's home address: put the full address as spoken in client.address, AND split what was actually given into street_address / address_city / address_state / address_zip / address_country. Only fill the parts that were stated — if they only said "Austin, Texas", set address_city and address_state and leave street_address, address_zip and address_country null. Do not infer a state from a city, a ZIP from a city, or a country from anything.`,
-        messages: [{ role: "user", content: `Call summary / transcript:\n${text}` }],
-      }),
-    }, { label: `${firm.id}][intake` });
-    if (!res.ok) {
-      console.error(`[${firm.id}][intake] Anthropic API error ${res.status}: ${await res.text()}`);
-      return null;
-    }
-    const json = await res.json();
-    const toolUse = (json.content || []).find((c) => c.type === "tool_use");
-    return toolUse?.input || null;
-  } catch (err) {
-    console.error(`[${firm.id}][intake] Extraction error:`, err.message);
-    return null;
-  }
+    user: `Call summary / transcript:\n${text}`,
+  });
 }
 
 // Which columns actually exist on a table (cached per firm+table). Used so the
@@ -2694,19 +2784,13 @@ function clearPendingCallback(firm, phone, callId) {
 // one of four labels triggers it. Missed calls are excluded upstream — this
 // only runs on calls a human or Sona actually took.
 async function detectCallbackRequest(firm, text) {
-  if (!ANTHROPIC_API_KEY || !text) return false;
+  if (!llmConfigured() || !text) return false;
   try {
-    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 16,
-        system: `You read summaries/transcripts of calls at a law firm and label each one. The label decides whether an attorney or paralegal gets assigned a task to phone this client back, so the bar is HIGH.
+    const reply = (await llmText({
+      label: `${firm.id}][callback`,
+      maxTokens: 16,
+      user: `This was an INBOUND call: the client dialed the firm and someone at the firm answered.\n\nCall summary / transcript:\n${text}`,
+      system: `You read summaries/transcripts of calls at a law firm and label each one. The label decides whether an attorney or paralegal gets assigned a task to phone this client back, so the bar is HIGH.
 
 Reply with exactly one of these labels:
 
@@ -2733,15 +2817,7 @@ RULES:
 - If you are unsure between two labels, pick the one that is NOT "callback_owed".
 
 Reply with ONLY the label. No explanation.`,
-        messages: [{ role: "user", content: `This was an INBOUND call: the client dialed the firm and someone at the firm answered.\n\nCall summary / transcript:\n${text}` }],
-      }),
-    }, { label: `${firm.id}][callback` });
-    if (!res.ok) {
-      console.error(`[${firm.id}][callback] Anthropic API error ${res.status}`);
-      return false;
-    }
-    const json = await res.json();
-    const reply = (json.content?.[0]?.text || "").toLowerCase().trim();
+    }) || "").toLowerCase().trim();
     const owed = reply.includes("callback_owed");
     // Logged on every call so the labels can be reviewed and the prompt tuned
     // against real traffic rather than guesses.
@@ -2784,8 +2860,8 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     return { isLead: false, isQualified: false, label: "No (No Summary)" };
   }
 
-  if (!ANTHROPIC_API_KEY) {
-    console.warn(`[${firm.id}][lead] ANTHROPIC_API_KEY not set — cannot classify`);
+  if (!llmConfigured()) {
+    console.warn(`[${firm.id}][lead] No LLM API key set — cannot classify`);
     return { isLead: false, isQualified: false, label: "No (Unclassified)" };
   }
 
@@ -2838,26 +2914,14 @@ Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No exp
     ].filter(Boolean);
     const context = contextLines.length ? `Context:\n${contextLines.join("\n")}\n\n` : "";
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 10,
-        system: systemPrompt,
-        messages: [{ role: "user", content: `${context}Call summary:\n${text}` }],
-      }),
+    const raw = await llmText({
+      label: `${firm.id}][lead`,
+      maxTokens: 10,
+      system: systemPrompt,
+      user: `${context}Call summary:\n${text}`,
     });
-    if (!res.ok) {
-      console.error(`[${firm.id}][lead] Anthropic API error ${res.status}: ${await res.text()}`);
-      return { isLead: false, isQualified: false, label: "No (API Error)" };
-    }
-    const json = await res.json();
-    const reply = (json.content?.[0]?.text || "").toLowerCase().trim();
+    if (raw === null) return { isLead: false, isQualified: false, label: "No (API Error)" };
+    const reply = raw.toLowerCase().trim();
     console.log(`[${firm.id}][lead] LLM classification: "${reply}"`);
     if (reply.includes("qualified_lead")) return { isLead: true, isQualified: true, label: "🔥 Qualified Lead" };
     if (reply.includes("not_lead")) return { isLead: false, isQualified: false, label: "No" };
@@ -3797,6 +3861,12 @@ async function loadFirmCaches(firm) {
   // 2. Connect to Postgres and load any firms added via the admin UI.
   await initFirmStore();
   await loadFirmsFromDb();
+
+  console.log(
+    LLM_PROVIDER === "openai" ? `[llm] Using OpenAI (${OPENAI_MODEL})`
+    : LLM_PROVIDER === "anthropic" ? `[llm] Using Anthropic (${ANTHROPIC_MODEL}) — set OPENAI_API_KEY to switch to OpenAI`
+    : `[llm] No OPENAI_API_KEY or ANTHROPIC_API_KEY set — lead classification, call-back detection, intake extraction and translation fallback are disabled`,
+  );
 
   // 3. Start listening once all firms are known, so no webhook 404s at boot.
   app.listen(PORT, () => {
