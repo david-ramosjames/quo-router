@@ -174,8 +174,14 @@ create table if not exists public.intake_interactions (
   content        text,
   transcript     text,
   quo_link       text,
+  slack_permalink text,
   data           jsonb,
   occurred_at    timestamptz default now()
 );
 alter table public.intake_interactions enable row level security;
 create index if not exists intake_interactions_intake_idx on public.intake_interactions (intake_call_id);
+
+-- 6) Slack permalinks so Docket Flow can link an intake (and each call) back
+--    to the #lead-calls conversation. Safe to re-run.
+alter table public.intakes add column if not exists slack_permalink text;
+alter table public.intake_interactions add column if not exists slack_permalink text;

@@ -1302,6 +1302,7 @@ async function insertIntake(firm, record) {
   const cols = flattenExtraction(record.data || {});
   cols.call_id = record.callId;
   cols.quo_link = record.quoLink || null;
+  cols.slack_permalink = record.slackPermalink || null;
   cols.transcript = record.transcript || null;
   // The Quo caller number is more reliable than the model-extracted one.
   if (record.phone) cols.phone = record.phone;
@@ -1393,7 +1394,10 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 
 // Extract → insert → notify, then open a follow-up window on the caller's phone.
 // Best-effort: any failure is logged and swallowed so it never affects routing.
-async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null }) {
+async function runIntake(firm, {
+  callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null,
+  slackPermalink = null, callSlackPermalink = null, direction = "inbound", callType = "call",
+}) {
   if (!firm.intakeConfig?.enabled || !isQualified) return;
   if (!callId) return;
   if (!firm.caseDbUrl) {
@@ -1424,7 +1428,7 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
 
   const { inserted, error } = await insertIntake(firm, {
     callId, name, phone, accidentDate, quoLink: deepLink || null,
-    transcript: transcript || summaryText, data: extracted,
+    slackPermalink, transcript: transcript || summaryText, data: extracted,
   });
   if (error) return;
   if (!inserted) {
@@ -1432,6 +1436,15 @@ async function runIntake(firm, { callId, deepLink, summaryText, externalPhone, i
     return;
   }
   console.log(`[${firm.id}][intake] Loaded intake for ${name || "unknown"} (${callId})`);
+
+  // The intake row keeps the qualifying call's transcript for Docket Flow's
+  // "Call Transcript" card. Every call — including this one — is also logged
+  // as an interaction so later calls aren't lost (Quo summary + Slack/Quo links).
+  await insertInteraction(firm, {
+    intakeCallId: callId, phone: phoneKey(externalPhone || phone), type: callType,
+    direction, sourceId: callId, content: summaryText || null, transcript,
+    quoLink: deepLink || null, slackPermalink: callSlackPermalink || slackPermalink,
+  });
 
   // Open the 72h (configurable) follow-up window on this caller's number.
   openFollowUpWindow(firm, externalPhone, callId);
@@ -1580,12 +1593,29 @@ async function insertInteraction(firm, rec) {
       return { inserted: false, missingTable: true };
     }
 
+    const cols = {
+      intake_call_id: rec.intakeCallId,
+      phone: rec.phone,
+      type: rec.type,
+      direction: rec.direction,
+      source_id: rec.sourceId,
+      content: rec.content || null,
+      transcript: rec.transcript || null,
+      quo_link: rec.quoLink || null,
+      slack_permalink: rec.slackPermalink || null,
+    };
+    for (const name of Object.keys(cols)) {
+      if (!existing.has(name)) delete cols[name];
+    }
+    if (existing.has("data")) cols.data = JSON.stringify(rec.data || {});
+
+    const names = Object.keys(cols);
+    const params = names.map((n, i) => (n === "data" ? `$${i + 1}::jsonb` : `$${i + 1}`));
+    const values = names.map((n) => cols[n]);
     const res = await client.query(
-      `INSERT INTO ${table} (intake_call_id, phone, type, direction, source_id, content, transcript, quo_link, data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+      `INSERT INTO ${table} (${names.join(", ")}) VALUES (${params.join(", ")})
        ON CONFLICT (source_id) DO NOTHING`,
-      [rec.intakeCallId, rec.phone, rec.type, rec.direction, rec.sourceId,
-       rec.content || null, rec.transcript || null, rec.quoLink || null, JSON.stringify(rec.data || {})],
+      values,
     );
     return { inserted: res.rowCount > 0 };
   } catch (err) {
@@ -1598,13 +1628,13 @@ async function insertInteraction(firm, rec) {
 
 // Capture a follow-up interaction on a tracked number: log it, then (if it has
 // text) extract and merge new details into the intake. Best-effort.
-async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, extractText }) {
+async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, slackPermalink, extractText }) {
   const window = getFollowUpWindow(firm, phone);
   if (!window || !sourceId) return;
 
   const { inserted, missingTable } = await insertInteraction(firm, {
     intakeCallId: window.intakeCallId, phone: phoneKey(phone), type, direction,
-    sourceId, content, transcript, quoLink,
+    sourceId, content, transcript, quoLink, slackPermalink,
   });
   // Not inserted and the table exists → we already logged this one (dedup), so
   // don't re-extract. If the table is simply absent, still merge into the intake.
@@ -1808,7 +1838,8 @@ async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
       items.push({
         type: "call", sourceId: c.id, at,
         direction: c.direction === "outgoing" ? "outbound" : "inbound",
-        content: "", needsTranscript: true,
+        content: quoCallSummary(c), quoLink: quoCallDeepLink(c),
+        needsTranscript: true,
       });
     }
   }
@@ -1829,7 +1860,7 @@ async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
     const { inserted } = await insertInteraction(firm, {
       intakeCallId, phone: phoneKey(externalPhone), type: it.type,
       direction: it.direction, sourceId: it.sourceId,
-      content: it.content || null, transcript, quoLink: null,
+      content: it.content || null, transcript, quoLink: it.quoLink || null,
     });
     if (!inserted) continue; // already captured live
     logged++;
@@ -2014,6 +2045,20 @@ async function fetchQuoHistory(firm, kind, phoneNumberId, participant, maxResult
   }
 }
 
+function quoCallSummary(call) {
+  const raw = call?.summary;
+  if (Array.isArray(raw)) return raw.filter(Boolean).join(" ");
+  return typeof raw === "string" && raw.trim() ? raw.trim() : "";
+}
+
+function quoCallDeepLink(call) {
+  const pn = call?.phoneNumberId;
+  const conv = call?.conversationId;
+  const id = call?.id;
+  if (pn && conv && id) return `https://my.quo.com/inbox/${pn}/c/${conv}?at=${id}`;
+  return null;
+}
+
 // === Slack API (per-firm) ===
 
 async function loadSlackChannels(firm) {
@@ -2190,6 +2235,16 @@ async function getSlackPermalink(firm, channelId, messageTs) {
   }
 }
 
+// Permalink for the thread root (what Docket Flow should open), falling back
+// to the specific message if this post started the thread or the root lookup fails.
+async function getSlackThreadPermalink(firm, channelId, parentTs, messagePermalink = null, messageTs = null) {
+  if (parentTs && channelId && parentTs !== messageTs) {
+    const root = await getSlackPermalink(firm, channelId, parentTs);
+    if (root) return root;
+  }
+  return messagePermalink || null;
+}
+
 // skipThreadSearch: post as a standalone message without hunting for a prior
 // thread (used for closed-client alerts, which never have one — the search
 // would cost two history fetches and a 5s retry for nothing).
@@ -2251,7 +2306,7 @@ async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
 }
 
 async function threadInLeadChannelIfMatch(firm, text, phoneFrom, phoneTo, { mentionUsers = [] } = {}) {
-  if (!firm.slackBotToken || !firm.slackLeadCallsChannelId) return false;
+  if (!firm.slackBotToken || !firm.slackLeadCallsChannelId) return null;
   const phones = [phoneFrom, phoneTo].filter(Boolean);
   let threadTs = null;
   for (const phone of phones) {
@@ -2260,7 +2315,7 @@ async function threadInLeadChannelIfMatch(firm, text, phoneFrom, phoneTo, { ment
     threadTs = searchChannelHistoryForPhone(messages, phone);
     if (threadTs) break;
   }
-  if (!threadTs) return false;
+  if (!threadTs) return null;
   const finalText = insertMentionsAfterTitle(text, mentionUsers);
   try {
     const res = await fetch("https://slack.com/api/chat.postMessage", {
@@ -2278,13 +2333,15 @@ async function threadInLeadChannelIfMatch(firm, text, phoneFrom, phoneTo, { ment
     const json = await res.json();
     if (json.ok) {
       console.log(`[${firm.id}][lead-thread] Threaded event in lead-calls (ts: ${threadTs})`);
-      return true;
+      const msgTs = json.ts;
+      const permalink = msgTs ? await getSlackPermalink(firm, firm.slackLeadCallsChannelId, msgTs) : null;
+      return { permalink, ts: msgTs, parentTs: threadTs, channelId: firm.slackLeadCallsChannelId };
     }
     console.error(`[${firm.id}][lead-thread] Slack API error: ${json.error}`);
   } catch (err) {
     console.error(`[${firm.id}][lead-thread] Error:`, err.message);
   }
-  return false;
+  return null;
 }
 
 async function fetchLegalAssistantHistory(firm) {
@@ -2993,14 +3050,18 @@ async function handleMessages(firm, req, res) {
     // a closed-case client texting in is often a new matter.
     const closedClient = !isOutbound && shouldAlertClosedClient(firm, externalPhone);
 
+    let slackPermalink = null;
     let threadedInLeads = false;
     if (closedClient) {
-      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+      const leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
-      threadedInLeads = true;
+      threadedInLeads = !!leadPost;
+      slackPermalink = leadPost?.permalink || null;
       console.log(`[${firm.id}][messages] Closed client — ALSO sent to lead-calls`);
     } else {
-      threadedInLeads = await threadInLeadChannelIfMatch(firm, text, from, to);
+      const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to);
+      threadedInLeads = !!threadPost;
+      slackPermalink = threadPost?.permalink || null;
     }
 
     if (closedClient) {
@@ -3019,7 +3080,7 @@ async function handleMessages(firm, req, res) {
       const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
       await captureFollowUp(firm, {
         phone: externalPhone, type: "text", direction: isOutbound ? "outbound" : "inbound",
-        sourceId: msgId, content: body, quoLink: null, extractText: body,
+        sourceId: msgId, content: body, quoLink: null, slackPermalink, extractText: body,
       }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
     }
   } catch (err) {
@@ -3131,13 +3192,16 @@ async function handleCalls(firm, req, res) {
 
     const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
+    let slackPermalink = null;
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
-      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+      const leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
+      slackPermalink = leadPost?.permalink || null;
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
     } else {
-      await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      slackPermalink = threadPost?.permalink || null;
     }
 
     if (!isActiveClient(firm, externalPhone)) {
@@ -3157,7 +3221,7 @@ async function handleCalls(firm, req, res) {
       await captureFollowUp(firm, {
         phone: externalPhone, type: hasVoicemail ? "voicemail" : "missed_call",
         direction: "inbound", sourceId: callId, content: text,
-        transcript: vmTranscript || null, extractText: vmTranscript,
+        transcript: vmTranscript || null, slackPermalink, extractText: vmTranscript,
       }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
     }
   } catch (err) {
@@ -3222,7 +3286,8 @@ async function handleCallSummary(firm, req, res) {
 
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
 
-    let leadPermalink = null;
+    let slackMessagePermalink = null;
+    let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
     if (isLead) {
       const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
@@ -3230,15 +3295,17 @@ async function handleCallSummary(firm, req, res) {
       const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
-      leadPermalink = leadPost?.permalink || null;
+      slackMessagePermalink = leadPost?.permalink || null;
       leadParentTs = leadPost?.parentTs || null;
+      slackThreadPermalink = await getSlackThreadPermalink(
+        firm, firm.slackLeadCallsChannelId, leadParentTs, slackMessagePermalink, leadPost?.ts);
       console.log(`[${firm.id}][call-summary] Sent to lead-calls (${leadLabel})`);
     }
 
     let text;
     if (sona) {
-      const leadLink = leadPermalink ? `\n<${leadPermalink}|View in #lead-calls>` : "";
-      console.log(`[${firm.id}][call-summary] Sona post — isLead=${isLead}, leadPermalink=${leadPermalink || "null"}`);
+      const leadLink = slackMessagePermalink ? `\n<${slackMessagePermalink}|View in #lead-calls>` : "";
+      console.log(`[${firm.id}][call-summary] Sona post — isLead=${isLead}, leadPermalink=${slackMessagePermalink || "null"}`);
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
       console.log(`[${firm.id}][call-summary] Sent to sona-calls`);
@@ -3252,10 +3319,15 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
-    let threadedInLeads = false;
+    let threadedInLeads = !!isLead;
     if (!isLead) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
-      threadedInLeads = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
+      const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
+      threadedInLeads = !!threadPost;
+      slackMessagePermalink = threadPost?.permalink || null;
+      leadParentTs = threadPost?.parentTs || null;
+      slackThreadPermalink = await getSlackThreadPermalink(
+        firm, firm.slackLeadCallsChannelId, leadParentTs, slackMessagePermalink, threadPost?.ts);
     }
 
     const isInbound = !!firm.phoneLines[to] || cached?.direction === "incoming";
@@ -3315,10 +3387,15 @@ async function handleCallSummary(firm, req, res) {
         phone: externalPhone, type: sona ? "sona_call" : "call",
         direction: isInbound ? "inbound" : "outbound", sourceId: callId,
         content: summaryText, transcript, quoLink: deepLink,
+        slackPermalink: slackMessagePermalink,
         extractText: [transcript, summaryText].filter(Boolean).join("\n\n"),
       }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
     } else {
-      await runIntake(firm, { callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs })
+      await runIntake(firm, {
+        callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs,
+        slackPermalink: slackThreadPermalink, callSlackPermalink: slackMessagePermalink,
+        direction: isInbound ? "inbound" : "outbound", callType: sona ? "sona_call" : "call",
+      })
         .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
     }
   } catch (err) {

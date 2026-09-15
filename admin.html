@@ -277,7 +277,7 @@
       </label>
       <label for="firm-intake-table">Intake table</label>
       <input id="firm-intake-table" name="intakeTable" placeholder="public.intakes">
-      <div class="hint">Table to insert into. Must have columns: <code>call_id</code> (unique), <code>name</code>, <code>phone</code>, <code>accident_date</code>, <code>quo_link</code>, <code>transcript</code>, <code>data</code> (jsonb). Default: <code>public.intakes</code>. See the FAQ for the exact DDL.</div>
+      <div class="hint">Table to insert into. Must have columns: <code>call_id</code> (unique), <code>name</code>, <code>phone</code>, <code>accident_date</code>, <code>quo_link</code>, <code>slack_permalink</code>, <code>transcript</code>, <code>data</code> (jsonb). Default: <code>public.intakes</code>. See the FAQ for the exact DDL.</div>
       <label for="firm-intake-channel">Notification channel ID</label>
       <input id="firm-intake-channel" name="intakeNotifyChannelId" placeholder="defaults to #lead-calls channel">
       <div class="hint">Slack channel ID for the "Intake loaded" confirmation. Leave blank to use the #lead-calls channel.</div>
@@ -367,7 +367,7 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
 
     <details>
       <summary>How does Intake Extraction work?</summary>
-      <p>When enabled, every <strong>qualified-lead</strong> call summary is parsed by Claude into a structured intake record (client, accident, injuries, insurance, vehicle, etc.) and written as one row to your intake table, with the Quo call link saved alongside it. Then it posts <code>📝 Intake loaded for [Name]</code> to the notification channel (default #lead-calls).</p>
+      <p>When enabled, every <strong>qualified-lead</strong> call summary is parsed by Claude into a structured intake record (client, accident, injuries, insurance, vehicle, etc.) and written as one row to your intake table, with the Quo call link and Slack conversation permalink saved alongside it. Then it posts <code>📝 Intake loaded for [Name]</code> to the notification channel (default #lead-calls).</p>
       <ul>
         <li><strong>Trigger:</strong> qualified leads only — spam/vendor/existing-client calls are skipped.</li>
         <li><strong>Where it writes:</strong> the same case database (<code>CASE_DB_URL</code>). The DB role needs <code>INSERT</code> on the intake table — e.g. <code>GRANT INSERT ON public.intakes TO your_role;</code></li>
@@ -381,8 +381,9 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
   call_id       text unique,
   name          text,
   phone         text,
-  quo_link      text,
-  transcript    text,
+  quo_link        text,
+  slack_permalink text,
+  transcript      text,
   data          jsonb,
   created_at    timestamptz default now()
 );</pre>
@@ -395,10 +396,10 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
       <summary>How do follow-up calls/texts get captured? (72h window)</summary>
       <p>When an intake is created, a follow-up window opens on that caller's number (default 72h, configurable). During the window, every call, text, voicemail, and Sona call on that number is:</p>
       <ul>
-        <li>logged as a row in the <strong>interactions table</strong> (linked to the intake by <code>intake_call_id</code>, deduped by the Quo message/call id), and</li>
+        <li>logged as a row in the <strong>interactions table</strong> (linked to the intake by <code>intake_call_id</code>, deduped by the Quo message/call id), with the <strong>Quo summary</strong>, Quo link, and Slack permalink when we posted the call to #lead-calls, and</li>
         <li>if it has any text (text body, call transcript, voicemail transcription), run through the extractor and <strong>merged into the intake</strong> — filling any fields that were still empty (existing values are never overwritten; lists are unioned).</li>
       </ul>
-      <p>You get a brief <code>📝 Intake updated — filled N fields</code> Slack note whenever a follow-up adds something. Windows survive redeploys (rehydrated from recent intakes on startup).</p>
+      <p>The qualifying call itself is also logged as an interaction, so Docket Flow can show every call (summary + Slack/Quo links), not only the first transcript. You get a brief <code>📝 Intake updated — filled N fields</code> Slack note whenever a follow-up adds something. Windows survive redeploys (rehydrated from recent intakes on startup).</p>
       <p><strong>It also looks backwards.</strong> Right after the intake is created, the router queries Quo history for messages/calls with that same number from the <em>same</em> look-back window (e.g. a text they sent an hour before the qualifying call), logs them as interactions, and merges their details in too. Items already captured live are skipped via the <code>source_id</code> dedup, so nothing is double-counted.</p>
       <p>Create the interactions table:</p>
       <pre>create table public.intake_interactions (
@@ -408,15 +409,16 @@ Call summary: https://&lt;your-host&gt;/webhooks/quo/&lt;firmId&gt;/call-summary
   type           text,          -- text | call | sona_call | missed_call | voicemail
   direction      text,          -- inbound | outbound
   source_id      text unique,   -- Quo message/call id (dedup)
-  content        text,
+  content        text,          -- text body, or Quo call summary
   transcript     text,
   quo_link       text,
+  slack_permalink text,         -- #lead-calls message for this event
   data           jsonb,
   occurred_at    timestamptz default now()
 );
 grant insert, select on public.intake_interactions to your_role;  -- if not the owner</pre>
       <p>Pull a full lead later by joining on <code>intake_call_id</code>:</p>
-      <pre>select i.name, i.phone, x.type, x.direction, x.content, x.occurred_at
+      <pre>select i.name, i.phone, i.slack_permalink, x.type, x.direction, x.content, x.quo_link, x.slack_permalink, x.occurred_at
 from public.intakes i
 left join public.intake_interactions x on x.intake_call_id = i.call_id
 where i.call_id = '...'
