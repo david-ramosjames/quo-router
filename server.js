@@ -1394,6 +1394,137 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 
 // Extract → insert → notify, then open a follow-up window on the caller's phone.
 // Best-effort: any failure is logged and swallowed so it never affects routing.
+function leadPhoneE164(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return null;
+}
+
+// Grade and sentiment are decisions on the lead. A new call may revise both.
+// Intake Manager is where a person corrects them. This does not send texts.
+async function recordLeadDecision(firm, {
+  phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+}) {
+  if (!firm.caseDbUrl) return;
+  const phoneE164 = leadPhoneE164(phone);
+  if (!phoneE164 && !callId) return;
+
+  let score = null;
+  const sourceText = String(summary || "").trim();
+  if (sourceText && llmConfigured()) {
+    score = await llmExtract({
+      label: `${firm.id}][lead-score`,
+      name: "score_lead",
+      description: "Grade and sentiment for one lead call",
+      maxTokens: 300,
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          grade: { type: ["string", "null"], enum: ["A", "B", "C", null] },
+          grade_reason: { type: ["string", "null"] },
+          sentiment: { type: ["string", "null"], enum: ["positive", "neutral", "negative", null] },
+          sentiment_reason: { type: ["string", "null"] },
+        },
+        required: ["grade", "grade_reason", "sentiment", "sentiment_reason"],
+      },
+      system: `You score one call for a Texas personal injury firm.
+grade is how strong a case this is for the firm: A is a clear injury matter worth pursuing, B is possible but thin, C is a weak fit or outside the firm's work. Use null only when the call has no facts.
+sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
+Reasons are one short sentence each. Do not invent facts.`,
+      user: sourceText.slice(0, 6000),
+    });
+  }
+
+  const grade = score && ["A", "B", "C"].includes(score.grade) ? score.grade : null;
+  const sentiment = score && ["positive", "neutral", "negative"].includes(score.sentiment) ? score.sentiment : null;
+  const summaryText = sourceText ? sourceText.slice(0, 2000) : null;
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const found = await client.query(
+      `select id, kind, intake_call_id, signed_case, case_id, lead_status
+       from public.leads
+       where ($1::text is not null and intake_call_id = $1)
+          or ($2::text is not null and phone_e164 = $2
+              and signed_case = false
+              and case_id is null
+              and lead_status not in ('Lost', 'Referred', 'Promoted', 'Signed'))
+       order by case when intake_call_id = $1 then 0 else 1 end, created_at desc
+       limit 1`,
+      [callId || null, phoneE164],
+    );
+    const existing = found.rows[0];
+    const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
+
+    if (existing) {
+      if (existing.signed_case || existing.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(existing.lead_status)) {
+        return;
+      }
+      await client.query(
+        `update public.leads set
+           kind = $2,
+           arrival = coalesce($3, arrival),
+           summary = coalesce($4, summary),
+           quo_link = coalesce($5, quo_link),
+           owner_name = coalesce($6, owner_name),
+           slack_permalink = coalesce($7, slack_permalink),
+           grade = coalesce($8, grade),
+           grade_reason = case when $8::text is null then grade_reason else $9 end,
+           grade_source = case when $8::text is null then grade_source else 'quo-router' end,
+           sentiment = coalesce($10, sentiment),
+           sentiment_reason = case when $10::text is null then sentiment_reason else $11 end,
+           sentiment_source = case when $10::text is null then sentiment_source else 'quo-router' end
+         where id = $1`,
+        [
+          existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
+          slackPermalink || null, grade, score?.grade_reason || null, sentiment, score?.sentiment_reason || null,
+        ],
+      );
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, 'scored', 'quo-router', $2::jsonb)`,
+        [existing.id, JSON.stringify({ grade, sentiment, kind, call_id: callId || null })],
+      );
+      console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}`);
+      return;
+    }
+
+    const inserted = await client.query(
+      `insert into public.leads (
+         lead_date, phone, phone_e164, source_type, lead_status, kind, arrival,
+         summary, quo_link, intake_call_id, owner_name, slack_permalink,
+         grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up
+       ) values (
+         current_date, $1, $2, 'Call', 'New', $3, $4,
+         $5, $6, $7, $8, $9,
+         $10, $11, case when $10::text is null then null else 'quo-router' end,
+         $12, $13, case when $12::text is null then null else 'quo-router' end, true
+       )
+       on conflict (intake_call_id) do nothing
+       returning id`,
+      [
+        phone || null, phoneE164, kind, arrival || null, summaryText, quoLink || null, callId || null,
+        handledBy || null, slackPermalink || null, grade, score?.grade_reason || null,
+        sentiment, score?.sentiment_reason || null,
+      ],
+    );
+    const id = inserted.rows[0]?.id;
+    if (!id) return;
+    await client.query(
+      `insert into public.lead_events (lead_id, event_type, actor, payload)
+       values ($1, 'scored', 'quo-router', $2::jsonb)`,
+      [id, JSON.stringify({ grade, sentiment, kind, call_id: callId || null })],
+    );
+    console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}`);
+  } catch (err) {
+    console.error(`[${firm.id}][lead] Could not record the decision:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
 async function runIntake(firm, {
   callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null,
   slackPermalink = null, callSlackPermalink = null, direction = "inbound", callType = "call",
@@ -1528,6 +1659,18 @@ async function mergeIntoIntake(firm, intakeCallId, extracted) {
   let client;
   try {
     client = await connectCaseDb(firm);
+    const closed = await client.query(
+      `select signed_case, form_fill_closed_at
+       from public.leads
+       where intake_call_id = $1
+       limit 1`,
+      [intakeCallId],
+    ).catch(() => null);
+    const lead = closed?.rows?.[0];
+    if (lead && (lead.signed_case || lead.form_fill_closed_at)) {
+      console.log(`[${firm.id}][intake] Form fill stopped — lead for ${intakeCallId} is signed`);
+      return 0;
+    }
     const { rows } = await client.query(`SELECT * FROM ${table} WHERE call_id = $1`, [intakeCallId]);
     if (!rows.length) return 0;
     const current = rows[0];
@@ -3420,6 +3563,21 @@ async function handleCallSummary(firm, req, res) {
     // a follow-up window, treat the call as a follow-up (log + merge into the
     // existing intake); otherwise a qualified lead opens a new intake.
     const externalPhone = firm.phoneLines[from] ? to : from;
+    if (isLead) {
+      const handledBy = sona
+        ? "Sona"
+        : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || null);
+      await recordLeadDecision(firm, {
+        phone: externalPhone,
+        isQualified,
+        summary: summaryText,
+        quoLink: deepLink,
+        callId,
+        handledBy,
+        arrival: sona ? "sona" : (isQualified ? "qualified_call" : "human_call"),
+        slackPermalink: slackMessagePermalink,
+      }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
+    }
     if (getFollowUpWindow(firm, externalPhone)) {
       const transcript = await fetchCallTranscript(firm, callId);
       await captureFollowUp(firm, {
