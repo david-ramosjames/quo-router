@@ -2552,6 +2552,36 @@ async function postToCaseChannel(firm, text, phoneFrom, phoneTo, { skipMentions 
   }
 }
 
+// Hand texted photos to the file sorter, which saves them into the case's Dropbox
+// Photos folder. Best-effort: a failure here never blocks the Slack posts.
+const FILE_SORTER_INGEST_URL = (process.env.FILE_SORTER_INGEST_URL || "").replace(/\/$/, "");
+const FILE_SORTER_INGEST_SECRET = process.env.FILE_SORTER_INGEST_SECRET || "";
+
+async function forwardCasePhotosToFileSorter(firm, { phone, media, messageId, sentAt }) {
+  if (!FILE_SORTER_INGEST_URL || !FILE_SORTER_INGEST_SECRET) return;
+  const images = (media || [])
+    .map((m) => ({ url: m?.url || (typeof m === "string" ? m : ""), type: m?.type || "" }))
+    .filter((m) => m.url && m.type.toLowerCase().startsWith("image/"));
+  if (images.length === 0 || !messageId) return;
+
+  const contactName = getContactName(firm, phone);
+  const caseNumber = extractCaseNumber(contactName);
+  if (!caseNumber) return;
+  const senderName = (contactName || "").replace(/\b\d{3,5}\b/g, "").replace(/\s+/g, " ").trim();
+
+  try {
+    const res = await fetch(`${FILE_SORTER_INGEST_URL}/ingest/case-photos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Ingest-Secret": FILE_SORTER_INGEST_SECRET },
+      body: JSON.stringify({ caseNumber, messageId, senderName, sentAt, media: images }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    console.log(`[${firm.id}][case-photos] Forwarded ${images.length} photo(s) for case ${caseNumber}`);
+  } catch (err) {
+    console.error(`[${firm.id}][case-photos] Forward failed:`, err.message);
+  }
+}
+
 // === Call Cache + Fallback (per-firm) ===
 
 function cacheCall(firm, callId, info) {
@@ -3073,6 +3103,15 @@ async function handleMessages(firm, req, res) {
     }
 
     await postToCaseChannel(firm, text, from, to, { skipMentions: isOutbound });
+
+    if (!isOutbound && media.length > 0) {
+      await forwardCasePhotosToFileSorter(firm, {
+        phone: externalPhone,
+        media,
+        messageId: obj.id || extractField(payload, "data.object.id", "data.id"),
+        sentAt: obj.createdAt || new Date().toISOString(),
+      });
+    }
 
     // Follow-up capture: if this number is in an intake follow-up window, log the
     // text and merge any new details into the intake. Best-effort.
