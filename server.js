@@ -4,6 +4,7 @@ import path from "path";
 import crypto from "crypto";
 import dns from "node:dns";
 import { fileURLToPath } from "url";
+import { absorbLeadChannel, nextSequence } from "./lead-channel.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
 // outbound IPv6 route, and Node 18+ returns DNS results verbatim — so a
@@ -1444,7 +1445,7 @@ Reasons are one short sentence each. Do not invent facts.`,
   try {
     client = await connectCaseDb(firm);
     const found = await client.query(
-      `select id, kind, intake_call_id, signed_case, case_id, lead_status
+      `select id, kind, sequence, intake_call_id, signed_case, case_id, lead_status
        from public.leads
        where ($1::text is not null and intake_call_id = $1)
           or ($2::text is not null and phone_e164 = $2
@@ -1457,6 +1458,12 @@ Reasons are one short sentence each. Do not invent facts.`,
     );
     const existing = found.rows[0];
     const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
+    const sequence = nextSequence({
+      text: sourceText,
+      isQualified,
+      existing: existing?.sequence || null,
+    });
+    const detailLine = summaryText ? `Call: ${summaryText}` : null;
 
     if (existing) {
       if (existing.signed_case || existing.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(existing.lead_status)) {
@@ -1475,11 +1482,19 @@ Reasons are one short sentence each. Do not invent facts.`,
            grade_source = case when $8::text is null then grade_source else 'quo-router' end,
            sentiment = coalesce($10, sentiment),
            sentiment_reason = case when $10::text is null then sentiment_reason else $11 end,
-           sentiment_source = case when $10::text is null then sentiment_source else 'quo-router' end
+           sentiment_source = case when $10::text is null then sentiment_source else 'quo-router' end,
+           sequence = $12,
+           case_detail = case
+             when $13::text is null then case_detail
+             when case_detail is null or case_detail = '' then $13
+             when position($13 in case_detail) > 0 then case_detail
+             else right(case_detail || E'\n\n' || $13, 15000)
+           end
          where id = $1`,
         [
           existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
           slackPermalink || null, grade, score?.grade_reason || null, sentiment, score?.sentiment_reason || null,
+          sequence, detailLine,
         ],
       );
       await client.query(
@@ -1493,12 +1508,12 @@ Reasons are one short sentence each. Do not invent facts.`,
 
     const inserted = await client.query(
       `insert into public.leads (
-         lead_date, phone, phone_e164, source_type, lead_status, kind, arrival,
-         summary, quo_link, intake_call_id, owner_name, slack_permalink,
+         lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
+         summary, case_detail, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
          grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up
        ) values (
-         current_date, $1, $2, 'Call', 'New', $3, $4,
-         $5, $6, $7, $8, $9,
+         current_date, $1, $2, 'Call', 'Call', 'New', $3, $4,
+         $5, $14, $15, $6, $7, $8, $9,
          $10, $11, case when $10::text is null then null else 'quo-router' end,
          $12, $13, case when $12::text is null then null else 'quo-router' end, true
        )
@@ -1507,7 +1522,7 @@ Reasons are one short sentence each. Do not invent facts.`,
       [
         phone || null, phoneE164, kind, arrival || null, summaryText, quoLink || null, callId || null,
         handledBy || null, slackPermalink || null, grade, score?.grade_reason || null,
-        sentiment, score?.sentiment_reason || null,
+        sentiment, score?.sentiment_reason || null, detailLine, sequence,
       ],
     );
     const id = inserted.rows[0]?.id;
@@ -4174,3 +4189,21 @@ setInterval(() => {
 setInterval(() => {
   for (const firm of firms.values()) loadCaseStatuses(firm);
 }, CASE_STATUS_REFRESH_INTERVAL);
+
+let readingLeadChannel = false;
+setInterval(() => {
+  if (readingLeadChannel) return;
+  readingLeadChannel = true;
+  Promise.all([...firms.values()].map((firm) => absorbLeadChannel(firm, {
+    connectCaseDb,
+    llmExtract,
+    llmConfigured,
+    fetchHistory: fetchLeadChannelHistory,
+    messageText: getFullMessageText,
+    leadPhoneE164,
+  }))).catch((error) => {
+    console.error("[lead-channel] Error:", error.message);
+  }).finally(() => {
+    readingLeadChannel = false;
+  });
+}, 2 * 60 * 1000);
