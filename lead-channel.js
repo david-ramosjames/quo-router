@@ -173,6 +173,7 @@ export async function absorbLeadChannel(firm, deps) {
              sequence = case when $3::boolean then sequence else $4 end,
              kind = case when $3::boolean then kind else $5 end,
              email = coalesce(email, $6),
+             phone = coalesce(phone, $7),
              phone_e164 = coalesce(phone_e164, $7),
              slack_channel_id = coalesce(slack_channel_id, $8),
              slack_message_ts = coalesce(slack_message_ts, $9)
@@ -193,10 +194,10 @@ export async function absorbLeadChannel(firm, deps) {
       }
       const inserted = await client.query(
         `insert into public.leads (
-           lead_date, phone_e164, email, source_channel, lead_status, kind, arrival,
+           lead_date, phone, phone_e164, email, source_channel, lead_status, kind, arrival,
            case_detail, sequence, follow_up, slack_channel_id, slack_message_ts
          ) values (
-           current_date, $1, $2, 'Web form', 'New', $3, 'form',
+           current_date, $1, $1, $2, 'Web form', 'New', $3, 'form',
            $4, $5, $6, $7, $8
          )
          returning id`,
