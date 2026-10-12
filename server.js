@@ -1459,7 +1459,7 @@ async function recordLeadDecision(firm, {
         required: ["grade", "grade_reason", "sentiment", "sentiment_reason"],
       },
       system: `You score one call for a Texas personal injury firm.
-grade is how strong a case this is for the firm: A is a clear injury matter worth pursuing, B is possible but thin, C is a weak fit or outside the firm's work. Use null only when the call has no facts.
+grade is the personal-injury strength of the case, not how far the lead has gotten. A is a clear injury matter such as a car, truck, motorcycle, or pedestrian crash. B is a possible but thin injury. C is no injury or outside the firm's work. Use null only when the call has no facts. The dashboard combines this grade with whether the firm still needs contact, more facts, or a signature.
 sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
 Reasons are one short sentence each. Do not invent facts.`,
       user: sourceText.slice(0, 6000),
