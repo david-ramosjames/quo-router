@@ -1214,6 +1214,20 @@ const INTAKE_COLUMNS = [
   ["notes", ["notes"], "text"],
 ];
 
+function blankLabel(value) {
+  return !String(value ?? "").trim() || /^(null|undefined|none|unknown|n\/a|na|incorrect text|-)$/i.test(String(value).trim());
+}
+
+function caseKindFromNarrative(text) {
+  const body = String(text || "");
+  if (/\b(fight|assault(?:ed)?|attacked|beaten|beer bottle)\b/i.test(body)) return "Assault";
+  if (/\bdog bite|bitten by (?:a |the )?dog\b/i.test(body)) return "Dog Bite";
+  if (/\b(?:slip(?:ped)? and fall|wet floor)\b/i.test(body)) return "Slip and fall";
+  if (/\b(?:workers?'? compensation|work accident)\b/i.test(body)) return "Work Accident";
+  if (/\b(?:car accident|rear-?ended|other driver)\b/i.test(body)) return "Car accident";
+  return null;
+}
+
 function coerceColumnValue(raw, type) {
   if (raw === null || raw === undefined || raw === "") return null;
   if (type === "bool") {
@@ -1229,7 +1243,8 @@ function coerceColumnValue(raw, type) {
     return joined || null;
   }
   const s = String(raw).trim();
-  return s || null;
+  if (blankLabel(s)) return null;
+  return s;
 }
 
 // Turn a nested extraction into { column: value }, dropping nulls.
@@ -1634,6 +1649,43 @@ async function rememberClientName(firm, { callId, phone, clientName, staffName, 
   }
 }
 
+async function stampKnownFacts(firm, { callId, phone, narrative }) {
+  const phoneE164 = leadPhoneE164(phone);
+  const kind = caseKindFromNarrative(narrative);
+  if (!callId && !phoneE164) return;
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    await client.query(
+      `update public.intakes as intake
+       set name = case
+             when intake.name is null or btrim(intake.name) = '' or lower(btrim(intake.name)) in ('null','undefined','none','unknown','n/a','na','-')
+             then lead.lead_name else intake.name end,
+           email = case
+             when intake.email is null or btrim(intake.email) = '' or lower(btrim(intake.email)) in ('null','undefined','none','unknown','n/a','na','-')
+             then lead.email else intake.email end
+       from public.leads as lead
+       where intake.call_id = $1
+         and (lead.intake_call_id = $1 or ($2::text is not null and lead.phone_e164 = $2))
+         and nullif(btrim(lead.lead_name), '') is not null
+         and lower(btrim(lead.lead_name)) <> 'null'`,
+      [callId, phoneE164],
+    );
+    if (!kind) return;
+    await client.query(
+      `update public.leads
+       set case_type = $3
+       where ($1::text is not null and intake_call_id = $1 or $2::text is not null and phone_e164 = $2)
+         and (case_type is null or btrim(case_type) = '' or lower(btrim(case_type)) in ('other','null'))
+         and case_id is null
+         and lead_status is distinct from 'Promoted'`,
+      [callId, phoneE164, kind],
+    );
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
 async function runIntake(firm, {
   callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null,
   slackPermalink = null, callSlackPermalink = null, direction = "inbound", callType = "call",
@@ -1664,7 +1716,8 @@ async function runIntake(firm, {
     console.error(`[${firm.id}][intake] Staff directory unavailable:`, err.message);
     return [];
   });
-  const heardName = extracted.client?.name || null;
+  const heardName = blankLabel(extracted.client?.name) ? null : extracted.client.name;
+  if (extracted.client) extracted.client.name = heardName;
   const staffHit = matchStaff(heardName, staff);
   if (staffHit && extracted.client) extracted.client.name = null;
   const name = staffHit ? null : heardName;
@@ -1687,6 +1740,11 @@ async function runIntake(firm, {
     slackPermalink, transcript: transcript || summaryText, data: extracted,
   });
   if (error) return;
+  await stampKnownFacts(firm, {
+    callId,
+    phone: externalPhone || phone,
+    narrative: [summaryText, extracted.accident?.description].filter(Boolean).join("\n"),
+  }).catch((err) => console.error(`[${firm.id}][intake] Could not copy the known name and case type:`, err.message));
   if (!inserted) {
     console.log(`[${firm.id}][intake] ${callId} already recorded — skipping`);
     return;
@@ -1813,7 +1871,7 @@ async function mergeIntoIntake(firm, intakeCallId, extracted) {
           updates[col] = merged;
           added += merged.split(",").length - String(cur || "").split(",").filter((s) => s.trim()).length;
         }
-      } else if (cur === null || cur === undefined || cur === "") {
+      } else if (cur === null || cur === undefined || cur === "" || /^(null|undefined|none|unknown|n\/a|na|incorrect text|-)$/i.test(String(cur).trim())) {
         updates[col] = val;
         added += 1;
       }
@@ -1968,7 +2026,8 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   const extracted = await extractIntake(firm, text);
   if (!extracted) return;
   const staff = await loadStaffDirectory(firm).catch(() => []);
-  const heardName = extracted.client?.name || null;
+  const heardName = blankLabel(extracted.client?.name) ? null : extracted.client.name;
+  if (extracted.client) extracted.client.name = heardName;
   const staffHit = matchStaff(heardName, staff);
   if (staffHit && extracted.client) extracted.client.name = null;
   await rememberClientName(firm, {
