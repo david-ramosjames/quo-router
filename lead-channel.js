@@ -2,6 +2,8 @@
 // The first run only marks the posts already in the channel as seen, so old
 // history is not replayed into the lead list.
 
+import { loadStaffDirectory, matchStaff } from "./staff-directory.js";
+
 const SEQUENCES = new Set(["want_to_sign", "needs_info", "referral", "stop"]);
 
 export function nextSequence({ text, isQualified, existing }) {
@@ -22,6 +24,29 @@ function firstPhone(text, toE164) {
 
 function firstEmail(text) {
   return String(text || "").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? null;
+}
+
+function labeledValue(text, labels) {
+  const pattern = new RegExp(
+    `(?:^|\\n)\\s*\\**\\s*(?:${labels.join("|")})\\s*\\**\\s*:\\s*\\**\\s*([^\\n]+)`,
+    "i",
+  );
+  const raw = String(text || "").match(pattern)?.[1]
+    ?.replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim() ?? "";
+  if (!raw || /^(other|n\/a|na|none|unknown|yes|no|-)$/i.test(raw)) return null;
+  return raw;
+}
+
+// Web forms put the client on a labeled line. SMS Follow-Up reads the same
+// post for texts. This saves the name and accident before anyone calls.
+export function formFacts(text) {
+  return {
+    name: labeledValue(text, ["full name", "client name", "name"]),
+    accident: labeledValue(text, ["type of accident", "case type", "tipo de accidente"]),
+  };
 }
 
 function appendDetail(current, addition) {
@@ -69,6 +94,27 @@ function kindFor(sequence, existingKind) {
   return existingKind || "pursue";
 }
 
+async function saveFormIntake(client, leadId, name, accident, phone, email) {
+  if (!name && !accident) return;
+  const callId = `form:${leadId}`;
+  await client.query(
+    `update public.leads
+     set intake_call_id = coalesce(intake_call_id, $2)
+     where id = $1`,
+    [leadId, callId],
+  );
+  await client.query(
+    `insert into public.intakes (call_id, name, phone, email, accident_description)
+     values ($1, $2, $3, $4, $5)
+     on conflict (call_id) do update set
+       name = coalesce(public.intakes.name, excluded.name),
+       phone = coalesce(public.intakes.phone, excluded.phone),
+       email = coalesce(public.intakes.email, excluded.email),
+       accident_description = coalesce(public.intakes.accident_description, excluded.accident_description)`,
+    [callId, name, phone, email, accident],
+  );
+}
+
 async function remember(client, channelId, ts, leadId) {
   await client.query(
     `insert into public.lead_channel_posts (channel_id, message_ts, lead_id)
@@ -110,6 +156,7 @@ export async function absorbLeadChannel(firm, deps) {
     const known = new Set(seen.rows.map((row) => row.message_ts));
     const fresh = posts.filter((message) => !known.has(message.ts)).slice(0, 20);
     if (!fresh.length) return;
+    const staff = await loadStaffDirectory(firm).catch(() => []);
 
     if (!firm.slackBotUserId) {
       const auth = await fetch("https://slack.com/api/auth.test", {
@@ -165,6 +212,8 @@ export async function absorbLeadChannel(firm, deps) {
         }
       }
       const kind = kindFor(sequence, existing?.kind);
+      const facts = formFacts(text);
+      const clientName = facts.name && !matchStaff(facts.name, staff) ? facts.name : null;
 
       if (existing) {
         await client.query(
@@ -176,13 +225,17 @@ export async function absorbLeadChannel(firm, deps) {
              phone = coalesce(phone, $7),
              phone_e164 = coalesce(phone_e164, $7),
              slack_channel_id = coalesce(slack_channel_id, $8),
-             slack_message_ts = coalesce(slack_message_ts, $9)
+             slack_message_ts = coalesce(slack_message_ts, $9),
+             lead_name = coalesce(nullif(btrim(lead_name), ''), $10),
+             case_type = coalesce(nullif(btrim(case_type), ''), $11)
            where id = $1`,
           [
             existing.id, caseDetail, Boolean(closed), sequence, kind,
             firstEmail(text), phoneE164, channelId, message.ts,
+            clientName, facts.accident,
           ],
         );
+        await saveFormIntake(client, existing.id, clientName, facts.accident, phoneE164, firstEmail(text));
         await remember(client, channelId, message.ts, existing.id);
         console.log(`[${firm.id}][lead-channel] Updated lead ${existing.id} sequence=${sequence || "unchanged"}`);
         continue;
@@ -194,19 +247,20 @@ export async function absorbLeadChannel(firm, deps) {
       }
       const inserted = await client.query(
         `insert into public.leads (
-           lead_date, phone, phone_e164, email, source_channel, lead_status, kind, arrival,
+           lead_date, lead_name, phone, phone_e164, email, case_type, source_channel, lead_status, kind, arrival,
            case_detail, sequence, follow_up, slack_channel_id, slack_message_ts
          ) values (
-           current_date, $1, $1, $2, 'Web form', 'New', $3, 'form',
+           current_date, $9, $1, $1, $2, $10, 'Web form', 'New', $3, 'form',
            $4, $5, $6, $7, $8
          )
          returning id`,
         [
           phoneE164, firstEmail(text), kind, caseDetail, sequence,
-         sequence !== "stop", channelId, message.ts,
+          sequence !== "stop", channelId, message.ts, clientName, facts.accident,
         ],
       );
       const id = inserted.rows[0]?.id || null;
+      if (id) await saveFormIntake(client, id, clientName, facts.accident, phoneE164, firstEmail(text));
       await remember(client, channelId, message.ts, id);
       if (id) console.log(`[${firm.id}][lead-channel] Opened lead ${id} sequence=${sequence}`);
     }
