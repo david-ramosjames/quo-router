@@ -1430,6 +1430,17 @@ function leadPhoneE164(phone) {
   return null;
 }
 
+// A property dispute, a wrong number, or anything outside personal injury is not a lead.
+// A real crash, fall, bite, or work injury stays a lead even if the caller also says "property".
+function callIsNotALead(text, score) {
+  if (score && score.not_a_lead === true) return true;
+  const body = String(text || "");
+  if (/\b(car accident|truck|motorcycle|pedestrian|rear-?ended|slip and fall|dog bite|workers?'? compensation|18-wheeler)\b/i.test(body)) {
+    return false;
+  }
+  return /\b(property issue|neighbor encroaching|not a personal[- ]injury|outside (?:the |our )?firm'?s work|wrong number)\b/i.test(body);
+}
+
 // Grade and sentiment are decisions on the lead. A new call may revise both.
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
@@ -1446,7 +1457,7 @@ async function recordLeadDecision(firm, {
       label: `${firm.id}][lead-score`,
       name: "score_lead",
       description: "Grade and sentiment for one lead call",
-      maxTokens: 300,
+      maxTokens: 400,
       schema: {
         type: "object",
         additionalProperties: false,
@@ -1455,25 +1466,28 @@ async function recordLeadDecision(firm, {
           grade_reason: { type: ["string", "null"] },
           sentiment: { type: ["string", "null"], enum: ["positive", "neutral", "negative", null] },
           sentiment_reason: { type: ["string", "null"] },
+          not_a_lead: { type: "boolean" },
+          not_a_lead_reason: { type: ["string", "null"] },
         },
-        required: ["grade", "grade_reason", "sentiment", "sentiment_reason"],
+        required: ["grade", "grade_reason", "sentiment", "sentiment_reason", "not_a_lead", "not_a_lead_reason"],
       },
       system: `You score one call for a Texas personal injury firm.
 grade is the personal-injury strength of the case, not how far the lead has gotten. A is a clear injury matter such as a car, truck, motorcycle, or pedestrian crash. B is a possible but thin injury. C is no injury or outside the firm's work. Use null only when the call has no facts. The dashboard combines this grade with whether the firm still needs contact, more facts, or a signature.
 sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
+not_a_lead is true only when this call shows the person is not a personal-injury lead: a property dispute, a matter the firm does not take, a wrong number, or someone already sent to another firm. It is false when there is a possible injury, even a thin one, or when the call does not say. Do not mark not_a_lead because the caller is unsure or the firm still needs facts.
 Reasons are one short sentence each. Do not invent facts.`,
       user: sourceText.slice(0, 6000),
     });
   }
 
-  const grade = score && ["A", "B", "C"].includes(score.grade) ? score.grade : null;
   const sentiment = score && ["positive", "neutral", "negative"].includes(score.sentiment) ? score.sentiment : null;
   const summaryText = sourceText ? sourceText.slice(0, 2000) : null;
   let client;
   try {
     client = await connectCaseDb(firm);
     const found = await client.query(
-      `select id, kind, sequence, intake_call_id, signed_case, case_id, lead_status
+      `select id, kind, sequence, intake_call_id, signed_case, case_id, lead_status,
+              agreement_status, agreement_sent_at
        from public.leads
        where ($1::text is not null and intake_call_id = $1)
           or ($2::text is not null and phone_e164 = $2
@@ -1486,7 +1500,14 @@ Reasons are one short sentence each. Do not invent facts.`,
     );
     const existing = found.rows[0];
     const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
-    const sequence = nextSequence({
+    const contractOut = Boolean(existing?.agreement_sent_at)
+      || ["sent", "viewed", "signed", "completed"].includes(existing?.agreement_status || "");
+    const closeNow = callIsNotALead(sourceText, score) && !contractOut;
+    const grade = closeNow ? "C" : (score && ["A", "B", "C"].includes(score.grade) ? score.grade : null);
+    const gradeReason = closeNow
+      ? (score?.not_a_lead_reason || score?.grade_reason || "Not a personal-injury lead.")
+      : (score?.grade_reason || null);
+    const sequence = closeNow ? "stop" : nextSequence({
       text: sourceText,
       isQualified,
       existing: existing?.sequence || null,
@@ -1512,6 +1533,13 @@ Reasons are one short sentence each. Do not invent facts.`,
            sentiment_reason = case when $10::text is null then sentiment_reason else $11 end,
            sentiment_source = case when $10::text is null then sentiment_source else 'quo-router' end,
            sequence = $12,
+           lead_status = case when $14 then 'Lost' else lead_status end,
+           follow_up = case when $14 then false else follow_up end,
+           close_reason = case when $14 then 'not_a_lead' else close_reason end,
+           text_sequence_status = case
+             when $14 and text_sequence_status = 'active' then 'stopped'
+             else text_sequence_status
+           end,
            case_detail = case
              when $13::text is null then case_detail
              when case_detail is null or case_detail = '' then $13
@@ -1521,16 +1549,28 @@ Reasons are one short sentence each. Do not invent facts.`,
          where id = $1`,
         [
           existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
-          slackPermalink || null, grade, score?.grade_reason || null, sentiment, score?.sentiment_reason || null,
-          sequence, detailLine,
+          slackPermalink || null, grade, gradeReason, sentiment, score?.sentiment_reason || null,
+          sequence, detailLine, closeNow,
         ],
       );
+      if (closeNow) {
+        await client.query(
+          `update public.lead_jobs
+           set status = 'skipped', detail = 'Not a lead'
+           where lead_id = $1 and status = 'pending'`,
+          [existing.id],
+        );
+      }
       await client.query(
         `insert into public.lead_events (lead_id, event_type, actor, payload)
-         values ($1, 'scored', 'quo-router', $2::jsonb)`,
-        [existing.id, JSON.stringify({ grade, sentiment, kind, call_id: callId || null })],
+         values ($1, $2, 'quo-router', $3::jsonb)`,
+        [
+          existing.id,
+          closeNow ? "not_a_lead" : "scored",
+          JSON.stringify({ grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null }),
+        ],
       );
-      console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}`);
+      console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}${closeNow ? " not_a_lead" : ""}`);
       return;
     }
 
@@ -1538,29 +1578,36 @@ Reasons are one short sentence each. Do not invent facts.`,
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, case_detail, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
-         grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up
+         grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up,
+         close_reason
        ) values (
-         current_date, $1, $2, 'Call', 'Call', 'New', $3, $4,
+         current_date, $1, $2, 'Call', 'Call', case when $16 then 'Lost' else 'New' end, $3, $4,
          $5, $14, $15, $6, $7, $8, $9,
          $10, $11, case when $10::text is null then null else 'quo-router' end,
-         $12, $13, case when $12::text is null then null else 'quo-router' end, true
+         $12, $13, case when $12::text is null then null else 'quo-router' end,
+         case when $16 then false else true end,
+         case when $16 then 'not_a_lead' else null end
        )
        on conflict (intake_call_id) do nothing
        returning id`,
       [
         phone || null, phoneE164, kind, arrival || null, summaryText, quoLink || null, callId || null,
-        handledBy || null, slackPermalink || null, grade, score?.grade_reason || null,
-        sentiment, score?.sentiment_reason || null, detailLine, sequence,
+        handledBy || null, slackPermalink || null, grade, gradeReason,
+        sentiment, score?.sentiment_reason || null, detailLine, sequence, closeNow,
       ],
     );
     const id = inserted.rows[0]?.id;
     if (!id) return;
     await client.query(
       `insert into public.lead_events (lead_id, event_type, actor, payload)
-       values ($1, 'scored', 'quo-router', $2::jsonb)`,
-      [id, JSON.stringify({ grade, sentiment, kind, call_id: callId || null })],
+       values ($1, $2, 'quo-router', $3::jsonb)`,
+      [
+        id,
+        closeNow ? "not_a_lead" : "scored",
+        JSON.stringify({ grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null }),
+      ],
     );
-    console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}`);
+    console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}${closeNow ? " not_a_lead" : ""}`);
   } catch (err) {
     console.error(`[${firm.id}][lead] Could not record the decision:`, err.message);
   } finally {
