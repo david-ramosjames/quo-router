@@ -74,7 +74,7 @@ const SECRET_FIELDS = [
   { key: "SLACK_LEGAL_ASSISTANT_WEBHOOK_URL", label: "#legalassistant-phone webhook", secret: true },
   { key: "SLACK_LEAD_CALLS_CHANNEL_ID", label: "#lead-calls channel ID", secret: false },
   { key: "SLACK_LEGAL_ASSISTANT_CHANNEL_ID", label: "#legalassistant-phone channel ID", secret: false },
-  { key: "CASE_DB_URL", label: "Case DB connection string (Supabase Postgres, optional)", secret: true },
+  { key: "CASE_DB_URL", label: "Case DB connection string (Supabase Postgres, optional)", secret: true, revealable: true },
   { key: "EMAIL_WEBHOOK_TOKEN", label: "Inbound email webhook token (optional)", secret: true },
 ];
 
@@ -82,13 +82,19 @@ const SECRET_FIELDS = [
 // then legacy un-prefixed env (default firm only), then UI-stored secrets.
 // Env always wins so an existing env-based deployment can never be overridden
 // by a value saved through the admin UI.
-function resolveFirmSecrets(firmId, storedSecrets) {
+function pickSecretValue(firmId, storedSecrets, key) {
   const upper = firmId.toUpperCase();
-  const perFirm = (key) => process.env[`FIRM_${upper}_${key}`];
-  const legacyOk = firmId === DEFAULT_FIRM_ID && !perFirm("QUO_API_KEY") && !perFirm("SLACK_BOT_TOKEN");
-  const legacy = (key) => (legacyOk ? process.env[key] : undefined);
-  const stored = storedSecrets || {};
-  const pick = (key) => perFirm(key) || legacy(key) || stored[key] || null;
+  const perFirm = process.env[`FIRM_${upper}_${key}`];
+  if (perFirm) return perFirm;
+  const legacyOk = firmId === DEFAULT_FIRM_ID
+    && !process.env[`FIRM_${upper}_QUO_API_KEY`]
+    && !process.env[`FIRM_${upper}_SLACK_BOT_TOKEN`];
+  if (legacyOk && process.env[key]) return process.env[key];
+  return (storedSecrets && storedSecrets[key]) || null;
+}
+
+function resolveFirmSecrets(firmId, storedSecrets) {
+  const pick = (key) => pickSecretValue(firmId, storedSecrets, key);
   return {
     slackLeadCallsChannelId: pick("SLACK_LEAD_CALLS_CHANNEL_ID"),
     slackLegalAssistantChannelId: pick("SLACK_LEGAL_ASSISTANT_CHANNEL_ID"),
@@ -1689,9 +1695,11 @@ async function runIntake(firm, {
   // The intake row keeps the qualifying call's transcript for Docket Flow's
   // "Call Transcript" card. Every call — including this one — is also logged
   // as an interaction so later calls aren't lost (Quo summary + Slack/Quo links).
+  const matter = await findClientMatter(firm, externalPhone || phone);
   await insertInteraction(firm, {
-    intakeCallId: callId, phone: phoneKey(externalPhone || phone), type: callType,
-    direction, sourceId: callId, content: summaryText || null, transcript,
+    intakeCallId: callId, phone: phoneKey(externalPhone || phone),
+    phoneE164: leadPhoneE164(externalPhone || phone), leadId: matter?.leadId || null,
+    type: callType, direction, sourceId: callId, content: summaryText || null, transcript,
     quoLink: deepLink || null, slackPermalink: callSlackPermalink || slackPermalink,
   });
 
@@ -1778,15 +1786,15 @@ async function mergeIntoIntake(firm, intakeCallId, extracted) {
   try {
     client = await connectCaseDb(firm);
     const closed = await client.query(
-      `select signed_case, form_fill_closed_at
+      `select case_id, lead_status
        from public.leads
        where intake_call_id = $1
        limit 1`,
       [intakeCallId],
     ).catch(() => null);
     const lead = closed?.rows?.[0];
-    if (lead && (lead.signed_case || lead.form_fill_closed_at)) {
-      console.log(`[${firm.id}][intake] Form fill stopped — lead for ${intakeCallId} is signed`);
+    if (lead && (lead.case_id || lead.lead_status === "Promoted")) {
+      console.log(`[${firm.id}][intake] Form fill stopped — lead for ${intakeCallId} is promoted`);
       return 0;
     }
     const { rows } = await client.query(`SELECT * FROM ${table} WHERE call_id = $1`, [intakeCallId]);
@@ -1857,6 +1865,8 @@ async function insertInteraction(firm, rec) {
     const cols = {
       intake_call_id: rec.intakeCallId,
       phone: rec.phone,
+      phone_e164: rec.phoneE164 || null,
+      lead_id: rec.leadId || null,
       type: rec.type,
       direction: rec.direction,
       source_id: rec.sourceId,
@@ -1887,31 +1897,92 @@ async function insertInteraction(firm, rec) {
   }
 }
 
-// Capture a follow-up interaction on a tracked number: log it, then (if it has
-// text) extract and merge new details into the intake. Best-effort.
+// The open lead for this phone, if there is one. Promoted matters stay on the
+// same row so a later call is logged against them and does not open a new intake.
+async function findClientMatter(firm, phone) {
+  const phoneE164 = leadPhoneE164(phone);
+  const key = phoneKey(phone);
+  if (!firm.caseDbUrl || (!phoneE164 && !key)) return null;
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const found = await client.query(
+      `select id, intake_call_id, case_id, lead_status
+       from public.leads
+       where ($1::text is not null and phone_e164 = $1)
+          or ($2::text is not null and right(regexp_replace(coalesce(phone, ''), '\\D', '', 'g'), 10) = $2)
+       order by case when case_id is null and lead_status is distinct from 'Promoted' then 0 else 1 end,
+                created_at desc
+       limit 1`,
+      [phoneE164, key || null],
+    );
+    const lead = found.rows[0];
+    if (!lead) return null;
+    let intakeCallId = lead.intake_call_id || null;
+    if (!intakeCallId && key) {
+      const earlier = await client.query(
+        `select intake_call_id
+         from public.intake_interactions
+         where phone = $1 and intake_call_id is not null
+         order by occurred_at desc nulls last
+         limit 1`,
+        [key],
+      );
+      intakeCallId = earlier.rows[0]?.intake_call_id || null;
+    }
+    return {
+      leadId: lead.id,
+      intakeCallId,
+      promoted: Boolean(lead.case_id) || lead.lead_status === "Promoted",
+    };
+  } catch (err) {
+    console.error(`[${firm.id}][history] Could not find the lead:`, err.message);
+    return null;
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
+// Log every call and text. New facts fill empty intake fields until the case
+// is promoted. SMS Follow-Up sends through Quo, so those texts arrive here too.
 async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, slackPermalink, extractText }) {
+  if (!sourceId) return;
+  const matter = await findClientMatter(firm, phone);
   const window = getFollowUpWindow(firm, phone);
-  if (!window || !sourceId) return;
+  const intakeCallId = matter?.intakeCallId || window?.intakeCallId || null;
 
   const { inserted, missingTable } = await insertInteraction(firm, {
-    intakeCallId: window.intakeCallId, phone: phoneKey(phone), type, direction,
-    sourceId, content, transcript, quoLink, slackPermalink,
+    intakeCallId, phone: phoneKey(phone), phoneE164: leadPhoneE164(phone),
+    leadId: matter?.leadId || null, type, direction, sourceId, content, transcript,
+    quoLink, slackPermalink,
   });
-  // Not inserted and the table exists → we already logged this one (dedup), so
-  // don't re-extract. If the table is simply absent, still merge into the intake.
   if (!inserted && !missingTable) return;
   if (inserted) {
-    console.log(`[${firm.id}][follow-up] Logged ${type} for intake ${window.intakeCallId} (${sourceId})`);
+    console.log(`[${firm.id}][history] Logged ${type} for ${intakeCallId || "no intake"} (${sourceId})`);
   }
+  if (matter?.promoted || !intakeCallId) return;
 
-  const text = extractText && extractText.trim();
-  if (!text) return;
+  const text = String(extractText || "").trim();
+  if (text.length < 20) return;
   const extracted = await extractIntake(firm, text);
   if (!extracted) return;
-  const added = await mergeIntoIntake(firm, window.intakeCallId, extracted);
+  const staff = await loadStaffDirectory(firm).catch(() => []);
+  const heardName = extracted.client?.name || null;
+  const staffHit = matchStaff(heardName, staff);
+  if (staffHit && extracted.client) extracted.client.name = null;
+  await rememberClientName(firm, {
+    callId: intakeCallId,
+    phone,
+    clientName: staffHit ? null : heardName,
+    staffName: staffHit ? staffHit.name : null,
+    evidence: staffHit
+      ? `The call used “${heardName}”, which matches ${staffHit.name} on the staff directory.`
+      : `Quo Router heard the client name ${heardName}. The stored name is different.`,
+  }).catch((err) => console.error(`[${firm.id}][lead] Name check failed:`, err.message));
+  const added = await mergeIntoIntake(firm, intakeCallId, extracted);
   if (added > 0) {
-    console.log(`[${firm.id}][follow-up] Merged ${added} field(s) into intake ${window.intakeCallId}`);
-    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, window.intakeCallId)}`,
+    console.log(`[${firm.id}][intake] Merged ${added} field(s) into intake ${intakeCallId}`);
+    await intakeNotify(firm, `📝 *Intake updated* from ${type} — filled ${added} field${added === 1 ? "" : "s"}${intakeLink(firm, intakeCallId)}`,
       { phone });
   }
 }
@@ -3374,15 +3445,11 @@ async function handleMessages(firm, req, res) {
       });
     }
 
-    // Follow-up capture: if this number is in an intake follow-up window, log the
-    // text and merge any new details into the intake. Best-effort.
-    if (getFollowUpWindow(firm, externalPhone)) {
-      const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
-      await captureFollowUp(firm, {
-        phone: externalPhone, type: "text", direction: isOutbound ? "outbound" : "inbound",
-        sourceId: msgId, content: body, quoLink: null, slackPermalink, extractText: body,
-      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
-    }
+    const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
+    await captureFollowUp(firm, {
+      phone: externalPhone, type: "text", direction: isOutbound ? "outbound" : "inbound",
+      sourceId: msgId, content: body, quoLink: null, slackPermalink, extractText: body,
+    }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
   } catch (err) {
     console.error(`[${firm.id}][messages] Error:`, err.message);
   }
@@ -3465,6 +3532,13 @@ async function handleCalls(firm, req, res) {
       }
       console.log(`[${firm.id}][calls] Outbound ${hasVoicemail ? "voicemail left" : "no-answer"}: ${fromDisplay} → ${toDisplay}`);
       await postToCaseChannel(firm, outText, from, to, { skipMentions: true });
+      const outboundPhone = firm.phoneLines[from] ? to : from;
+      const vmTranscript = voicemail && typeof voicemail === "object" ? (voicemail.transcript || voicemail.transcription || "") : "";
+      await captureFollowUp(firm, {
+        phone: outboundPhone, type: hasVoicemail ? "voicemail" : "missed_call",
+        direction: "outbound", sourceId: callId, content: outText,
+        transcript: vmTranscript || null, slackPermalink: null, extractText: vmTranscript,
+      }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
       return;
     }
 
@@ -3513,17 +3587,12 @@ async function handleCalls(firm, req, res) {
 
     await postToCaseChannel(firm, text, from, to);
 
-    // Follow-up capture: missed calls and voicemails on a tracked number. A
-    // voicemail with a transcript feeds the extractor; a bare missed call is
-    // logged as an interaction only (no text to extract).
-    if (getFollowUpWindow(firm, externalPhone)) {
-      const vmTranscript = voicemail && typeof voicemail === "object" ? (voicemail.transcript || voicemail.transcription || "") : "";
-      await captureFollowUp(firm, {
-        phone: externalPhone, type: hasVoicemail ? "voicemail" : "missed_call",
-        direction: "inbound", sourceId: callId, content: text,
-        transcript: vmTranscript || null, slackPermalink, extractText: vmTranscript,
-      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
-    }
+    const vmTranscript = voicemail && typeof voicemail === "object" ? (voicemail.transcript || voicemail.transcription || "") : "";
+    await captureFollowUp(firm, {
+      phone: externalPhone, type: hasVoicemail ? "voicemail" : "missed_call",
+      direction: "inbound", sourceId: callId, content: text,
+      transcript: vmTranscript || null, slackPermalink, extractText: vmTranscript,
+    }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
   } catch (err) {
     console.error(`[${firm.id}][calls] Error:`, err.message);
   }
@@ -3696,22 +3765,32 @@ async function handleCallSummary(firm, req, res) {
         slackPermalink: slackMessagePermalink,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
-    if (getFollowUpWindow(firm, externalPhone)) {
-      const transcript = await fetchCallTranscript(firm, callId);
+    const transcript = await fetchCallTranscript(firm, callId);
+    const matter = await findClientMatter(firm, externalPhone);
+    const laterCall = matter?.promoted || (matter?.intakeCallId && matter.intakeCallId !== callId);
+    if (laterCall) {
       await captureFollowUp(firm, {
         phone: externalPhone, type: sona ? "sona_call" : "call",
         direction: isInbound ? "inbound" : "outbound", sourceId: callId,
         content: summaryText, transcript, quoLink: deepLink,
         slackPermalink: slackMessagePermalink,
         extractText: [transcript, summaryText].filter(Boolean).join("\n\n"),
-      }).catch((err) => console.error(`[${firm.id}][follow-up] Error:`, err.message));
+      }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
     } else {
       await runIntake(firm, {
         callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs,
         slackPermalink: slackThreadPermalink, callSlackPermalink: slackMessagePermalink,
         direction: isInbound ? "inbound" : "outbound", callType: sona ? "sona_call" : "call",
-      })
-        .catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
+      }).catch((err) => console.error(`[${firm.id}][intake] Error:`, err.message));
+      if (!isQualified) {
+        await captureFollowUp(firm, {
+          phone: externalPhone, type: sona ? "sona_call" : "call",
+          direction: isInbound ? "inbound" : "outbound", sourceId: callId,
+          content: summaryText, transcript, quoLink: deepLink,
+          slackPermalink: slackMessagePermalink,
+          extractText: matter?.promoted ? "" : [transcript, summaryText].filter(Boolean).join("\n\n"),
+        }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
+      }
     }
   } catch (err) {
     console.error(`[${firm.id}][call-summary] Error:`, err.message);
@@ -4025,9 +4104,29 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
 // Which credential fields are editable in the UI (metadata only, no values).
 app.get("/admin/api/secret-fields", requireAuth, (_req, res) => {
   res.json({
-    fields: SECRET_FIELDS.map(({ key, label, secret }) => ({ key, label, secret })),
+    fields: SECRET_FIELDS.map(({ key, label, secret, revealable }) => ({
+      key, label, secret, revealable: !!revealable,
+    })),
     encryptionEnabled: !!SECRET_KEY,
     dbConfigured: !!pgPool,
+  });
+});
+
+// Reveal a stored credential the UI is allowed to unhide (Case DB URL today).
+// Other secrets stay write-only — this is opt-in per SECRET_FIELDS.revealable.
+app.get("/admin/api/firms/:id/secrets/:key", requireAuth, (req, res) => {
+  const firm = firms.get(req.params.id);
+  if (!firm) return res.status(404).json({ error: `Firm "${req.params.id}" not found` });
+  const field = SECRET_FIELDS.find((f) => f.key === req.params.key);
+  if (!field?.revealable) {
+    return res.status(403).json({ error: "This credential cannot be revealed" });
+  }
+  const value = pickSecretValue(firm.id, firm.storedSecrets, field.key);
+  if (!value) return res.status(404).json({ error: "Not set" });
+  res.json({
+    key: field.key,
+    value,
+    source: secretSources(firm.id, firm.storedSecrets)[field.key],
   });
 });
 

@@ -117,6 +117,9 @@
   .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 2px; font-weight: 500; cursor: pointer; }
   .checkbox-row input { width: auto; margin: 0; }
   .secret-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .secret-row { display: flex; gap: 8px; align-items: center; }
+  .secret-row input { flex: 1; }
+  .secret-row .reveal-btn { flex-shrink: 0; white-space: nowrap; padding: 8px 12px; }
   .src-tag { font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 10px; }
   .src-tag.env { background: #e0e7ff; color: #3730a3; }
   .src-tag.stored { background: #d1fae5; color: #065f46; }
@@ -353,7 +356,7 @@ FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
 
     <details>
       <summary>Is it safe to store credentials in the database?</summary>
-      <p>The admin panel is gated behind Google OAuth restricted to your domain, and the API never returns stored secret values (the UI only shows "saved / not set / from env"). For defense in depth, set <code>SECRET_ENCRYPTION_KEY</code> to any strong passphrase — credentials are then AES-256-GCM encrypted before they're written to Postgres, so a database dump alone can't reveal them. The key itself lives only in the environment, never in the database. Without it, credentials are stored as plaintext in the DB (still behind the database's own access controls).</p>
+      <p>The admin panel is gated behind Google OAuth restricted to your domain. Most credentials stay write-only in the UI (the list shows "saved / not set / from env"). The Case DB connection string is the exception — signed-in admins can click <strong>Show</strong> to unhide the live value. For defense in depth, set <code>SECRET_ENCRYPTION_KEY</code> to any strong passphrase — credentials are then AES-256-GCM encrypted before they're written to Postgres, so a database dump alone can't reveal them. The key itself lives only in the environment, never in the database. Without it, credentials are stored as plaintext in the DB (still behind the database's own access controls).</p>
     </details>
 
     <details>
@@ -733,12 +736,76 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
         status = '<span class="src-tag stored">saved — leave blank to keep</span>';
         ph = "•••••••• (unchanged)";
       }
+      const canReveal = !!f.revealable;
+      const revealBtn = canReveal
+        ? `<button type="button" class="secondary reveal-btn" data-reveal="${escape(f.key)}">Show</button>`
+        : "";
       return `
         <label class="secret-label">${escape(f.label)} ${status}</label>
-        <input type="${f.secret ? "password" : "text"}" data-secret="${escape(f.key)}" ${disabled}
-          placeholder="${escape(ph)}" autocomplete="off" spellcheck="false">
+        <div class="secret-row">
+          <input type="${f.secret ? "password" : "text"}" data-secret="${escape(f.key)}" ${disabled}
+            placeholder="${escape(ph)}" autocomplete="off" spellcheck="false">
+          ${revealBtn}
+        </div>
       `;
     }).join("");
+    el.querySelectorAll("[data-reveal]").forEach((btn) => {
+      btn.addEventListener("click", () => toggleRevealSecret(btn));
+    });
+  }
+
+  async function toggleRevealSecret(btn) {
+    const key = btn.getAttribute("data-reveal");
+    const inp = document.querySelector(`[data-secret="${CSS.escape(key)}"]`);
+    if (!inp) return;
+    const hiding = inp.type === "text" && inp.dataset.revealed === "1";
+    if (hiding) {
+      inp.type = "password";
+      inp.dataset.revealed = "";
+      btn.textContent = "Show";
+      // Clearing an unedited fetched value keeps "leave blank to keep" on save.
+      if (inp.dataset.fetched === "1" && !inp.disabled && inp.value === inp.dataset.fetchedValue) {
+        inp.value = "";
+        inp.dataset.fetched = "";
+        inp.dataset.fetchedValue = "";
+      }
+      return;
+    }
+    if (inp.value) {
+      inp.type = "text";
+      inp.dataset.revealed = "1";
+      btn.textContent = "Hide";
+      return;
+    }
+    if (!editingId) {
+      inp.type = "text";
+      inp.dataset.revealed = "1";
+      btn.textContent = "Hide";
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const res = await fetch(
+        `/admin/api/firms/${encodeURIComponent(editingId)}/secrets/${encodeURIComponent(key)}`,
+        { credentials: "same-origin" },
+      );
+      if (res.status === 401) { location.reload(); return; }
+      const json = await res.json();
+      if (!res.ok) {
+        msg($("add-result"), "error", escape(json.error || "Could not reveal value"));
+        return;
+      }
+      inp.value = json.value || "";
+      inp.type = "text";
+      inp.dataset.revealed = "1";
+      inp.dataset.fetched = "1";
+      inp.dataset.fetchedValue = inp.value;
+      btn.textContent = "Hide";
+    } catch (err) {
+      msg($("add-result"), "error", `Network error: ${escape(err.message)}`);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   function collectSecrets() {
