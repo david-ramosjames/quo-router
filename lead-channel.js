@@ -28,24 +28,45 @@ function firstEmail(text) {
 
 function labeledValue(text, labels) {
   const pattern = new RegExp(
-    `(?:^|\\n)\\s*\\**\\s*(?:${labels.join("|")})\\s*\\**\\s*:\\s*\\**\\s*([^\\n]+)`,
+    `(?:^|\\n)\\s*(?:[•\\-*]\\s*)*\\*?\\s*(?:${labels.join("|")})\\s*:?\\s*\\*?\\s*:?\\s*([^\\n]+)`,
     "i",
   );
   const raw = String(text || "").match(pattern)?.[1]
-    ?.replace(/<[^>]+>/g, " ")
+    ?.replace(/<[^|>]*\|([^>]+)>/g, "$1")
+    .replace(/<[^>]+>/g, " ")
     .replace(/&amp;/g, "&")
     .replace(/\s+/g, " ")
     .trim() ?? "";
-  if (!raw || /^(other|n\/a|na|none|unknown|yes|no|-)$/i.test(raw)) return null;
+  if (!raw || /^(other|n\/a|na|none|unknown|yes|no|-|null|undefined)$/i.test(raw)) return null;
   return raw;
 }
 
-// Web forms put the client on a labeled line. SMS Follow-Up reads the same
-// post for texts. This saves the name and accident before anyone calls.
+function headingName(text) {
+  return String(text || "").match(
+    /(?:^|\n)\*((?!New lead|Contract path|More details|Details)[A-Z][A-Za-z.'’\-]+(?:\s+[A-Z][A-Za-z.'’\-]+){1,3})\*\s*(?=\n|$)/,
+  )?.[1] ?? null;
+}
+
+function prettySource(raw) {
+  return String(raw || "")
+    .split("/")
+    .map((part) => {
+      const token = part.trim();
+      if (/^cpc$/i.test(token)) return "cpc";
+      if (/^(gmb|cpm|seo)$/i.test(token)) return token.toUpperCase();
+      return token.replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+    })
+    .join(" / ");
+}
+
+// Intake Engine posts the name in bold and again as "*Full name:*", the accident
+// on the question line, and the ad source as "Source: google / cpc".
 export function formFacts(text) {
+  const sourceRaw = String(text || "").match(/(?:^|\n)Source:\s*([^·\n]+)/i)?.[1]?.trim() ?? "";
   return {
-    name: labeledValue(text, ["full name", "client name", "name"]),
-    accident: labeledValue(text, ["type of accident", "case type", "tipo de accidente"]),
+    name: labeledValue(text, ["full name", "client name", "name"]) || headingName(text),
+    accident: labeledValue(text, ["what type of accident[^:\\n]*", "type of accident", "case type", "tipo de accidente"]),
+    source: sourceRaw && !/^(other|n\/a|na|none|unknown|-|null)$/i.test(sourceRaw) ? prettySource(sourceRaw) : null,
   };
 }
 
@@ -226,13 +247,14 @@ export async function absorbLeadChannel(firm, deps) {
              phone_e164 = coalesce(phone_e164, $7),
              slack_channel_id = coalesce(slack_channel_id, $8),
              slack_message_ts = coalesce(slack_message_ts, $9),
-             lead_name = coalesce(nullif(btrim(lead_name), ''), $10),
-             case_type = coalesce(nullif(btrim(case_type), ''), $11)
+             lead_name = coalesce(nullif(nullif(btrim(lead_name), ''), 'null'), $10),
+             case_type = coalesce(nullif(nullif(btrim(case_type), ''), 'null'), $11),
+             lead_source = coalesce(nullif(btrim(lead_source), ''), $12)
            where id = $1`,
           [
             existing.id, caseDetail, Boolean(closed), sequence, kind,
             firstEmail(text), phoneE164, channelId, message.ts,
-            clientName, facts.accident,
+            clientName, facts.accident, facts.source,
           ],
         );
         await saveFormIntake(client, existing.id, clientName, facts.accident, phoneE164, firstEmail(text));
@@ -247,16 +269,16 @@ export async function absorbLeadChannel(firm, deps) {
       }
       const inserted = await client.query(
         `insert into public.leads (
-           lead_date, lead_name, phone, phone_e164, email, case_type, source_channel, lead_status, kind, arrival,
+           lead_date, lead_name, phone, phone_e164, email, case_type, lead_source, source_channel, lead_status, kind, arrival,
            case_detail, sequence, follow_up, slack_channel_id, slack_message_ts
          ) values (
-           current_date, $9, $1, $1, $2, $10, 'Web form', 'New', $3, 'form',
+           current_date, $9, $1, $1, $2, $10, $11, 'Web form', 'New', $3, 'form',
            $4, $5, $6, $7, $8
          )
          returning id`,
         [
           phoneE164, firstEmail(text), kind, caseDetail, sequence,
-          sequence !== "stop", channelId, message.ts, clientName, facts.accident,
+          sequence !== "stop", channelId, message.ts, clientName, facts.accident, facts.source,
         ],
       );
       const id = inserted.rows[0]?.id || null;

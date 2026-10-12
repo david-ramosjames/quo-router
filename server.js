@@ -1576,7 +1576,8 @@ async function rememberClientName(firm, { callId, phone, clientName, staffName, 
     if (lead.signed_case || lead.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(lead.lead_status)) return;
     if (lead.identity_status === "confirmed") return;
 
-    const stored = String(lead.lead_name || "").trim();
+    const storedRaw = String(lead.lead_name || "").trim();
+    const stored = /^(null|undefined)$/i.test(storedRaw) ? "" : storedRaw;
     const storedKey = stored.toLowerCase();
 
     if (staffName && !clientName) {
@@ -1602,7 +1603,7 @@ async function rememberClientName(firm, { callId, phone, clientName, staffName, 
     }
 
     const heard = String(clientName || "").trim();
-    if (!heard) return;
+    if (!heard || /^(null|undefined|none|unknown|n\/a|na|-)$/i.test(heard)) return;
     if (!stored) {
       await client.query(
         `update public.leads set lead_name = $2, identity_status = 'ok' where id = $1`,
