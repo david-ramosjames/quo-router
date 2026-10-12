@@ -5,6 +5,7 @@ import crypto from "crypto";
 import dns from "node:dns";
 import { fileURLToPath } from "url";
 import { absorbLeadChannel, nextSequence } from "./lead-channel.js";
+import { loadStaffDirectory, matchStaff, staffPromptLine } from "./staff-directory.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
 // outbound IPv6 route, and Node 18+ returns DNS results verbatim — so a
@@ -1257,6 +1258,12 @@ async function extractIntake(firm, text) {
     console.warn(`[${firm.id}][intake] No LLM API key set — cannot extract`);
     return null;
   }
+  let staffLine = "";
+  try {
+    staffLine = staffPromptLine(await loadStaffDirectory(firm));
+  } catch (err) {
+    console.error(`[${firm.id}][intake] Staff directory unavailable:`, err.message);
+  }
   return llmExtract({
     label: `${firm.id}][intake`,
     maxTokens: 1500,
@@ -1265,7 +1272,7 @@ async function extractIntake(firm, text) {
     schema: INTAKE_TOOL_SCHEMA,
     system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call summary/transcript. Only include facts EXPLICITLY stated in the call. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If the call is not an accident intake, return mostly nulls.
 
-For the client's home address: put the full address as spoken in client.address, AND split what was actually given into street_address / address_city / address_state / address_zip / address_country. Only fill the parts that were stated — if they only said "Austin, Texas", set address_city and address_state and leave street_address, address_zip and address_country null. Do not infer a state from a city, a ZIP from a city, or a country from anything.`,
+For the client's home address: put the full address as spoken in client.address, AND split what was actually given into street_address / address_city / address_state / address_zip / address_country. Only fill the parts that were stated — if they only said "Austin, Texas", set address_city and address_state and leave street_address, address_zip and address_country null. Do not infer a state from a city, a ZIP from a city, or a country from anything.${staffLine}`,
     user: `Call summary / transcript:\n${text}`,
   });
 }
@@ -1540,6 +1547,86 @@ Reasons are one short sentence each. Do not invent facts.`,
   }
 }
 
+// The intake extraction can hear a coworker’s name. That name is not the client.
+// A blank client name gets filled. A name that disagrees with one already stored
+// is flagged for review and left in place.
+async function rememberClientName(firm, { callId, phone, clientName, staffName, evidence }) {
+  if (!firm.caseDbUrl || (!clientName && !staffName)) return;
+  const phoneE164 = leadPhoneE164(phone);
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    const found = await client.query(
+      `select id, lead_name, identity_status, identity_evidence, signed_case, case_id, lead_status
+       from public.leads
+       where ($1::text is not null and intake_call_id = $1)
+          or ($2::text is not null and phone_e164 = $2)
+       order by case when intake_call_id = $1 then 0 else 1 end, created_at desc
+       limit 1`,
+      [callId || null, phoneE164],
+    );
+    const lead = found.rows[0];
+    if (!lead) return;
+    if (lead.signed_case || lead.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(lead.lead_status)) return;
+    if (lead.identity_status === "confirmed") return;
+
+    const stored = String(lead.lead_name || "").trim();
+    const storedKey = stored.toLowerCase();
+
+    if (staffName && !clientName) {
+      const staffKey = staffName.trim().toLowerCase();
+      if (stored && storedKey !== staffKey) return;
+      if (lead.identity_status === "needs_review" && lead.identity_evidence === evidence) return;
+      await client.query(
+        `update public.leads set
+           identity_status = 'needs_review',
+           identity_evidence = $2,
+           needs_verification = true,
+           owner_name = coalesce(owner_name, $3)
+         where id = $1`,
+        [lead.id, evidence, staffName],
+      );
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, 'identity_flagged', 'quo-router', $2::jsonb)`,
+        [lead.id, JSON.stringify({ staff: staffName })],
+      );
+      console.log(`[${firm.id}][lead] Flagged ${lead.id} because the heard name matches staff`);
+      return;
+    }
+
+    const heard = String(clientName || "").trim();
+    if (!heard) return;
+    if (!stored) {
+      await client.query(
+        `update public.leads set lead_name = $2, identity_status = 'ok' where id = $1`,
+        [lead.id, heard],
+      );
+      console.log(`[${firm.id}][lead] Filled the client name on ${lead.id}`);
+      return;
+    }
+    if (storedKey !== heard.toLowerCase() && lead.identity_evidence !== evidence) {
+      await client.query(
+        `update public.leads set
+           identity_status = 'needs_review',
+           identity_evidence = $2,
+           needs_verification = true
+         where id = $1`,
+        [lead.id, evidence],
+      );
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, 'identity_flagged', 'quo-router', $2::jsonb)`,
+        [lead.id, JSON.stringify({ heard })],
+      );
+    }
+  } catch (err) {
+    console.error(`[${firm.id}][lead] Could not apply the client name:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
 async function runIntake(firm, {
   callId, deepLink, summaryText, externalPhone, isQualified, leadParentTs = null,
   slackPermalink = null, callSlackPermalink = null, direction = "inbound", callType = "call",
@@ -1566,7 +1653,23 @@ async function runIntake(firm, {
     console.warn(`[${firm.id}][intake] Nothing extracted for ${callId}`);
     return;
   }
-  const name = extracted.client?.name || null;
+  const staff = await loadStaffDirectory(firm).catch((err) => {
+    console.error(`[${firm.id}][intake] Staff directory unavailable:`, err.message);
+    return [];
+  });
+  const heardName = extracted.client?.name || null;
+  const staffHit = matchStaff(heardName, staff);
+  if (staffHit && extracted.client) extracted.client.name = null;
+  const name = staffHit ? null : heardName;
+  await rememberClientName(firm, {
+    callId,
+    phone: externalPhone,
+    clientName: name,
+    staffName: staffHit ? staffHit.name : null,
+    evidence: staffHit
+      ? `The call used “${heardName}”, which matches ${staffHit.name} on the staff directory.`
+      : `Quo Router heard the client name ${heardName}. The stored name is different.`,
+  }).catch((err) => console.error(`[${firm.id}][lead] Name check failed:`, err.message));
   const accidentDate = extracted.accident?.date || null;
   // Store the actual Quo caller number (reliable for follow-up matching), not the
   // model-extracted one. The extracted client phone stays inside data.client.phone.
