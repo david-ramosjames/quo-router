@@ -1441,6 +1441,29 @@ function callIsNotALead(text, score) {
   return /\b(property issue|neighbor encroaching|not a personal[- ]injury|outside (?:the |our )?firm'?s work|wrong number)\b/i.test(body);
 }
 
+function chicagoToday() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+// Same answer Intake Manager stores. Desired stays blank until a consultation call exists.
+function desiredCase({ consultationDate, grade, tags, declineReason, closeReason, leadStatus, signed, qualified }) {
+  if (!consultationDate) return null;
+  const list = Array.isArray(tags) ? tags : [];
+  const declined = Boolean(declineReason) || list.some((tag) => String(tag).startsWith("DEC:"));
+  const qualifiedNo = list.includes("QUALIFIED NO") || qualified === false;
+  const qualifiedYes = list.includes("QUALIFIED YES") || qualified === true;
+  const notALead = closeReason === "not_a_lead" || leadStatus === "Lost";
+  const letter = String(grade || "").toUpperCase();
+  if (notALead || declined || qualifiedNo || letter === "C") return false;
+  if (signed || qualifiedYes || letter === "A" || letter === "B") return true;
+  return null;
+}
+
 // Grade and sentiment are decisions on the lead. A new call may revise both.
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
@@ -1468,13 +1491,15 @@ async function recordLeadDecision(firm, {
           sentiment_reason: { type: ["string", "null"] },
           not_a_lead: { type: "boolean" },
           not_a_lead_reason: { type: ["string", "null"] },
+          consultation: { type: "boolean" },
         },
-        required: ["grade", "grade_reason", "sentiment", "sentiment_reason", "not_a_lead", "not_a_lead_reason"],
+        required: ["grade", "grade_reason", "sentiment", "sentiment_reason", "not_a_lead", "not_a_lead_reason", "consultation"],
       },
       system: `You score one call for a Texas personal injury firm.
 grade is the personal-injury strength of the case, not how far the lead has gotten. A is a clear injury matter such as a car, truck, motorcycle, or pedestrian crash. B is a possible but thin injury. C is no injury or outside the firm's work. Use null only when the call has no facts. The dashboard combines this grade with whether the firm still needs contact, more facts, or a signature.
 sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
 not_a_lead is true only when this call shows the person is not a personal-injury lead: a property dispute, a matter the firm does not take, a wrong number, or someone already sent to another firm. It is false when there is a possible injury, even a thin one, or when the call does not say. Do not mark not_a_lead because the caller is unsure or the firm still needs facts.
+consultation is true only when this phone call itself was the consultation: the firm and the caller talked through the accident, the injuries, or whether the firm would take the case. It is false for a missed call, a voicemail, a call that only scheduled a later consultation, or a call that never became a real conversation. Scheduling a consultation is not the consultation.
 Reasons are one short sentence each. Do not invent facts.`,
       user: sourceText.slice(0, 6000),
     });
@@ -1487,7 +1512,8 @@ Reasons are one short sentence each. Do not invent facts.`,
     client = await connectCaseDb(firm);
     const found = await client.query(
       `select id, kind, sequence, intake_call_id, signed_case, case_id, lead_status,
-              agreement_status, agreement_sent_at
+              agreement_status, agreement_sent_at, consultation_date, grade,
+              callrail_tags, qualified, decline_reason, close_reason
        from public.leads
        where ($1::text is not null and intake_call_id = $1)
           or ($2::text is not null and phone_e164 = $2
@@ -1513,6 +1539,20 @@ Reasons are one short sentence each. Do not invent facts.`,
       existing: existing?.sequence || null,
     });
     const detailLine = summaryText ? `Call: ${summaryText}` : null;
+    const thisConsult = score?.consultation === true;
+    const consultDate = existing?.consultation_date || (thisConsult ? chicagoToday() : null);
+    const gradeNow = grade || existing?.grade || null;
+    const desired = desiredCase({
+      consultationDate: consultDate,
+      grade: gradeNow,
+      tags: existing?.callrail_tags || [],
+      declineReason: existing?.decline_reason || null,
+      closeReason: closeNow ? "not_a_lead" : (existing?.close_reason || null),
+      leadStatus: closeNow ? "Lost" : (existing?.lead_status || "New"),
+      signed: Boolean(existing?.signed_case),
+      qualified: existing?.qualified ?? null,
+    });
+    const newConsultDate = existing?.consultation_date ? null : (thisConsult ? consultDate : null);
 
     if (existing) {
       if (existing.signed_case || existing.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(existing.lead_status)) {
@@ -1545,12 +1585,19 @@ Reasons are one short sentence each. Do not invent facts.`,
              when case_detail is null or case_detail = '' then $13
              when position($13 in case_detail) > 0 then case_detail
              else right(case_detail || E'\n\n' || $13, 15000)
-           end
+           end,
+           consultation_date = coalesce(consultation_date, $15::date),
+           consultation = case
+             when consultation_date is not null then consultation
+             when $15::date is null then consultation
+             else 'quo-router'
+           end,
+           desired_case = $16
          where id = $1`,
         [
           existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
           slackPermalink || null, grade, gradeReason, sentiment, score?.sentiment_reason || null,
-          sequence, detailLine, closeNow,
+          sequence, detailLine, closeNow, newConsultDate, desired,
         ],
       );
       if (closeNow) {
@@ -1567,10 +1614,13 @@ Reasons are one short sentence each. Do not invent facts.`,
         [
           existing.id,
           closeNow ? "not_a_lead" : "scored",
-          JSON.stringify({ grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null }),
+          JSON.stringify({
+            grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null,
+            consultation: thisConsult, consultation_date: consultDate, desired_case: desired,
+          }),
         ],
       );
-      console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}${closeNow ? " not_a_lead" : ""}`);
+      console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}${thisConsult ? " consultation" : ""}${closeNow ? " not_a_lead" : ""}`);
       return;
     }
 
@@ -1579,14 +1629,15 @@ Reasons are one short sentence each. Do not invent facts.`,
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, case_detail, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
          grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up,
-         close_reason
+         close_reason, consultation_date, consultation, desired_case
        ) values (
          current_date, $1, $2, 'Call', 'Call', case when $16 then 'Lost' else 'New' end, $3, $4,
          $5, $14, $15, $6, $7, $8, $9,
          $10, $11, case when $10::text is null then null else 'quo-router' end,
          $12, $13, case when $12::text is null then null else 'quo-router' end,
          case when $16 then false else true end,
-         case when $16 then 'not_a_lead' else null end
+         case when $16 then 'not_a_lead' else null end,
+         $17, case when $17::date is null then null else 'quo-router' end, $18
        )
        on conflict (intake_call_id) do nothing
        returning id`,
@@ -1594,6 +1645,7 @@ Reasons are one short sentence each. Do not invent facts.`,
         phone || null, phoneE164, kind, arrival || null, summaryText, quoLink || null, callId || null,
         handledBy || null, slackPermalink || null, grade, gradeReason,
         sentiment, score?.sentiment_reason || null, detailLine, sequence, closeNow,
+        newConsultDate, desired,
       ],
     );
     const id = inserted.rows[0]?.id;
@@ -1604,10 +1656,13 @@ Reasons are one short sentence each. Do not invent facts.`,
       [
         id,
         closeNow ? "not_a_lead" : "scored",
-        JSON.stringify({ grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null }),
+        JSON.stringify({
+          grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null,
+          consultation: thisConsult, consultation_date: consultDate, desired_case: desired,
+        }),
       ],
     );
-    console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}${closeNow ? " not_a_lead" : ""}`);
+    console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}${thisConsult ? " consultation" : ""}${closeNow ? " not_a_lead" : ""}`);
   } catch (err) {
     console.error(`[${firm.id}][lead] Could not record the decision:`, err.message);
   } finally {
