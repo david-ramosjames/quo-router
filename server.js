@@ -1712,10 +1712,10 @@ Reasons are one short sentence each. Do not invent facts.`,
        from public.leads
        where ($1::text is not null and intake_call_id = $1)
           or ($2::text is not null and phone_e164 = $2
-              and signed_case = false
-              and case_id is null
-              and lead_status not in ('Lost', 'Referred', 'Promoted', 'Signed'))
-       order by case when intake_call_id = $1 then 0 else 1 end, created_at desc
+              and lead_status not in ('Lost', 'Referred'))
+       order by case when intake_call_id = $1 then 0 else 1 end,
+                case when signed_case or case_id is not null or lead_status in ('Signed', 'Promoted') then 0 else 1 end,
+                created_at desc
        limit 1`,
       [callId || null, phoneE164],
     );

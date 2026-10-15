@@ -209,9 +209,10 @@ export async function absorbLeadChannel(firm, deps) {
          from public.leads
          where (slack_channel_id = $1 and slack_message_ts = $2)
             or ($3::text is not null and phone_e164 = $3
-                and signed_case = false and case_id is null
-                and lead_status not in ('Lost', 'Referred', 'Promoted', 'Signed'))
-         order by case when slack_message_ts = $2 then 0 else 1 end, created_at desc
+                and lead_status not in ('Lost', 'Referred'))
+         order by case when slack_message_ts = $2 then 0 else 1 end,
+                  case when signed_case or case_id is not null or lead_status in ('Signed', 'Promoted') then 0 else 1 end,
+                  created_at desc
          limit 1`,
         [channelId, message.ts, phoneE164],
       );
