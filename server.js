@@ -4056,15 +4056,17 @@ async function handleCallSummary(firm, req, res) {
     let slackMessagePermalink = null;
     let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
-    const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
-    if (isLead || bucket) {
+    // Slack routing is still isLead: qualified and unqualified leads (including
+    // outside-practice) go to #lead-calls. Excluded buckets (vendor, existing
+    // client, spam, insurance, …) keep their tags in Intake Manager but do not
+    // get a new lead-calls post — they only thread if this phone already has one.
+    if (isLead) {
+      const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
       const qualTag = bucket === "non_pi"
         ? "📋 *Lead · Outside practice*"
-        : bucket
-          ? `*${BUCKET_LABEL[bucket] || leadLabel}*`
-          : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
+        : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
       const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
-      const leadPostOpts = sona && isLead ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
+      const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
       slackMessagePermalink = leadPost?.permalink || null;
       leadParentTs = leadPost?.parentTs || null;
@@ -4090,8 +4092,8 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
-    let threadedInLeads = !!isLead || !!bucket;
-    if (!isLead && !bucket) {
+    let threadedInLeads = !!isLead;
+    if (!isLead) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
       const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
       threadedInLeads = !!threadPost;
