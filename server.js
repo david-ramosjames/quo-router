@@ -1430,14 +1430,14 @@ function leadPhoneE164(phone) {
   return null;
 }
 
-// A property dispute, a wrong number, or anything outside personal injury is not a lead.
-// A real crash, fall, bite, or work injury stays a lead even if the caller also says "property".
+// A property dispute or a wrong number is not a lead.
+// A crash, fall, bite, or work injury stays a lead. Workers' compensation, no other driver, and no consultation yet do not change that.
 function callIsNotALead(text, score) {
-  if (score && score.not_a_lead === true) return true;
   const body = String(text || "");
-  if (/\b(car accident|truck|motorcycle|pedestrian|rear-?ended|slip and fall|dog bite|workers?'? compensation|18-wheeler)\b/i.test(body)) {
+  if (/\b(work(?:place)? injur(?:y|ies)|work accident|workers?'? compensation|company vehicle|on the job|car accident|truck|motorcycle|pedestrian|rear-?ended|slip and fall|dog bite|18-wheeler)\b/i.test(body)) {
     return false;
   }
+  if (score && score.not_a_lead === true) return true;
   return /\b(property issue|neighbor encroaching|not a personal[- ]injury|outside (?:the |our )?firm'?s work|wrong number)\b/i.test(body);
 }
 
@@ -1450,25 +1450,218 @@ function chicagoToday() {
   }).format(new Date());
 }
 
-// Same answer Intake Manager stores. Desired stays blank until a consultation call exists.
-function desiredCase({ consultationDate, grade, tags, declineReason, closeReason, leadStatus, signed, qualified }) {
-  if (!consultationDate) return null;
-  const list = Array.isArray(tags) ? tags : [];
-  const declined = Boolean(declineReason) || list.some((tag) => String(tag).startsWith("DEC:"));
-  const qualifiedNo = list.includes("QUALIFIED NO") || qualified === false;
-  const qualifiedYes = list.includes("QUALIFIED YES") || qualified === true;
-  const notALead = closeReason === "not_a_lead" || leadStatus === "Lost";
-  const letter = String(grade || "").toUpperCase();
-  if (notALead || declined || qualifiedNo || letter === "C") return false;
-  if (signed || qualifiedYes || letter === "A" || letter === "B") return true;
-  return null;
+const BUCKET_LABEL = {
+  spam: "Excluded · Spam / robocall",
+  vendor: "Excluded · Vendor",
+  employment: "Excluded · Employment inquiry",
+  existing_client: "Excluded · Existing client",
+  insurance: "Excluded · Insurance company",
+  other_law_office: "Excluded · Other law office",
+  wrong_number: "Excluded · Wrong number",
+  return_call: "Return call",
+  non_pi: "Lead · Outside practice",
+};
+
+// Store the classification without putting an excluded call into the work queue.
+// A return call is merged onto the lead that phone already has.
+// A non-PI legal inquiry is still a lead, then closed as outside practice.
+async function recordClassifiedCall(firm, {
+  phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+}) {
+  if (!firm.caseDbUrl || !bucket) return;
+  const phoneE164 = leadPhoneE164(phone);
+  if (!phoneE164 && !callId) return;
+  const summaryText = String(summary || "").trim().slice(0, 2000) || null;
+  const outside = bucket === "non_pi";
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    if (bucket === "return_call" && phoneE164) {
+      const found = await client.query(
+        `select id from public.leads
+         where phone_e164 = $1
+         order by created_at desc
+         limit 1`,
+        [phoneE164],
+      );
+      const existing = found.rows[0];
+      if (existing) {
+        const detail = summaryText ? `Return call: ${summaryText}` : null;
+        await client.query(
+          `update public.leads set
+             summary = coalesce(summary, $2),
+             quo_link = coalesce(quo_link, $3),
+             slack_permalink = coalesce(slack_permalink, $4),
+             case_detail = case
+               when $5::text is null then case_detail
+               when case_detail is null or case_detail = '' then $5
+               when position($5 in case_detail) > 0 then case_detail
+               else right(case_detail || E'\n\n' || $5, 15000)
+             end
+           where id = $1`,
+          [existing.id, summaryText, quoLink || null, slackPermalink || null, detail],
+        );
+        await client.query(
+          `insert into public.lead_events (lead_id, event_type, actor, payload)
+           values ($1, 'return_call', 'quo-router', $2::jsonb)`,
+          [existing.id, JSON.stringify({ call_id: callId || null })],
+        );
+        console.log(`[${firm.id}][lead] Return call merged into ${existing.id}`);
+        return;
+      }
+    }
+
+    const byCall = callId
+      ? await client.query(
+        `select id, signed_case, case_id, lead_status from public.leads where intake_call_id = $1 limit 1`,
+        [callId],
+      )
+      : { rows: [] };
+    const row = byCall.rows[0];
+    if (row?.signed_case || row?.case_id || ["Promoted", "Signed"].includes(row?.lead_status)) return;
+
+    if (outside) {
+      const reason = "Sought legal help outside personal injury.";
+      if (row && !["Lost", "Referred"].includes(row.lead_status)) {
+        await client.query(
+          `update public.leads set
+             caller_class = 'non_pi',
+             close_suggestion = 'decline',
+             grade = coalesce(grade, 'C'),
+             grade_reason = $2,
+             grade_source = 'quo-router',
+             summary = coalesce(summary, $3),
+             slack_permalink = coalesce(slack_permalink, $4)
+           where id = $1`,
+          [row.id, reason, summaryText, slackPermalink || null],
+        );
+        await client.query(
+          `insert into public.lead_events (lead_id, event_type, actor, payload)
+           values ($1, 'close_suggested', 'quo-router', $2::jsonb)`,
+          [row.id, JSON.stringify({ close_suggestion: "decline", call_id: callId || null })],
+        );
+        console.log(`[${firm.id}][lead] Suggested decline for ${row.id}`);
+        return;
+      }
+      if (!row) {
+        const inserted = await client.query(
+          `insert into public.leads (
+             lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
+             summary, quo_link, intake_call_id, owner_name, slack_permalink,
+             grade, grade_reason, grade_source, follow_up, caller_class, close_suggestion
+           ) values (
+             current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
+             $4, $5, $6, $7, $8,
+             'C', $9, 'quo-router', true, 'non_pi', 'decline'
+           )
+           on conflict (intake_call_id) do nothing
+           returning id`,
+          [
+            phone || null, phoneE164, arrival || null, summaryText, quoLink || null, callId || null,
+            handledBy || null, slackPermalink || null, reason,
+          ],
+        );
+        const id = inserted.rows[0]?.id;
+        if (id) {
+          await client.query(
+            `insert into public.lead_events (lead_id, event_type, actor, payload)
+             values ($1, 'close_suggested', 'quo-router', $2::jsonb)`,
+            [id, JSON.stringify({ close_suggestion: "decline", call_id: callId || null })],
+          );
+          console.log(`[${firm.id}][lead] Opened outside-practice lead ${id} for a person to decline or refer`);
+        }
+        return;
+      }
+    }
+
+    const closeReason = "not_a_lead";
+    const grade = outside ? "C" : null;
+    const reason = outside ? "Sought legal help outside personal injury." : (BUCKET_LABEL[bucket] || bucket);
+    const decline = outside ? "Referred" : null;
+    const tags = outside ? ["QUALIFIED NO", "DEC: Referred"] : null;
+    if (row) {
+      await client.query(
+        `update public.leads set
+           caller_class = $2,
+           lead_status = 'Lost',
+           follow_up = false,
+           sequence = 'stop',
+           close_reason = $3,
+           grade = coalesce($4, grade),
+           grade_reason = $5,
+           grade_source = case when $4::text is null then grade_source else 'quo-router' end,
+           decline_reason = coalesce($6, decline_reason),
+           callrail_tags = case
+             when $7::text[] is null then callrail_tags
+             else (
+               select coalesce(array_agg(distinct tag), '{}')
+               from unnest(coalesce(callrail_tags, '{}'::text[]) || $7::text[]) as tag
+             )
+           end,
+           summary = coalesce($8, summary),
+           slack_permalink = coalesce($9, slack_permalink)
+         where id = $1`,
+        [row.id, bucket, closeReason, grade, reason, decline, tags, summaryText, slackPermalink || null],
+      );
+      await client.query(
+        `update public.lead_jobs set status = 'skipped', detail = $2 where lead_id = $1 and status = 'pending'`,
+        [row.id, reason],
+      );
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, $2, 'quo-router', $3::jsonb)`,
+        [row.id, outside ? "outside_practice" : "not_a_lead", JSON.stringify({ caller_class: bucket, call_id: callId || null })],
+      );
+      console.log(`[${firm.id}][lead] Classified ${row.id} as ${bucket}`);
+      return;
+    }
+
+    const inserted = await client.query(
+      `insert into public.leads (
+         lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
+         summary, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
+         grade, grade_reason, grade_source, follow_up, close_reason, caller_class,
+         decline_reason, callrail_tags
+       ) values (
+         current_date, $1, $2, 'Call', 'Call', 'Lost', 'needs_info', $3,
+         $4, 'stop', $5, $6, $7, $8,
+         $9, $10, case when $9::text is null then null else 'quo-router' end,
+         false, $11, $12,
+         $13, $14::text[]
+       )
+       on conflict (intake_call_id) do nothing
+       returning id`,
+      [
+        phone || null, phoneE164, arrival || null, summaryText, quoLink || null, callId || null,
+        handledBy || null, slackPermalink || null, grade, reason, closeReason, bucket, decline, tags,
+      ],
+    );
+    const id = inserted.rows[0]?.id;
+    if (!id) return;
+    await client.query(
+      `insert into public.lead_events (lead_id, event_type, actor, payload)
+       values ($1, $2, 'quo-router', $3::jsonb)`,
+      [id, outside ? "outside_practice" : "not_a_lead", JSON.stringify({ caller_class: bucket, call_id: callId || null })],
+    );
+    console.log(`[${firm.id}][lead] Stored ${bucket} call ${id} outside the work queue`);
+  } catch (err) {
+    console.error(`[${firm.id}][lead] Could not store classification:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
 }
 
 // Grade and sentiment are decisions on the lead. A new call may revise both.
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
-  phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+  phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
 }) {
+  if (bucket) {
+    await recordClassifiedCall(firm, {
+      phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+    });
+    return;
+  }
   if (!firm.caseDbUrl) return;
   const phoneE164 = leadPhoneE164(phone);
   if (!phoneE164 && !callId) return;
@@ -1491,15 +1684,17 @@ async function recordLeadDecision(firm, {
           sentiment_reason: { type: ["string", "null"] },
           not_a_lead: { type: "boolean" },
           not_a_lead_reason: { type: ["string", "null"] },
+          not_interested: { type: "boolean" },
           consultation: { type: "boolean" },
         },
-        required: ["grade", "grade_reason", "sentiment", "sentiment_reason", "not_a_lead", "not_a_lead_reason", "consultation"],
+        required: ["grade", "grade_reason", "sentiment", "sentiment_reason", "not_a_lead", "not_a_lead_reason", "not_interested", "consultation"],
       },
       system: `You score one call for a Texas personal injury firm.
-grade is the personal-injury strength of the case, not how far the lead has gotten. A is a clear injury matter such as a car, truck, motorcycle, or pedestrian crash. B is a possible but thin injury. C is no injury or outside the firm's work. Use null only when the call has no facts. The dashboard combines this grade with whether the firm still needs contact, more facts, or a signature.
+grade is the personal-injury strength of the case, not how far the lead has gotten. A is a clear injury matter such as a car, truck, motorcycle, pedestrian, or workplace injury. B is a possible but thin injury. C is no injury or a matter outside personal injury. Use null only when the call has no facts. A work injury is not grade C only because workers' compensation is involved.
 sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
-not_a_lead is true only when this call shows the person is not a personal-injury lead: a property dispute, a matter the firm does not take, a wrong number, or someone already sent to another firm. It is false when there is a possible injury, even a thin one, or when the call does not say. Do not mark not_a_lead because the caller is unsure or the firm still needs facts.
-consultation is true only when this phone call itself was the consultation: the firm and the caller talked through the accident, the injuries, or whether the firm would take the case. It is false for a missed call, a voicemail, a call that only scheduled a later consultation, or a call that never became a real conversation. Scheduling a consultation is not the consultation.
+not_a_lead is true only when this call is not someone seeking legal help: spam, a vendor, an employment inquiry, an existing client, an insurance company, another law office, or a wrong number. It is false when the person wants legal help, including immigration, criminal, family, or any other matter outside personal injury. Those are still leads. A workplace injury, work accident, or workers' compensation question is a lead even when the team has not consulted yet, workers' compensation insurance exists, or no other driver was involved. It is false when there is a possible injury, even a thin one, or when the call does not say. Do not mark not_a_lead because the caller is unsure or the firm still needs facts.
+not_interested is true only when the caller rejects the firm or says they are no longer interested. It is false when they are unsure, shopping, or still willing to talk.
+consultation is true only when this phone call itself was a meaningful back-and-forth about an injury, not a brief question. It is false for a missed call, a voicemail, a call that only scheduled a later consultation, or a call that never became a real conversation. Scheduling a consultation is not the consultation. Whether the firm wants the case is not the consultation.
 Reasons are one short sentence each. Do not invent facts.`,
       user: sourceText.slice(0, 6000),
     });
@@ -1528,9 +1723,12 @@ Reasons are one short sentence each. Do not invent facts.`,
     const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
     const contractOut = Boolean(existing?.agreement_sent_at)
       || ["sent", "viewed", "signed", "completed"].includes(existing?.agreement_status || "");
-    const closeNow = callIsNotALead(sourceText, score) && !contractOut;
-    const grade = closeNow ? "C" : (score && ["A", "B", "C"].includes(score.grade) ? score.grade : null);
-    const gradeReason = closeNow
+    const flagged = callIsNotALead(sourceText, score) && !contractOut;
+    const suggestion = flagged ? "not_a_lead" : score?.not_interested ? "not_interested" : null;
+    // Decline, rejection, and not-a-lead stay open until a person confirms them.
+    const closeNow = false;
+    const grade = flagged ? "C" : (score && ["A", "B", "C"].includes(score.grade) ? score.grade : null);
+    const gradeReason = flagged
       ? (score?.not_a_lead_reason || score?.grade_reason || "Not a personal-injury lead.")
       : (score?.grade_reason || null);
     const sequence = closeNow ? "stop" : nextSequence({
@@ -1541,18 +1739,25 @@ Reasons are one short sentence each. Do not invent facts.`,
     const detailLine = summaryText ? `Call: ${summaryText}` : null;
     const thisConsult = score?.consultation === true;
     const consultDate = existing?.consultation_date || (thisConsult ? chicagoToday() : null);
-    const gradeNow = grade || existing?.grade || null;
-    const desired = desiredCase({
-      consultationDate: consultDate,
-      grade: gradeNow,
-      tags: existing?.callrail_tags || [],
-      declineReason: existing?.decline_reason || null,
-      closeReason: closeNow ? "not_a_lead" : (existing?.close_reason || null),
-      leadStatus: closeNow ? "Lost" : (existing?.lead_status || "New"),
-      signed: Boolean(existing?.signed_case),
-      qualified: existing?.qualified ?? null,
-    });
+    const markDesired = contractOut;
     const newConsultDate = existing?.consultation_date ? null : (thisConsult ? consultDate : null);
+    async function suggestPriority(leadId) {
+      if (grade !== "A" || contractOut || suggestion || !leadId) return;
+      const reason = String(gradeReason || "Clear injury matter.").slice(0, 240);
+      await client.query(
+        `update public.leads
+         set priority_suggestion = $2
+         where id = $1
+           and priority = false
+           and priority_suggestion is null
+           and priority_suggestion_dismissed = false
+           and signed_case = false
+           and agreement_sent_at is null
+           and coalesce(agreement_status, '') not in ('sent', 'viewed', 'signed', 'completed')
+           and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
+        [leadId, reason],
+      );
+    }
 
     if (existing) {
       if (existing.signed_case || existing.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(existing.lead_status)) {
@@ -1592,20 +1797,21 @@ Reasons are one short sentence each. Do not invent facts.`,
              when $15::date is null then consultation
              else 'quo-router'
            end,
-           desired_case = $16
+           desired_case = case when $16::boolean then true else desired_case end,
+           desired_source = case when $16::boolean and desired_source is null then 'contract' else desired_source end
          where id = $1`,
         [
           existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
           slackPermalink || null, grade, gradeReason, sentiment, score?.sentiment_reason || null,
-          sequence, detailLine, closeNow, newConsultDate, desired,
+          sequence, detailLine, closeNow, newConsultDate, markDesired,
         ],
       );
-      if (closeNow) {
+      await suggestPriority(existing.id);
+      if (suggestion) {
         await client.query(
-          `update public.lead_jobs
-           set status = 'skipped', detail = 'Not a lead'
-           where lead_id = $1 and status = 'pending'`,
-          [existing.id],
+          `update public.leads set close_suggestion = $2
+           where id = $1 and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
+          [existing.id, suggestion],
         );
       }
       await client.query(
@@ -1613,10 +1819,10 @@ Reasons are one short sentence each. Do not invent facts.`,
          values ($1, $2, 'quo-router', $3::jsonb)`,
         [
           existing.id,
-          closeNow ? "not_a_lead" : "scored",
+          suggestion ? "close_suggested" : "scored",
           JSON.stringify({
-            grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null,
-            consultation: thisConsult, consultation_date: consultDate, desired_case: desired,
+            grade, sentiment, kind, close_suggestion: suggestion, call_id: callId || null,
+            consultation: thisConsult, consultation_date: consultDate, desired_case: markDesired,
           }),
         ],
       );
@@ -1629,7 +1835,7 @@ Reasons are one short sentence each. Do not invent facts.`,
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, case_detail, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
          grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up,
-         close_reason, consultation_date, consultation, desired_case
+         close_reason, consultation_date, consultation, desired_case, desired_source
        ) values (
          current_date, $1, $2, 'Call', 'Call', case when $16 then 'Lost' else 'New' end, $3, $4,
          $5, $14, $15, $6, $7, $8, $9,
@@ -1637,7 +1843,9 @@ Reasons are one short sentence each. Do not invent facts.`,
          $12, $13, case when $12::text is null then null else 'quo-router' end,
          case when $16 then false else true end,
          case when $16 then 'not_a_lead' else null end,
-         $17, case when $17::date is null then null else 'quo-router' end, $18
+         $17, case when $17::date is null then null else 'quo-router' end,
+         case when $18::boolean then true else null end,
+         case when $18::boolean then 'contract' else null end
        )
        on conflict (intake_call_id) do nothing
        returning id`,
@@ -1645,20 +1853,27 @@ Reasons are one short sentence each. Do not invent facts.`,
         phone || null, phoneE164, kind, arrival || null, summaryText, quoLink || null, callId || null,
         handledBy || null, slackPermalink || null, grade, gradeReason,
         sentiment, score?.sentiment_reason || null, detailLine, sequence, closeNow,
-        newConsultDate, desired,
+        newConsultDate, markDesired,
       ],
     );
     const id = inserted.rows[0]?.id;
     if (!id) return;
+    await suggestPriority(id);
+    if (suggestion) {
+      await client.query(
+        `update public.leads set close_suggestion = $2 where id = $1`,
+        [id, suggestion],
+      );
+    }
     await client.query(
       `insert into public.lead_events (lead_id, event_type, actor, payload)
        values ($1, $2, 'quo-router', $3::jsonb)`,
       [
         id,
-        closeNow ? "not_a_lead" : "scored",
+        suggestion ? "close_suggested" : "scored",
         JSON.stringify({
           grade, sentiment, kind, not_a_lead: closeNow, call_id: callId || null,
-          consultation: thisConsult, consultation_date: consultDate, desired_case: desired,
+          consultation: thisConsult, consultation_date: consultDate, desired_case: markDesired,
         }),
       ],
     );
@@ -3418,11 +3633,11 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     // through to classification — they may be calling about a new matter.
     if (isActiveClient(firm, phone)) {
       console.log(`[${firm.id}][lead] Skipping — existing client: ${getContactName(firm, phone)}`);
-      return { isLead: false, isQualified: false, label: "No (Existing Client)" };
+      return { isLead: false, isQualified: false, bucket: "existing_client", label: "Excluded · Existing client" };
     }
     if (isKnownBusiness(firm, phone)) {
       console.log(`[${firm.id}][lead] Skipping — known business: ${getContactName(firm, phone)}`);
-      return { isLead: false, isQualified: false, label: "No (Known Business)" };
+      return { isLead: false, isQualified: false, bucket: "vendor", label: "Excluded · Vendor" };
     }
   }
 
@@ -3438,12 +3653,12 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
       : typeof s === "string" ? `empty string`
       : typeof s;
     console.warn(`[${firm.id}][lead] No text to classify — Quo status="${obj.status || "?"}", summary=${shape}, keys: [${Object.keys(obj).join(", ") || "none"}]`);
-    return { isLead: false, isQualified: false, label: "No (No Summary)" };
+    return { isLead: false, isQualified: false, bucket: null, label: "No (No Summary)" };
   }
 
   if (!llmConfigured()) {
     console.warn(`[${firm.id}][lead] No LLM API key set — cannot classify`);
-    return { isLead: false, isQualified: false, label: "No (Unclassified)" };
+    return { isLead: false, isQualified: false, bucket: null, label: "No (Unclassified)" };
   }
 
   try {
@@ -3451,8 +3666,15 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
 
 Classify each call into ONE of these categories:
 - "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury.
-- "lead": someone seeking legal help for something OUTSIDE ${firm.practiceArea} (family law, divorce, child support, criminal, immigration, etc.) OR a vague legal inquiry.
-- "not_lead": anything else.
+- "non_pi": someone seeking legal help OUTSIDE ${firm.practiceArea}, such as immigration, criminal defense, family law, divorce, or child support. This is still a lead. They wanted a lawyer. Do not use an exclude category for them.
+- "return_call": the caller is continuing a matter this firm already has, returning a call, or asking for a call back on an existing intake. Not a brand-new incident.
+- "spam": spam, a robocall, or an automated phone system.
+- "vendor": a sales pitch, a marketing call, a recruiter selling services, or a medical provider calling about records, billing, or appointments.
+- "employment": someone asking about a job at the firm.
+- "existing_client": someone with an open matter at this firm calling about that matter.
+- "insurance": an insurance company or adjuster calling about a claim, a demand, or subrogation.
+- "other_law_office": another law firm, opposing counsel, co-counsel, or a mediator calling about a case.
+- "wrong_number": the caller reached the firm by mistake.
 
 Signals that this IS a lead — any one of these is enough:
 - The caller describes an accident or injury and wants the firm to look at it
@@ -3461,14 +3683,16 @@ Signals that this IS a lead — any one of these is enough:
 - The summary reports accident details typical of a new intake: a date of accident, how the crash happened, injuries, hospital or medical treatment, a police report, insurance information
 - A FORMER client whose prior matter is closed is calling about a NEW incident
 
-"not_lead" is for:
-- Calls from insurance adjusters / insurance companies (Progressive, USAA, GEICO, State Farm, etc.) about claims, demands, subrogation
-- Calls from other law firms about case management, mediation, opposing counsel, co-counsel
-- Calls from medical providers (doctors, clinics, physiotherapy) about appointments, records, payments
-- Sales calls, marketing, recruiting, vendors
-- Press / media inquiries
-- Wrong numbers, spam, automated phone systems
-- Someone with an OPEN matter at this firm calling about that matter
+Use the exclude words for calls that are not someone seeking legal help:
+- "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm) about claims, demands, or subrogation
+- "other_law_office": other law firms, opposing counsel, co-counsel, or a mediator
+- "vendor": medical providers calling about records, billing, or appointments; sales, marketing, recruiting, and press
+- "spam": robocalls and automated systems
+- "wrong_number": the caller wanted someone else
+- "employment": a job inquiry
+- "existing_client": an OPEN matter at this firm
+- "return_call": continuing a matter this firm already has, not a new incident
+Someone calling about immigration, criminal defense, family law, or any other legal matter is "non_pi", not an exclude word.
 
 CRITICAL RULES:
 - Only treat it as an existing matter when there is real evidence of an existing relationship WITH THIS FIRM: a case number, a named attorney or paralegal here, questions about their settlement / status / lien / disbursement / medical records on a case the firm is already handling, or the summary says they are a current client.
@@ -3478,7 +3702,7 @@ CRITICAL RULES:
 - Language does not matter. Calls in Spanish or any other language are classified the same way as English.
 - TIE-BREAK: if the summary describes an accident or injury and there is no clear evidence of an existing relationship with this firm and the caller is not an adjuster/law firm/provider/vendor, answer "qualified_lead". A missed lead costs the firm far more than an extra one to review.
 
-Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No explanation.`;
+Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
 
     // Give the model the routing facts it can't infer from the summary: which of
     // the firm's lines was dialed (a line named "Leads"/"Intake" is a strong
@@ -3497,22 +3721,34 @@ Respond with ONLY a single word: "qualified_lead", "lead", or "not_lead". No exp
 
     const raw = await llmText({
       label: `${firm.id}][lead`,
-      maxTokens: 10,
+      maxTokens: 20,
       system: systemPrompt,
       user: `${context}Call summary:\n${text}`,
     });
-    if (raw === null) return { isLead: false, isQualified: false, label: "No (API Error)" };
+    if (raw === null) return { isLead: false, isQualified: false, bucket: null, label: "No (API Error)" };
     const reply = raw.toLowerCase().trim();
     console.log(`[${firm.id}][lead] LLM classification: "${reply}"`);
-    if (reply.includes("qualified_lead")) return { isLead: true, isQualified: true, label: "🔥 Qualified Lead" };
-    if (reply.includes("not_lead")) return { isLead: false, isQualified: false, label: "No" };
-    if (reply.includes("lead")) return { isLead: true, isQualified: false, label: "Lead" };
+    const parsed = classificationFromReply(reply);
+    if (parsed) return parsed;
     console.warn(`[${firm.id}][lead] Unexpected LLM response: "${reply}"`);
-    return { isLead: false, isQualified: false, label: "No (Unparseable)" };
+    return { isLead: false, isQualified: false, bucket: null, label: "No (Unparseable)" };
   } catch (err) {
     console.error(`[${firm.id}][lead] Classification error:`, err.message);
-    return { isLead: false, isQualified: false, label: "No (Error)" };
+    return { isLead: false, isQualified: false, bucket: null, label: "No (Error)" };
   }
+}
+
+function classificationFromReply(reply) {
+  const text = String(reply || "").toLowerCase();
+  if (text.includes("qualified_lead")) return { isLead: true, isQualified: true, bucket: null, label: "🔥 Qualified Lead" };
+  if (text.includes("non_pi")) return { isLead: true, isQualified: false, bucket: "non_pi", label: BUCKET_LABEL.non_pi };
+  if (text.includes("return_call")) return { isLead: false, isQualified: false, bucket: "return_call", label: BUCKET_LABEL.return_call };
+  for (const bucket of ["existing_client", "other_law_office", "wrong_number", "employment", "insurance", "vendor", "spam"]) {
+    if (text.includes(bucket)) return { isLead: false, isQualified: false, bucket, label: BUCKET_LABEL[bucket] };
+  }
+  if (text.includes("not_lead")) return { isLead: false, isQualified: false, bucket: null, label: "No" };
+  if (text.includes("lead")) return { isLead: true, isQualified: false, bucket: "non_pi", label: BUCKET_LABEL.non_pi };
+  return null;
 }
 
 function shouldRouteToLegalAssistant(firm, phoneFrom, phoneTo) {
@@ -3805,7 +4041,7 @@ async function handleCallSummary(firm, req, res) {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const { isLead, isQualified, label: leadLabel } = await classifyLead(firm, payload, from, to, cached);
+    const { isLead, isQualified, bucket, label: leadLabel } = await classifyLead(firm, payload, from, to, cached);
 
     const fromDisplay = formatFrom(firm, from);
     const toDisplay = formatPhone(firm, to);
@@ -3820,11 +4056,15 @@ async function handleCallSummary(firm, req, res) {
     let slackMessagePermalink = null;
     let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
-    if (isLead) {
-      const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
-      const qualTag = isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*";
+    const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
+    if (isLead || bucket) {
+      const qualTag = bucket === "non_pi"
+        ? "📋 *Lead · Outside practice*"
+        : bucket
+          ? `*${BUCKET_LABEL[bucket] || leadLabel}*`
+          : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
       const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
-      const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
+      const leadPostOpts = sona && isLead ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
       slackMessagePermalink = leadPost?.permalink || null;
       leadParentTs = leadPost?.parentTs || null;
@@ -3850,8 +4090,8 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
-    let threadedInLeads = !!isLead;
-    if (!isLead) {
+    let threadedInLeads = !!isLead || !!bucket;
+    if (!isLead && !bucket) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
       const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
       threadedInLeads = !!threadPost;
@@ -3912,7 +4152,7 @@ async function handleCallSummary(firm, req, res) {
     // a follow-up window, treat the call as a follow-up (log + merge into the
     // existing intake); otherwise a qualified lead opens a new intake.
     const externalPhone = firm.phoneLines[from] ? to : from;
-    if (isLead) {
+    if (isLead || bucket) {
       const handledBy = sona
         ? "Sona"
         : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || null);
@@ -3925,6 +4165,7 @@ async function handleCallSummary(firm, req, res) {
         handledBy,
         arrival: sona ? "sona" : (isQualified ? "qualified_call" : "human_call"),
         slackPermalink: slackMessagePermalink,
+        bucket,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
     const transcript = await fetchCallTranscript(firm, callId);
