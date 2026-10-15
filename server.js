@@ -3656,6 +3656,17 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     return { isLead: false, isQualified: false, bucket: null, label: "No (No Summary)" };
   }
 
+  // Quo still emits a call-summary when nobody talked — "no actionable details".
+  // That is a failed connect or a hangup, not a robocall. Do not send it to the
+  // model; it will guess "spam".
+  const noConnect = /\bno actionable details\b|\bnothing to summarize\b|\bno details to summarize\b|\bno transcript received\b/.test(text);
+  const outbound = ["outgoing", "outbound"].includes(String(cached?.direction || "").toLowerCase())
+    || isOwnLine(firm, phoneFrom);
+  if (noConnect) {
+    console.log(`[${firm.id}][lead] ${outbound ? "Outbound" : "Call"} had no conversation — not spam`);
+    return { isLead: false, isQualified: false, bucket: null, label: outbound ? "No (No connect)" : "No (No Summary)" };
+  }
+
   if (!llmConfigured()) {
     console.warn(`[${firm.id}][lead] No LLM API key set — cannot classify`);
     return { isLead: false, isQualified: false, bucket: null, label: "No (Unclassified)" };
@@ -3668,7 +3679,7 @@ Classify each call into ONE of these categories:
 - "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury.
 - "non_pi": someone seeking legal help OUTSIDE ${firm.practiceArea}, such as immigration, criminal defense, family law, divorce, or child support. This is still a lead. They wanted a lawyer. Do not use an exclude category for them.
 - "return_call": the caller is continuing a matter this firm already has, returning a call, or asking for a call back on an existing intake. Not a brand-new incident.
-- "spam": spam, a robocall, or an automated phone system.
+- "spam": an INBOUND robocall or automated system calling the firm. Never use this when the firm placed the call, when nobody connected, or when the summary says there were no details to summarize.
 - "vendor": a sales pitch, a marketing call, a recruiter selling services, or a medical provider calling about records, billing, or appointments.
 - "employment": someone asking about a job at the firm.
 - "existing_client": someone with an open matter at this firm calling about that matter.
@@ -3687,7 +3698,7 @@ Use the exclude words for calls that are not someone seeking legal help:
 - "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm) about claims, demands, or subrogation
 - "other_law_office": other law firms, opposing counsel, co-counsel, or a mediator
 - "vendor": medical providers calling about records, billing, or appointments; sales, marketing, recruiting, and press
-- "spam": robocalls and automated systems
+- "spam": inbound robocalls and automated systems calling the firm. Not an outbound call. Not a call that did not connect.
 - "wrong_number": the caller wanted someone else
 - "employment": a job inquiry
 - "existing_client": an OPEN matter at this firm
@@ -3701,6 +3712,7 @@ CRITICAL RULES:
 - The call being answered by staff, or an appointment being scheduled, does not make it an existing case — that is what intake does with a new lead.
 - Language does not matter. Calls in Spanish or any other language are classified the same way as English.
 - TIE-BREAK: if the summary describes an accident or injury and there is no clear evidence of an existing relationship with this firm and the caller is not an adjuster/law firm/provider/vendor, answer "qualified_lead". A missed lead costs the firm far more than an extra one to review.
+- If the firm dialed out, this is not spam, not a robocall, and not a wrong number. If they did not reach anyone, do not classify it as a lead either.
 
 Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
 
@@ -3713,6 +3725,7 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     const contactName = outside ? getContactName(firm, outside) : null;
     const contextLines = [
       lineLabel ? `Firm line involved: "${lineLabel}"` : null,
+      outbound ? "This call was placed BY the firm (outbound). Do not classify it as spam, a robocall, or a wrong number." : null,
       contactName
         ? `The outside number is a saved contact named "${contactName}". A saved contact whose matter is closed may still be a new lead.`
         : `The outside number is NOT a saved contact — the firm has no record of this caller.`,
@@ -3729,7 +3742,13 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     const reply = raw.toLowerCase().trim();
     console.log(`[${firm.id}][lead] LLM classification: "${reply}"`);
     const parsed = classificationFromReply(reply);
-    if (parsed) return parsed;
+    if (parsed) {
+      if (outbound && (parsed.bucket === "spam" || parsed.bucket === "wrong_number")) {
+        console.log(`[${firm.id}][lead] Ignoring ${parsed.bucket} on an outbound call`);
+        return { isLead: false, isQualified: false, bucket: null, label: "No (Outbound)" };
+      }
+      return parsed;
+    }
     console.warn(`[${firm.id}][lead] Unexpected LLM response: "${reply}"`);
     return { isLead: false, isQualified: false, bucket: null, label: "No (Unparseable)" };
   } catch (err) {

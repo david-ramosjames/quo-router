@@ -18,6 +18,8 @@ const harness = [
   `function getContactName() { return STUB.contactName || null; }`,
   grab("extractField"),
   grab("extractText"),
+  grab("lastTenDigits"),
+  grab("isOwnLine"),
   grab("classifyLead"),
   `export { classifyLead, setStub };`,
   `function setStub(s) { STUB = s || {}; }`,
@@ -73,6 +75,11 @@ const CASES = [
     summary: "Sales representative calling to offer case management software and asking to speak with the office manager about a demo." },
   { name: "wrong number", want: "not_lead",
     summary: "Caller was trying to reach a dentist office and had the wrong number." },
+  { name: "outbound no-connect is not spam", want: "not_lead",
+    from: LEADS_LINE, to: "+19032029240", cached: { direction: "outgoing" },
+    summary: "This call had no actionable details to summarize." },
+  { name: "inbound empty Quo summary is not spam", want: "not_lead",
+    summary: "This call had no actionable details to summarize." },
 ];
 
 requireKey();
@@ -84,7 +91,9 @@ const failures = [];
 for (const c of CASES) {
   mod.setStub({ contactName: c.contactName, activeClient: c.activeClientNote });
   const payload = { data: { object: { summary: c.summary } } };
-  const got = await mod.classifyLead(FIRM, payload, "+15124508938", LEADS_LINE, null);
+  const got = await mod.classifyLead(
+    FIRM, payload, c.from || "+15124508938", c.to || LEADS_LINE, c.cached || null,
+  );
   // Map the returned label back to the model's own vocabulary.
   const actual = got.isQualified ? "qualified_lead" : got.isLead ? "lead" : "not_lead";
   const ok = actual === c.want;
