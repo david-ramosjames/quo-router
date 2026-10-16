@@ -1667,6 +1667,7 @@ async function recordClassifiedCall(firm, {
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
   phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
+  holdExclusion = false,
 }) {
   if (bucket) {
     await recordClassifiedCall(firm, {
@@ -1735,8 +1736,8 @@ Reasons are one short sentence each. Do not invent facts.`,
     const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
     const contractOut = Boolean(existing?.agreement_sent_at)
       || ["sent", "viewed", "signed", "completed"].includes(existing?.agreement_status || "");
-    const flagged = callIsNotALead(sourceText, score) && !contractOut;
-    const suggestion = flagged ? "not_a_lead" : score?.not_interested ? "not_interested" : null;
+    const flagged = !holdExclusion && callIsNotALead(sourceText, score) && !contractOut;
+    const suggestion = flagged ? "not_a_lead" : (!holdExclusion && score?.not_interested ? "not_interested" : null);
     // Decline, rejection, and not-a-lead stay open until a person confirms them.
     const closeNow = false;
     const grade = flagged ? "C" : (score && ["A", "B", "C"].includes(score.grade) ? score.grade : null);
@@ -3778,6 +3779,33 @@ function looksLikePersonalInjury(text) {
   return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b/i.test(String(text || ""));
 }
 
+const FILTERING_BUCKETS = new Set([
+  "spam",
+  "vendor",
+  "employment",
+  "existing_client",
+  "insurance",
+  "other_law_office",
+  "wrong_number",
+  "return_call",
+]);
+
+function personAnswered(cached) {
+  const answeredBy = String(cached?.answeredBy || "");
+  const userId = String(cached?.userId || "");
+  if (/sona/i.test(answeredBy) || answeredBy.startsWith("SY")) return false;
+  if (/sona/i.test(userId)) return false;
+  return Boolean(answeredBy || userId);
+}
+
+// A missed call or a Sona call has not been verified by someone at the firm.
+// An exclude label would drop it from the queue, so keep it as No Contact.
+function holdUnverifiedCall(decision, { sona, cached, knownParty }) {
+  if (knownParty || !decision?.bucket || !FILTERING_BUCKETS.has(decision.bucket)) return decision;
+  if (!sona && personAnswered(cached)) return decision;
+  return { isLead: true, isQualified: false, bucket: null, label: "No Contact" };
+}
+
 function classificationFromReply(reply) {
   const text = String(reply || "").toLowerCase();
   if (text.includes("qualified_lead")) return { isLead: true, isQualified: true, bucket: null, label: "🔥 Qualified Lead" };
@@ -4081,7 +4109,14 @@ async function handleCallSummary(firm, req, res) {
     const summary = Array.isArray(rawSummary) ? "• " + rawSummary.join("\n• ") : safe(rawSummary);
 
     const sona = isSonaCall(payload, cached);
-    const { isLead, isQualified, bucket, label: leadLabel } = await classifyLead(firm, payload, from, to, cached);
+    const classified = await classifyLead(firm, payload, from, to, cached);
+    const knownParty = [from, to].filter(Boolean).some((phone) => (
+      !firm.phoneLines[phone] && (isActiveClient(firm, phone) || isKnownBusiness(firm, phone))
+    ));
+    const { isLead, isQualified, bucket, label: leadLabel } = holdUnverifiedCall(classified, { sona, cached, knownParty });
+    if (leadLabel === "No Contact" && classified.label !== leadLabel) {
+      console.log(`[${firm.id}][lead] Held ${classified.label} as No Contact until someone talks to them`);
+    }
 
     const fromDisplay = formatFrom(firm, from);
     const toDisplay = formatPhone(firm, to);
@@ -4208,6 +4243,7 @@ async function handleCallSummary(firm, req, res) {
         arrival: sona ? "sona" : (isQualified ? "qualified_call" : "human_call"),
         slackPermalink: slackMessagePermalink,
         bucket,
+        holdExclusion: leadLabel === "No Contact",
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
     const transcript = await fetchCallTranscript(firm, callId);
