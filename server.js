@@ -1220,11 +1220,19 @@ function blankLabel(value) {
 
 function caseKindFromNarrative(text) {
   const body = String(text || "");
-  if (/\b(fight|assault(?:ed)?|attacked|beaten|beer bottle)\b/i.test(body)) return "Assault";
-  if (/\bdog bite|bitten by (?:a |the )?dog\b/i.test(body)) return "Dog Bite";
-  if (/\b(?:slip(?:ped)? and fall|wet floor)\b/i.test(body)) return "Slip and fall";
-  if (/\b(?:workers?'? compensation|work accident)\b/i.test(body)) return "Work Accident";
-  if (/\b(?:car accident|rear-?ended|other driver)\b/i.test(body)) return "Car accident";
+  if (/\b(?:child abuse|sexual assault|molest)\b/i.test(body)) return "Sexual Assault / Child Abuse";
+  if (/\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b/i.test(body)) return "Dog Bite";
+  if (/\bwrongful death\b/i.test(body)) return "Wrongful Death";
+  if (/\b(?:medical malpractice|med\s*mal|surgical error)\b/i.test(body)) return "MedMal";
+  if (/\bworkers?'?\s*comp(?:ensation)?\b/i.test(body)) return "Workers Comp";
+  if (/\b(?:work(?:place)? (?:accident|injury)|injured at work)\b/i.test(body)) return "Work Injury";
+  if (/\b(?:18-?\s*wheeler|tractor-?trailer|commercial truck|truck accident)\b/i.test(body)) return "Commercial / 18 Wheeler";
+  if (/\b(?:pedestrian|bicycle|scooter)\b/i.test(body)) return "Pedestrian / Bicycle / Scooter";
+  if (/\b(?:no injuries|property damage only)\b/i.test(body)) return "No Injuries / Property Damage";
+  if (/\b(?:car accident|auto accident|rear-?ended|motorcycle|other driver|hit and run)\b/i.test(body)) return "Auto Accident";
+  if (/\b(?:slip(?:ped)? and fall|premises liability|wet floor)\b/i.test(body)) return "Premises Liability";
+  if (/\b(?:immigration|divorce|child support|criminal defense|family law)\b/i.test(body)) return "Non-PI Legal Matter";
+  if (/\b(?:injur(?:y|ed|ies)|hurt)\b/i.test(body)) return "Other Injury";
   return null;
 }
 
@@ -1531,7 +1539,11 @@ async function recordClassifiedCall(firm, {
              grade_reason = $2,
              grade_source = 'quo-router',
              summary = coalesce(summary, $3),
-             slack_permalink = coalesce(slack_permalink, $4)
+             slack_permalink = coalesce(slack_permalink, $4),
+             case_type = case
+               when case_type is null or btrim(case_type) = '' then 'Non-PI Legal Matter'
+               else case_type
+             end
            where id = $1`,
           [row.id, reason, summaryText, slackPermalink || null],
         );
@@ -1548,11 +1560,11 @@ async function recordClassifiedCall(firm, {
           `insert into public.leads (
              lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
              summary, quo_link, intake_call_id, owner_name, slack_permalink,
-             grade, grade_reason, grade_source, follow_up, caller_class, close_suggestion
+             grade, grade_reason, grade_source, follow_up, caller_class, close_suggestion, case_type
            ) values (
              current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
              $4, $5, $6, $7, $8,
-             'C', $9, 'quo-router', true, 'non_pi', 'decline'
+             'C', $9, 'quo-router', true, 'non_pi', 'decline', 'Non-PI Legal Matter'
            )
            on conflict (intake_call_id) do nothing
            returning id`,
