@@ -3676,7 +3676,7 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     const systemPrompt = `You classify call summaries for a ${firm.practiceArea} law firm (${firm.name}).
 
 Classify each call into ONE of these categories:
-- "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury.
+- "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, dog bites, animal attacks that caused an injury, assault injuries, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury. A dog bite is personal injury, not a criminal or non-PI matter.
 - "non_pi": someone seeking legal help OUTSIDE ${firm.practiceArea}, such as immigration, criminal defense, family law, divorce, or child support. This is still a lead. They wanted a lawyer. Do not use an exclude category for them.
 - "return_call": the caller is continuing a matter this firm already has, returning a call, or asking for a call back on an existing intake. Not a brand-new incident.
 - "spam": an INBOUND robocall or automated system calling the firm. Never use this when the firm placed the call, when nobody connected, or when the summary says there were no details to summarize.
@@ -3712,6 +3712,7 @@ CRITICAL RULES:
 - The call being answered by staff, or an appointment being scheduled, does not make it an existing case — that is what intake does with a new lead.
 - Language does not matter. Calls in Spanish or any other language are classified the same way as English.
 - TIE-BREAK: if the summary describes an accident or injury and there is no clear evidence of an existing relationship with this firm and the caller is not an adjuster/law firm/provider/vendor, answer "qualified_lead". A missed lead costs the firm far more than an extra one to review.
+- Dog bites, animal attacks with injuries, car and truck crashes, slip and falls, and work injuries are "qualified_lead". Do not call them "non_pi" because the summary uses words like attacked, owner, or neighbor.
 - If the firm dialed out, this is not spam, not a robocall, and not a wrong number. If they did not reach anyone, do not classify it as a lead either.
 
 Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
@@ -3747,6 +3748,10 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
         console.log(`[${firm.id}][lead] Ignoring ${parsed.bucket} on an outbound call`);
         return { isLead: false, isQualified: false, bucket: null, label: "No (Outbound)" };
       }
+      if (parsed.bucket === "non_pi" && looksLikePersonalInjury(text)) {
+        console.log(`[${firm.id}][lead] Injury summary stays a personal-injury lead`);
+        return { isLead: true, isQualified: true, bucket: null, label: "🔥 Qualified Lead" };
+      }
       return parsed;
     }
     console.warn(`[${firm.id}][lead] Unexpected LLM response: "${reply}"`);
@@ -3755,6 +3760,10 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     console.error(`[${firm.id}][lead] Classification error:`, err.message);
     return { isLead: false, isQualified: false, bucket: null, label: "No (Error)" };
   }
+}
+
+function looksLikePersonalInjury(text) {
+  return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b/i.test(String(text || ""));
 }
 
 function classificationFromReply(reply) {
