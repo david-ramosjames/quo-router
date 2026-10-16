@@ -3680,6 +3680,14 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
     return { isLead: false, isQualified: false, bucket: null, label: outbound ? "No (No connect)" : "No (No Summary)" };
   }
 
+  // Staff calling a carrier (or an adjuster calling the firm) is insurance work,
+  // not someone seeking a lawyer. Do not send it to the model — it will guess
+  // "non_pi" and that bucket still posts into #lead-calls.
+  if (looksLikeInsuranceCompanyCall(text, outbound)) {
+    console.log(`[${firm.id}][lead] Insurance-company call — not a lead`);
+    return { isLead: false, isQualified: false, bucket: "insurance", label: BUCKET_LABEL.insurance };
+  }
+
   if (!llmConfigured()) {
     console.warn(`[${firm.id}][lead] No LLM API key set — cannot classify`);
     return { isLead: false, isQualified: false, bucket: null, label: "No (Unclassified)" };
@@ -3690,13 +3698,13 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
 
 Classify each call into ONE of these categories:
 - "qualified_lead": someone seeking legal help for a situation the firm handles: car accidents, truck accidents, motorcycle accidents, pedestrian accidents, slip and fall, dog bites, animal attacks that caused an injury, assault injuries, workplace injuries, workers comp, wrongful death, drunk driver, hit and run, or any personal injury. A dog bite is personal injury, not a criminal or non-PI matter.
-- "non_pi": someone seeking legal help OUTSIDE ${firm.practiceArea}, such as immigration, criminal defense, family law, divorce, or child support. This is still a lead. They wanted a lawyer. Do not use an exclude category for them.
+- "non_pi": an INBOUND person who called the firm asking for a lawyer OUTSIDE ${firm.practiceArea}, such as immigration, criminal defense, family law, divorce, or child support. This is still a lead. Never use "non_pi" for an insurance company, an adjuster, or the firm calling a carrier about a client's claim.
 - "return_call": the caller is continuing a matter this firm already has, returning a call, or asking for a call back on an existing intake. Not a brand-new incident.
 - "spam": an INBOUND robocall or automated system calling the firm. Never use this when the firm placed the call, when nobody connected, or when the summary says there were no details to summarize.
 - "vendor": a sales pitch, a marketing call, a recruiter selling services, or a medical provider calling about records, billing, or appointments.
 - "employment": someone asking about a job at the firm.
 - "existing_client": someone with an open matter at this firm calling about that matter.
-- "insurance": an insurance company or adjuster calling about a claim, a demand, or subrogation.
+- "insurance": an insurance company or adjuster on the call — inbound or the firm calling them — about a claim, a demand, subrogation, or filing/reporting a claim. Staff calling State Farm, Progressive, GEICO, USAA, or any carrier is insurance, not a lead.
 - "other_law_office": another law firm, opposing counsel, co-counsel, or a mediator calling about a case.
 - "wrong_number": the caller reached the firm by mistake.
 
@@ -3708,7 +3716,7 @@ Signals that this IS a lead — any one of these is enough:
 - A FORMER client whose prior matter is closed is calling about a NEW incident
 
 Use the exclude words for calls that are not someone seeking legal help:
-- "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm) about claims, demands, or subrogation
+- "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm) about claims, demands, or subrogation. Also the firm calling a carrier to open, report, or follow up on a claim.
 - "other_law_office": other law firms, opposing counsel, co-counsel, or a mediator
 - "vendor": medical providers calling about records, billing, or appointments; sales, marketing, recruiting, and press
 - "spam": inbound robocalls and automated systems calling the firm. Not an outbound call. Not a call that did not connect.
@@ -3716,7 +3724,7 @@ Use the exclude words for calls that are not someone seeking legal help:
 - "employment": a job inquiry
 - "existing_client": an OPEN matter at this firm
 - "return_call": continuing a matter this firm already has, not a new incident
-Someone calling about immigration, criminal defense, family law, or any other legal matter is "non_pi", not an exclude word.
+Someone calling about immigration, criminal defense, family law, or any other legal matter is "non_pi", not an exclude word. An insurance company is never "non_pi".
 
 CRITICAL RULES:
 - Only treat it as an existing matter when there is real evidence of an existing relationship WITH THIS FIRM: a case number, a named attorney or paralegal here, questions about their settlement / status / lien / disbursement / medical records on a case the firm is already handling, or the summary says they are a current client.
@@ -3727,6 +3735,7 @@ CRITICAL RULES:
 - TIE-BREAK: if the summary describes an accident or injury and there is no clear evidence of an existing relationship with this firm and the caller is not an adjuster/law firm/provider/vendor, answer "qualified_lead". A missed lead costs the firm far more than an extra one to review.
 - Dog bites, animal attacks with injuries, car and truck crashes, slip and falls, and work injuries are "qualified_lead". Do not call them "non_pi" because the summary uses words like attacked, owner, or neighbor.
 - If the firm dialed out, this is not spam, not a robocall, and not a wrong number. If they did not reach anyone, do not classify it as a lead either.
+- If the firm placed the call to an insurance company, or the summary is staff filing, opening, or following up on a client's claim with a carrier, this is "insurance". Never "non_pi" or "qualified_lead". The firm calling State Farm, Progressive, GEICO, USAA, or any carrier is case work on a client, not a new lead.
 
 Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
 
@@ -3739,7 +3748,7 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     const contactName = outside ? getContactName(firm, outside) : null;
     const contextLines = [
       lineLabel ? `Firm line involved: "${lineLabel}"` : null,
-      outbound ? "This call was placed BY the firm (outbound). Do not classify it as spam, a robocall, or a wrong number." : null,
+      outbound ? "This call was placed BY the firm (outbound). The firm is following up on a client or doing case work. Do not classify it as spam, a robocall, a wrong number, or a lead. If the other party is an insurer, answer \"insurance\"." : null,
       contactName
         ? `The outside number is a saved contact named "${contactName}". A saved contact whose matter is closed may still be a new lead.`
         : `The outside number is NOT a saved contact — the firm has no record of this caller.`,
@@ -3757,6 +3766,11 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     console.log(`[${firm.id}][lead] LLM classification: "${reply}"`);
     const parsed = classificationFromReply(reply);
     if (parsed) {
+      if (looksLikeInsuranceCompanyCall(text, outbound)
+        || (parsed.bucket === "non_pi" && namesMajorInsurer(text) && !looksLikeNonPiLegalInquiry(text))) {
+        console.log(`[${firm.id}][lead] Insurance follow-up is not outside-practice`);
+        return { isLead: false, isQualified: false, bucket: "insurance", label: BUCKET_LABEL.insurance };
+      }
       if (outbound && (parsed.bucket === "spam" || parsed.bucket === "wrong_number")) {
         console.log(`[${firm.id}][lead] Ignoring ${parsed.bucket} on an outbound call`);
         return { isLead: false, isQualified: false, bucket: null, label: "No (Outbound)" };
@@ -3777,6 +3791,31 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
 
 function looksLikePersonalInjury(text) {
   return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b/i.test(String(text || ""));
+}
+
+const MAJOR_INSURER = /\b(state farm|progressive|geico|g\.e\.i\.c\.o|usaa|allstate|farmers(?: insurance)?|nationwide|liberty mutual|travelers|american family)\b/i;
+
+function namesMajorInsurer(text) {
+  return MAJOR_INSURER.test(String(text || ""));
+}
+
+// A person asking the firm for a non-PI lawyer. Insurance follow-up is not this.
+function looksLikeNonPiLegalInquiry(text) {
+  return /\b(divorce|child custody|child support|immigration|criminal defense|family law|bankruptcy|eviction|will and testament|probate)\b/i.test(String(text || ""));
+}
+
+// The other party is a carrier or adjuster — not a person asking for a lawyer.
+// "Caller has State Farm" on a new inbound intake must not match.
+function looksLikeInsuranceCompanyCall(text, outbound = false) {
+  const t = String(text || "");
+  if (!namesMajorInsurer(t)) return false;
+  if (
+    /\b(adjuster|subrogation|demand package|initiated a (?:new )?claim|report(?:ing|ed) a (?:new )?(?:auto )?claim|follow(?:ing)? up|new (?:auto )?claim (?:with|through|at)|claim with)\b/i.test(t)
+    || /\b(?:legal assistant|paralegal|attorney|staff).{0,120}\b(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)
+    || /\b(?:called|calling|contact(?:ed|ing)|spoke with|reached)\s+(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)
+  ) return true;
+  // Firm dialed out and the summary is about a claim/carrier — client follow-up.
+  return outbound && /\b(claim|policy|carrier|insurance company|adjuster)\b/i.test(t);
 }
 
 const FILTERING_BUCKETS = new Set([
@@ -3800,8 +3839,8 @@ function personAnswered(cached) {
 
 // A missed call or a Sona call has not been verified by someone at the firm.
 // An exclude label would drop it from the queue, so keep it as No Contact.
-function holdUnverifiedCall(decision, { sona, cached, knownParty }) {
-  if (knownParty || !decision?.bucket || !FILTERING_BUCKETS.has(decision.bucket)) return decision;
+function holdUnverifiedCall(decision, { sona, cached, knownParty, outbound }) {
+  if (outbound || knownParty || !decision?.bucket || !FILTERING_BUCKETS.has(decision.bucket)) return decision;
   if (!sona && personAnswered(cached)) return decision;
   return { isLead: true, isQualified: false, bucket: null, label: "No Contact" };
 }
@@ -4099,6 +4138,9 @@ async function handleCallSummary(firm, req, res) {
     }
     const from = safe(cached?.from);
     const to = safe(cached?.to);
+    const outbound = ["outgoing", "outbound"].includes(String(cached?.direction || "").toLowerCase())
+      || isOwnLine(firm, from);
+    const isInbound = !outbound;
 
     if (blockedByPhoneLineFilter(firm, from, to)) {
       console.log(`[${firm.id}][call-summary] Skipped — neither ${from} nor ${to} is a configured phone line`);
@@ -4113,7 +4155,7 @@ async function handleCallSummary(firm, req, res) {
     const knownParty = [from, to].filter(Boolean).some((phone) => (
       !firm.phoneLines[phone] && (isActiveClient(firm, phone) || isKnownBusiness(firm, phone))
     ));
-    const { isLead, isQualified, bucket, label: leadLabel } = holdUnverifiedCall(classified, { sona, cached, knownParty });
+    const { isLead, isQualified, bucket, label: leadLabel } = holdUnverifiedCall(classified, { sona, cached, knownParty, outbound });
     if (leadLabel === "No Contact" && classified.label !== leadLabel) {
       console.log(`[${firm.id}][lead] Held ${classified.label} as No Contact until someone talks to them`);
     }
@@ -4131,11 +4173,12 @@ async function handleCallSummary(firm, req, res) {
     let slackMessagePermalink = null;
     let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
-    // Slack routing is still isLead: qualified and unqualified leads (including
-    // outside-practice) go to #lead-calls. Excluded buckets (vendor, existing
-    // client, spam, insurance, …) keep their tags in Intake Manager but do not
-    // get a new lead-calls post — they only thread if this phone already has one.
-    if (isLead) {
+    // Slack routing is still isLead, and only inbound: qualified and
+    // unqualified inbound leads (including outside-practice) open a new
+    // #lead-calls post. Outbound staff work — calling a carrier, a vendor, or
+    // a client — goes to human-calls and only threads if that phone already
+    // has a lead post. Excluded buckets keep their tags in Intake Manager.
+    if (isLead && isInbound) {
       const handlerDisplay = sona ? "Sona" : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || "Human");
       const qualTag = bucket === "non_pi"
         ? "📋 *Lead · Outside practice*"
@@ -4148,6 +4191,8 @@ async function handleCallSummary(firm, req, res) {
       slackThreadPermalink = await getSlackThreadPermalink(
         firm, firm.slackLeadCallsChannelId, leadParentTs, slackMessagePermalink, leadPost?.ts);
       console.log(`[${firm.id}][call-summary] Sent to lead-calls (${leadLabel})`);
+    } else if (isLead && outbound) {
+      console.log(`[${firm.id}][call-summary] Outbound — not opening a new lead-calls post (${leadLabel})`);
     }
 
     let text;
@@ -4167,8 +4212,8 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
-    let threadedInLeads = !!isLead;
-    if (!isLead) {
+    let threadedInLeads = !!(isLead && isInbound);
+    if (!threadedInLeads) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
       const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
       threadedInLeads = !!threadPost;
@@ -4178,8 +4223,7 @@ async function handleCallSummary(firm, req, res) {
         firm, firm.slackLeadCallsChannelId, leadParentTs, slackMessagePermalink, threadPost?.ts);
     }
 
-    const isInbound = !!firm.phoneLines[to] || cached?.direction === "incoming";
-    const sonaLeadOverride = sona && isLead;
+    const sonaLeadOverride = sona && isLead && isInbound;
     if (isInbound && shouldRouteToLegalAssistant(firm, from, to) && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
       await postToLegalAssistant(firm, text, from, to);
       console.log(`[${firm.id}][call-summary] ALSO sent to legalassistant-phone`);

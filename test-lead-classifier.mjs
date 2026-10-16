@@ -20,6 +20,12 @@ const harness = [
   grab("extractText"),
   grab("lastTenDigits"),
   grab("isOwnLine"),
+  grab("MAJOR_INSURER"),
+  grab("namesMajorInsurer"),
+  grab("looksLikeNonPiLegalInquiry"),
+  grab("looksLikeInsuranceCompanyCall"),
+  grab("looksLikePersonalInjury"),
+  `const BUCKET_LABEL = { insurance: "Excluded · Insurance company", non_pi: "Lead · Outside practice", return_call: "Return call" };`,
   grab("classifyLead"),
   `export { classifyLead, setStub };`,
   `function setStub(s) { STUB = s || {}; }`,
@@ -80,6 +86,15 @@ const CASES = [
     summary: "This call had no actionable details to summarize." },
   { name: "inbound empty Quo summary is not spam", want: "not_lead",
     summary: "This call had no actionable details to summarize." },
+  { name: "outbound staff filing a State Farm claim is not a lead", want: "not_lead",
+    from: "+15125005266", to: "+18007325246", cached: { direction: "outgoing" },
+    summary: "The Legal Assistant initiated a new claim with State Farm. The claim is located in Texas." },
+  { name: "outbound staff contacting State Farm IVR is not a lead", want: "not_lead",
+    from: "+15125005266", to: "+18002527645", cached: { direction: "outgoing" },
+    summary: "The caller is a legal assistant contacting State Farm regarding a new auto claim. The automated system provided options to report a new claim." },
+  { name: "outbound follow-up on a client claim with State Farm is not outside practice", want: "not_lead",
+    from: "+15125005266", to: "+18007325246", cached: { direction: "outgoing" },
+    summary: "The Legal Assistant followed up with State Farm on the client's auto claim in Texas and identified themselves as an attorney." },
 ];
 
 requireKey();
