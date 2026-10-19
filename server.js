@@ -1496,6 +1496,13 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 
 // Extract → insert → notify, then open a follow-up window on the caller's phone.
 // Best-effort: any failure is logged and swallowed so it never affects routing.
+function taggableOwner(name) {
+  const text = String(name || "").trim();
+  if (!text) return null;
+  if (/^(sona|human|attorney(?:\s*\d+)?|legal assistant|referred|unassigned|intake(?: specialist)?|paralegal(?:\s*\d+)?|unknown|n\/a|na)$/i.test(text)) return null;
+  return text;
+}
+
 function leadPhoneE164(phone) {
   const digits = String(phone || "").replace(/\D/g, "");
   if (digits.length === 10) return `+1${digits}`;
@@ -1541,6 +1548,7 @@ const BUCKET_LABEL = {
 async function recordClassifiedCall(firm, {
   phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
 }) {
+  handledBy = taggableOwner(handledBy);
   if (!firm.caseDbUrl || !bucket) return;
   const phoneE164 = leadPhoneE164(phone);
   if (!phoneE164 && !callId) return;
@@ -1764,6 +1772,7 @@ async function recordLeadDecision(firm, {
   phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
   holdExclusion = false,
 }) {
+  handledBy = taggableOwner(handledBy);
   if (bucket) {
     await recordClassifiedCall(firm, {
       phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
