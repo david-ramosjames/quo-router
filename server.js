@@ -1282,7 +1282,69 @@ function mergeListValue(existing, incoming) {
   return [...seen.values()].join(", ");
 }
 
-async function extractIntake(firm, text) {
+function intakeSourceContext({ direction, type, leadPhone } = {}) {
+  const outbound = direction === "outbound" || direction === "outgoing";
+  const lines = [];
+  if (outbound && (type === "text" || type === "voicemail")) {
+    lines.push("SOURCE: This was written BY THE FIRM and sent TO the client.");
+    lines.push("The firm is giving the client information. Do not copy that information into client fields.");
+    lines.push("A decline or a referral to another lawyer/office is not intake. Return those client contact fields as null.");
+    lines.push("Only fill a field if the message restates a fact about THIS client (their accident, their own home address).");
+  } else if (outbound) {
+    lines.push("SOURCE: This is an OUTBOUND call — the firm called the lead back.");
+    lines.push("Fill intake fields with facts about the lead's own matter: what the client said, or what staff confirmed with the client.");
+    lines.push("Do not fill client name, phone, or address with a referred lawyer, another office, or anyone the firm told the client to call.");
+  } else {
+    lines.push("SOURCE: This is from the client, or a conversation with the client.");
+    lines.push("Fill facts about the injured client. Do not save a third party the firm referred them to as the client.");
+  }
+  if (leadPhone) {
+    lines.push(`The lead's phone number is ${leadPhone}. client.phone must be that number or null — never a different number mentioned in the text.`);
+  }
+  lines.push("Every field must be about the CLIENT. Ask: whose name, whose phone, whose address is this? If it belongs to a referral, an other driver, a doctor, or another office, it is null.");
+  return lines.join(" ");
+}
+
+function looksLikeFirmReferralMessage(text) {
+  const t = String(text || "");
+  if (/\b(not able to help|unable to (?:help|assist)|cannot (?:help|represent|take)|can'?t (?:help|represent)|we (?:don't|do not) (?:handle|take)|outside (?:our )?practice)\b/i.test(t)
+    && /\b(please contact|contact|call|reach)\b/i.test(t)) return true;
+  if (/\bplease contact\b.{0,80}\b(?:at\s+)?(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/i.test(t)) return true;
+  if (/\brefer(?:ring|red)? (?:you )?(?:to|out)\b/i.test(t)) return true;
+  return false;
+}
+
+function clearClientContactFields(client) {
+  if (!client || typeof client !== "object") return;
+  for (const key of ["name", "phone", "email", "address", "street_address", "address_city", "address_state", "address_zip", "address_country", "emergency_contact"]) {
+    client[key] = null;
+  }
+}
+
+// Drop referral / third-party contact info the model copied onto the client.
+function sanitizeExtractedClient(extracted, text, { leadPhone } = {}) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const client = extracted.client;
+  if (!client || typeof client !== "object") return extracted;
+  const lead10 = lastTenDigits(leadPhone);
+  const extracted10 = lastTenDigits(client.phone);
+  if (extracted10 && lead10 && extracted10 !== lead10) client.phone = null;
+  if (!looksLikeFirmReferralMessage(text)) return extracted;
+  clearClientContactFields(client);
+  if (!/\b(accident|rear-?end|injur(?:y|ed|ies)|crash|collision|hit and run)\b/i.test(String(text || ""))) {
+    if (extracted.accident && typeof extracted.accident === "object") {
+      extracted.accident.location = null;
+      extracted.accident.city = null;
+      extracted.accident.county = null;
+    }
+    if (extracted.referral && typeof extracted.referral === "object") {
+      extracted.referral.map_location = null;
+    }
+  }
+  return extracted;
+}
+
+async function extractIntake(firm, text, ctx = {}) {
   if (!llmConfigured()) {
     console.warn(`[${firm.id}][intake] No LLM API key set — cannot extract`);
     return null;
@@ -1293,17 +1355,20 @@ async function extractIntake(firm, text) {
   } catch (err) {
     console.error(`[${firm.id}][intake] Staff directory unavailable:`, err.message);
   }
-  return llmExtract({
+  const extracted = await llmExtract({
     label: `${firm.id}][intake`,
     maxTokens: 1500,
     name: "save_intake",
     description: "Save the client intake details extracted from the call.",
     schema: INTAKE_TOOL_SCHEMA,
-    system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call summary/transcript. Only include facts EXPLICITLY stated in the call. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If the call is not an accident intake, return mostly nulls.
+    system: `You extract new-client intake details for a personal-injury (motor vehicle accident) law firm from a phone call, text, or transcript. Only include facts EXPLICITLY stated. Use null for anything not mentioned — never guess, infer, or fabricate names, numbers, dates, or places. If this is not an accident intake, return mostly nulls.
+
+${intakeSourceContext(ctx)}
 
 For the client's home address: put the full address as spoken in client.address, AND split what was actually given into street_address / address_city / address_state / address_zip / address_country. Only fill the parts that were stated — if they only said "Austin, Texas", set address_city and address_state and leave street_address, address_zip and address_country null. Do not infer a state from a city, a ZIP from a city, or a country from anything.${staffLine}`,
-    user: `Call summary / transcript:\n${text}`,
+    user: `Source:\n${text}`,
   });
+  return sanitizeExtractedClient(extracted, text, ctx);
 }
 
 // Which columns actually exist on a table (cached per firm+table). Used so the
@@ -1525,8 +1590,38 @@ async function recordClassifiedCall(firm, {
         [callId],
       )
       : { rows: [] };
-    const row = byCall.rows[0];
-    if (row?.signed_case || row?.case_id || ["Promoted", "Signed"].includes(row?.lead_status)) return;
+    const byPhone = !byCall.rows[0] && phoneE164
+      ? await client.query(
+        `select id, signed_case, case_id, lead_status from public.leads
+         where phone_e164 = $1
+         order by case when signed_case or case_id is not null or lead_status in ('Signed', 'Promoted') then 0 else 1 end,
+                  created_at desc
+         limit 1`,
+        [phoneE164],
+      )
+      : { rows: [] };
+    const row = byCall.rows[0] || byPhone.rows[0];
+    if (row?.signed_case || row?.case_id || ["Promoted", "Signed"].includes(row?.lead_status)) {
+      const detail = summaryText ? `Later call: ${summaryText}` : null;
+      if (detail) {
+        await client.query(
+          `update public.leads set
+             case_detail = case
+               when case_detail is null or case_detail = '' then $2
+               when position($2 in case_detail) > 0 then case_detail
+               else right(case_detail || E'\\n\\n' || $2, 15000)
+             end
+           where id = $1`,
+          [row.id, detail],
+        );
+      }
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, 'return_call', 'quo-router', $2::jsonb)`,
+        [row.id, JSON.stringify({ call_id: callId || null, bucket })],
+      );
+      return;
+    }
 
     if (outside) {
       const reason = "Sought legal help outside personal injury.";
@@ -2037,7 +2132,9 @@ async function runIntake(firm, {
   }
   console.log(`[${firm.id}][intake] Extracting from ${transcript ? "transcript" : "summary only"} for ${callId}`);
 
-  const extracted = await extractIntake(firm, sourceText);
+  const extracted = await extractIntake(firm, sourceText, {
+    direction, type: callType, leadPhone: externalPhone,
+  });
   if (!extracted) {
     console.warn(`[${firm.id}][intake] Nothing extracted for ${callId}`);
     return;
@@ -2056,9 +2153,7 @@ async function runIntake(firm, {
     phone: externalPhone,
     clientName: name,
     staffName: staffHit ? staffHit.name : null,
-    evidence: staffHit
-      ? `The call used “${heardName}”, which matches ${staffHit.name} on the staff directory.`
-      : `Quo Router heard the client name ${heardName}. The stored name is different.`,
+    evidence: heardName ? `Heard ${heardName}` : null,
   }).catch((err) => console.error(`[${firm.id}][lead] Name check failed:`, err.message));
   const accidentDate = extracted.accident?.date || null;
   // Store the actual Quo caller number (reliable for follow-up matching), not the
@@ -2334,6 +2429,8 @@ async function findClientMatter(firm, phone) {
 
 // Log every call and text. New facts fill empty intake fields until the case
 // is promoted. SMS Follow-Up sends through Quo, so those texts arrive here too.
+// Outbound callbacks still fill the form when the conversation is about the
+// lead. Firm-sent referrals/declines do not — those facts are not the client's.
 async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, slackPermalink, extractText }) {
   if (!sourceId) return;
   const matter = await findClientMatter(firm, phone);
@@ -2353,7 +2450,7 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
 
   const text = String(extractText || "").trim();
   if (text.length < 20) return;
-  const extracted = await extractIntake(firm, text);
+  const extracted = await extractIntake(firm, text, { direction, type, leadPhone: phone });
   if (!extracted) return;
   const staff = await loadStaffDirectory(firm).catch(() => []);
   const heardName = blankLabel(extracted.client?.name) ? null : extracted.client.name;
@@ -2365,9 +2462,7 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
     phone,
     clientName: staffHit ? null : heardName,
     staffName: staffHit ? staffHit.name : null,
-    evidence: staffHit
-      ? `The call used “${heardName}”, which matches ${staffHit.name} on the staff directory.`
-      : `Quo Router heard the client name ${heardName}. The stored name is different.`,
+    evidence: heardName ? `Heard ${heardName}` : null,
   }).catch((err) => console.error(`[${firm.id}][lead] Name check failed:`, err.message));
   const added = await mergeIntoIntake(firm, intakeCallId, extracted);
   if (added > 0) {
@@ -2484,7 +2579,9 @@ async function handleInboundEmail(firm, req, res) {
         return;
       }
       // Opt-in: treat it as a brand-new lead.
-      const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`);
+      const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`, {
+        direction: "inbound", type: "email",
+      });
       if (!extracted) return;
       const senderEmail = extractEmailAddress(email.from);
       if (senderEmail) extracted.client = { ...(extracted.client || {}), email: senderEmail };
@@ -2511,7 +2608,9 @@ async function handleInboundEmail(firm, req, res) {
     // Dedup: already ingested this exact email.
     if (!inserted && !firm._warnedNoInteractions?.has(cfg.interactionsTable)) return;
 
-    const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`);
+    const extracted = await extractIntake(firm, `${email.subject}\n\n${email.text}`, {
+      direction: "inbound", type: "email", leadPhone: match.phone,
+    });
     if (!extracted) return;
     const added = await mergeIntoIntake(firm, match.callId, extracted);
     if (added > 0) {
@@ -2587,13 +2686,18 @@ async function backfillFollowUps(firm, { externalPhone, intakeCallId }) {
     if (!inserted) continue; // already captured live
     logged++;
     const t = (transcript || it.content || "").trim();
-    if (t) texts.push(t);
+    if (t) {
+      const outbound = it.direction === "outbound" || it.direction === "outgoing";
+      texts.push(`[${outbound ? "OUTBOUND from the firm" : "INBOUND from the client"} — ${it.type}]\n${t}`);
+    }
   }
   if (!logged) return;
   console.log(`[${firm.id}][backfill] Logged ${logged} prior interaction(s) for intake ${intakeCallId}`);
 
   if (!texts.length) return;
-  const extracted = await extractIntake(firm, texts.join("\n\n"));
+  const extracted = await extractIntake(firm, texts.join("\n\n"), {
+    direction: "inbound", type: "backfill", leadPhone: externalPhone,
+  });
   if (!extracted) return;
   const added = await mergeIntoIntake(firm, intakeCallId, extracted);
   if (added > 0) {
