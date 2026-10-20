@@ -4216,6 +4216,84 @@ async function handleCalls(firm, req, res) {
   }
 }
 
+function letterForCallScore(score) {
+  if (score >= 90) return "A";
+  if (score >= 80) return "B";
+  if (score >= 70) return "C";
+  if (score >= 60) return "D";
+  return "F";
+}
+
+const CALL_GRADE_SCHEMA = {
+  type: "object",
+  properties: {
+    grading_status: { type: "string", enum: ["graded", "insufficient_evidence", "out_of_scope"] },
+    track: { type: "string", enum: ["injury_lead", "other"] },
+    overall_score: { type: ["integer", "null"] },
+    reason: { type: "string" },
+  },
+  required: ["grading_status", "track", "overall_score", "reason"],
+};
+
+// RJL intake rubric (quo-reporting intakeGradingRubric.md), scored 0–100 and stored as A–F.
+async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerName, direction, quoLink, phone, leadId }) {
+  if (!callId || !llmConfigured() || !firm.caseDbUrl) return;
+  const text = String(transcript || "").trim();
+  if (text.length < 350) return;
+  const handler = handlerName || "Unknown";
+  const clipped = text.length > 28000 ? `${text.slice(0, 28000)}\n\n[transcript truncated]` : text;
+  const score = await llmExtract({
+    label: `${firm.id}][call-grade`,
+    name: "grade_intake_call",
+    description: "Grade the intake agent's performance on this call.",
+    maxTokens: 700,
+    schema: CALL_GRADE_SCHEMA,
+    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed.
+
+Classify the track first.
+injury_lead: a real personal-injury lead or consult. Score only C1 Greeting 10, C2 Compassion 15, C3 Control and listening 15, C4 Qualification 15, C5 Tailored firm value 15, C6 Catch release or next step 20, C7 Lead source 5, C8 Close 5.
+other: not a PI lead (property damage only, ordinary workers' comp, family, criminal, immigration, vendor, wrong number, existing-client admin). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
+
+met = full points, partial = half, missed = zero. not_applicable and not_observable stay out of the denominator. overall_score = round(100 * earned / observable applicable weight). If observable weight is under 50, grading_status is insufficient_evidence and overall_score is null. out_of_scope only for dead air or a silent agent. reason is one or two sentences naming why the score landed where it did. Do not invent quotes.`,
+    user: `Handler: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
+  });
+  if (!score || score.grading_status !== "graded" || !Number.isFinite(Number(score.overall_score))) {
+    console.log(`[${firm.id}][call-grade] ${callId} ${score?.grading_status || "ungraded"}`);
+    return;
+  }
+  const numeric = Math.max(0, Math.min(100, Math.round(Number(score.overall_score))));
+  const letter = letterForCallScore(numeric);
+  const reason = String(score.reason || "").replace(/\s+/g, " ").trim().slice(0, 400);
+  let client;
+  try {
+    client = await connectCaseDb(firm);
+    await client.query(
+      `insert into public.call_grades
+         (call_id, lead_id, phone_e164, handler_id, handler_name, grade, score, reason, track, direction, quo_link, occurred_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+       on conflict (call_id) do nothing`,
+      [
+        callId,
+        leadId || null,
+        leadPhoneE164(phone),
+        handlerId || null,
+        handler,
+        letter,
+        numeric,
+        reason || null,
+        score.track === "other" ? "other" : "injury_lead",
+        direction || null,
+        quoLink || null,
+      ],
+    );
+    console.log(`[${firm.id}][call-grade] ${callId} ${letter} (${numeric}) ${handler}`);
+  } catch (err) {
+    console.error(`[${firm.id}][call-grade] Could not save ${callId}:`, err.message);
+  } finally {
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+
 async function handleCallSummary(firm, req, res) {
   res.status(200).json({ received: true });
   try {
@@ -4405,6 +4483,21 @@ async function handleCallSummary(firm, req, res) {
     }
     const transcript = await fetchCallTranscript(firm, callId);
     const matter = await findClientMatter(firm, externalPhone);
+    if (!sona) {
+      const handlerId = isInbound
+        ? (cached?.answeredBy || cached?.userId || null)
+        : (cached?.userId || cached?.answeredBy || null);
+      await gradeIntakeCall(firm, {
+        callId,
+        transcript,
+        handlerId,
+        handlerName: getQuoUserName(firm, handlerId),
+        direction: isInbound ? "inbound" : "outbound",
+        quoLink: deepLink,
+        phone: externalPhone,
+        leadId: matter?.leadId || null,
+      }).catch((err) => console.error(`[${firm.id}][call-grade] Error:`, err.message));
+    }
     const laterCall = matter?.promoted || (matter?.intakeCallId && matter.intakeCallId !== callId);
     if (laterCall) {
       await captureFollowUp(firm, {
