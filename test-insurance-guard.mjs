@@ -16,7 +16,7 @@ const harness = [
   `const BUCKET_LABEL = { insurance: "Excluded · Insurance company" };`,
   sliceFrom("const MAJOR_INSURER", "const FILTERING_BUCKETS"),
   sliceFrom("const FILTERING_BUCKETS", "function classificationFromReply"),
-  `export { looksLikeInsuranceCompanyCall, looksLikeInboundInsuranceCaller, holdUnverifiedCall };`,
+  `export { looksLikeInsuranceCompanyCall, looksLikeInboundInsuranceCaller, mentionsOwnFirm, holdUnverifiedCall };`,
 ].join("\n\n");
 
 const mod = await import("data:text/javascript," + encodeURIComponent(harness));
@@ -27,6 +27,8 @@ const HAS_STATE_FARM = `Caller was rear-ended on the highway last Tuesday and ha
 const ADJUSTER = `Adjuster from Progressive called regarding claim number 44-8812 to discuss the demand package and request updated medical records.`;
 const OUTBOUND_STATE_FARM = `The Legal Assistant initiated a new claim with State Farm. The claim is located in Texas.`;
 const PROVIDER = `Caller from Austin Physical Therapy asking where to send billing records and whether the firm received the last statement about insurance.`;
+const OTHER_LAW_FIRM = `Claudia from Ronald James Law Firm called and left a message. The call was in response to a missed call from +16504223661. Claudia provided a callback number: (512) 537-3369.`;
+const FIRM = { name: "Ramos James Law" };
 
 const CASES = [
   { name: "AAA Insurance leaving a Sona message", fn: "looksLikeInsuranceCompanyCall", arg: AAA, want: true },
@@ -35,6 +37,9 @@ const CASES = [
   { name: "injured caller who has State Farm is still a lead", fn: "looksLikeInsuranceCompanyCall", arg: HAS_STATE_FARM, want: false },
   { name: "medical provider mentioning insurance is not a carrier", fn: "looksLikeInsuranceCompanyCall", arg: PROVIDER, want: false },
   { name: "outbound staff filing a State Farm claim", fn: "looksLikeInsuranceCompanyCall", args: [OUTBOUND_STATE_FARM, true], want: true },
+  { name: "misheard Ramos James is not a carrier", fn: "looksLikeInsuranceCompanyCall", args: [OTHER_LAW_FIRM, true], want: false },
+  { name: "Ronald James Law Firm is this firm", fn: "mentionsOwnFirm", args: [OTHER_LAW_FIRM, FIRM], want: true },
+  { name: "exact firm name is this firm", fn: "mentionsOwnFirm", args: ["Liz from Ramos James Law left a message for the client.", FIRM], want: true },
 ];
 
 let pass = 0;

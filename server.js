@@ -3850,6 +3850,7 @@ CRITICAL RULES:
 - If the firm dialed out, this is not spam, not a robocall, and not a wrong number. If they did not reach anyone, do not classify it as a lead either.
 - If the firm placed the call to an insurance company, or the summary is staff filing, opening, or following up on a client's claim with a carrier, this is "insurance". Never "non_pi" or "qualified_lead". The firm calling State Farm, Progressive, GEICO, USAA, or any carrier is case work on a client, not a new lead.
 - If an insurance representative, adjuster, or someone from a named carrier (State Farm, AAA, Progressive, and similar) called the firm, this is "insurance" even when Sona or voicemail took the call, and even when they mention an existing client or a claim number. Never "qualified_lead", "existing_client", or "non_pi".
+- Only answer "insurance" when an insurance company or adjuster is actually identified. A misspelling of this firm's name is this firm, not an insurer and not another law office. If you are not sure it is a carrier, do not use "insurance".
 
 Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
 
@@ -3862,7 +3863,8 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     const contactName = outside ? getContactName(firm, outside) : null;
     const contextLines = [
       lineLabel ? `Firm line involved: "${lineLabel}"` : null,
-      outbound ? "This call was placed BY the firm (outbound). The firm is following up on a client or doing case work. Do not classify it as spam, a robocall, a wrong number, or a lead. If the other party is an insurer, answer \"insurance\"." : null,
+      outbound ? "This call was placed BY the firm (outbound). The firm is following up on a client or doing case work. Do not classify it as spam, a robocall, a wrong number, or a lead. Only answer \"insurance\" if an insurance company or adjuster is actually on the call." : null,
+      `This firm is named "${firm.name}". Speech-to-text often misspells that. A nearby misspelling is still this firm — not another law office and not an insurance company.`,
       contactName
         ? `The outside number is a saved contact named "${contactName}". A saved contact whose matter is closed may still be a new lead.`
         : `The outside number is NOT a saved contact — the firm has no record of this caller.`,
@@ -3880,6 +3882,13 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     console.log(`[${firm.id}][lead] LLM classification: "${reply}"`);
     const parsed = classificationFromReply(reply);
     if (parsed) {
+      if (parsed.bucket === "insurance" && !looksLikeInsuranceCompanyCall(text, outbound)
+        && mentionsOwnFirm(text, firm) && !namesMajorInsurer(text)) {
+        console.log(`[${firm.id}][lead] Own-firm name is not insurance`);
+        return outbound
+          ? { isLead: false, isQualified: false, bucket: null, label: "No (Outbound)" }
+          : { isLead: false, isQualified: false, bucket: null, label: "No" };
+      }
       if (looksLikeInsuranceCompanyCall(text, outbound)
         || (parsed.bucket === "non_pi" && namesMajorInsurer(text) && !looksLikeNonPiLegalInquiry(text))) {
         console.log(`[${firm.id}][lead] Insurance follow-up is not outside-practice`);
@@ -3916,6 +3925,27 @@ function namesMajorInsurer(text) {
 // A person asking the firm for a non-PI lawyer. Insurance follow-up is not this.
 function looksLikeNonPiLegalInquiry(text) {
   return /\b(divorce|child custody|child support|immigration|criminal defense|family law|bankruptcy|eviction|will and testament|probate)\b/i.test(String(text || ""));
+}
+
+function firmNameTokens(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !/^(the|law|firm|office|llp|llc|pc|pa|pllc|and)$/.test(w));
+}
+
+// Speech-to-text often hears this firm's name as a nearby "R… James Law Firm".
+function mentionsOwnFirm(text, firm) {
+  const tokens = firmNameTokens(firm?.name);
+  if (!tokens.length) return false;
+  const t = String(text || "").toLowerCase();
+  if (t.includes(tokens.join(" "))) return true;
+  if (tokens.length < 2) return false;
+  const last = tokens[tokens.length - 1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const first = tokens[0];
+  if (!first) return false;
+  return new RegExp(String.raw`\b${first[0]}[a-z]{2,8}\s+${last}\s+law\s+(?:firm|office)\b`, "i").test(t);
 }
 
 const FROM_INSURER_NAME = String.raw`(?!her|his|their|my|our|the|an?|your|this|that|about|regarding|has|have|with)[A-Za-z][\w&.''-]*`;
