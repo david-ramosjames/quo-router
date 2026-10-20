@@ -3817,7 +3817,7 @@ Classify each call into ONE of these categories:
 - "vendor": a sales pitch, a marketing call, a recruiter selling services, or a medical provider calling about records, billing, or appointments.
 - "employment": someone asking about a job at the firm.
 - "existing_client": someone with an open matter at this firm calling about that matter.
-- "insurance": an insurance company or adjuster on the call — inbound or the firm calling them — about a claim, a demand, subrogation, or filing/reporting a claim. Staff calling State Farm, Progressive, GEICO, USAA, or any carrier is insurance, not a lead.
+- "insurance": an insurance company, claims office, or adjuster on the call — inbound or the firm calling them — about a claim, a demand, subrogation, or filing/reporting a claim. Someone calling FROM State Farm, AAA, Progressive, GEICO, USAA, or any other carrier is insurance, even when they leave a message about an existing client. Staff calling a carrier is insurance, not a lead.
 - "other_law_office": another law firm, opposing counsel, co-counsel, or a mediator calling about a case.
 - "wrong_number": the caller reached the firm by mistake.
 
@@ -3829,7 +3829,7 @@ Signals that this IS a lead — any one of these is enough:
 - A FORMER client whose prior matter is closed is calling about a NEW incident
 
 Use the exclude words for calls that are not someone seeking legal help:
-- "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm) about claims, demands, or subrogation. Also the firm calling a carrier to open, report, or follow up on a claim.
+- "insurance": adjusters and insurance companies (Progressive, USAA, GEICO, State Farm, AAA) calling the firm, including to leave a message or ask about an existing client. Also the firm calling a carrier to open, report, or follow up on a claim. A person who merely has that insurer is not insurance.
 - "other_law_office": other law firms, opposing counsel, co-counsel, or a mediator
 - "vendor": medical providers calling about records, billing, or appointments; sales, marketing, recruiting, and press
 - "spam": inbound robocalls and automated systems calling the firm. Not an outbound call. Not a call that did not connect.
@@ -3849,6 +3849,7 @@ CRITICAL RULES:
 - Dog bites, animal attacks with injuries, car and truck crashes, slip and falls, and work injuries are "qualified_lead". Do not call them "non_pi" because the summary uses words like attacked, owner, or neighbor.
 - If the firm dialed out, this is not spam, not a robocall, and not a wrong number. If they did not reach anyone, do not classify it as a lead either.
 - If the firm placed the call to an insurance company, or the summary is staff filing, opening, or following up on a client's claim with a carrier, this is "insurance". Never "non_pi" or "qualified_lead". The firm calling State Farm, Progressive, GEICO, USAA, or any carrier is case work on a client, not a new lead.
+- If an insurance representative, adjuster, or someone from a named carrier (State Farm, AAA, Progressive, and similar) called the firm, this is "insurance" even when Sona or voicemail took the call, and even when they mention an existing client or a claim number. Never "qualified_lead", "existing_client", or "non_pi".
 
 Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call", "spam", "vendor", "employment", "existing_client", "insurance", "other_law_office", "wrong_number". No explanation.`;
 
@@ -3906,7 +3907,7 @@ function looksLikePersonalInjury(text) {
   return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b/i.test(String(text || ""));
 }
 
-const MAJOR_INSURER = /\b(state farm|progressive|geico|g\.e\.i\.c\.o|usaa|allstate|farmers(?: insurance)?|nationwide|liberty mutual|travelers|american family)\b/i;
+const MAJOR_INSURER = /\b(state farm|progressive|geico|g\.e\.i\.c\.o|usaa|allstate|farmers(?: insurance)?|nationwide|liberty mutual|travelers|american family|aaa(?: insurance)?|csaa|american county mutual|farm bureau|the hartford|hartford|safeco|mercury(?: insurance)?|national general|bristol west|dairyland|amica|erie insurance)\b/i;
 
 function namesMajorInsurer(text) {
   return MAJOR_INSURER.test(String(text || ""));
@@ -3917,15 +3918,29 @@ function looksLikeNonPiLegalInquiry(text) {
   return /\b(divorce|child custody|child support|immigration|criminal defense|family law|bankruptcy|eviction|will and testament|probate)\b/i.test(String(text || ""));
 }
 
+const FROM_INSURER_NAME = String.raw`(?!her|his|their|my|our|the|an?|your|this|that|about|regarding|has|have|with)[A-Za-z][\w&.''-]*`;
+
+// The caller IS the carrier — not an injured person who has that carrier.
+function looksLikeInboundInsuranceCaller(text) {
+  const t = String(text || "");
+  if (/\binsurance\s+(?:representative|rep\.?|adjuster|agent)\b/i.test(t)) return true;
+  if (/\bon behalf of\b[\s\S]{0,80}\b(?:insurance|aaa|state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)) return true;
+  if (new RegExp(String.raw`\bfrom\s+(?:aaa\s+insurance|(?:${FROM_INSURER_NAME}\s+){0,5}${FROM_INSURER_NAME}\s+insurance)\b`, "i").test(t)) return true;
+  if (/\b(?:called|calling) from\s+(?:aaa\s+insurance|state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)) return true;
+  if (/\brepresentante de seguros\b|\bcompa(?:ñ|n)[ií]a de seguros\b/i.test(t)) return true;
+  return false;
+}
+
 // The other party is a carrier or adjuster — not a person asking for a lawyer.
 // "Caller has State Farm" on a new inbound intake must not match.
 function looksLikeInsuranceCompanyCall(text, outbound = false) {
   const t = String(text || "");
+  if (looksLikeInboundInsuranceCaller(t)) return true;
   if (!namesMajorInsurer(t)) return false;
   if (
     /\b(adjuster|subrogation|demand package|initiated a (?:new )?claim|report(?:ing|ed) a (?:new )?(?:auto )?claim|follow(?:ing)? up|new (?:auto )?claim (?:with|through|at)|claim with)\b/i.test(t)
-    || /\b(?:legal assistant|paralegal|attorney|staff).{0,120}\b(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)
-    || /\b(?:called|calling|contact(?:ed|ing)|spoke with|reached)\s+(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual)\b/i.test(t)
+    || /\b(?:legal assistant|paralegal|attorney|staff).{0,120}\b(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual|aaa)\b/i.test(t)
+    || /\b(?:called|calling|contact(?:ed|ing)|spoke with|reached)\s+(?:state farm|progressive|geico|usaa|allstate|farmers|nationwide|liberty mutual|aaa)\b/i.test(t)
   ) return true;
   // Firm dialed out and the summary is about a claim/carrier — client follow-up.
   return outbound && /\b(claim|policy|carrier|insurance company|adjuster)\b/i.test(t);
@@ -3951,9 +3966,19 @@ function personAnswered(cached) {
 }
 
 // A missed call or a Sona call has not been verified by someone at the firm.
-// An exclude label would drop it from the queue, so keep it as No Contact.
-function holdUnverifiedCall(decision, { sona, cached, knownParty, outbound }) {
-  if (outbound || knownParty || !decision?.bucket || !FILTERING_BUCKETS.has(decision.bucket)) return decision;
+// An exclude label would drop it from the queue, so keep it as No Contact —
+// except insurance companies, which are never leads once we can identify them.
+function holdUnverifiedCall(decision, { sona, cached, knownParty, outbound, summary } = {}) {
+  if (outbound) return decision;
+  if (decision?.bucket === "insurance" || looksLikeInsuranceCompanyCall(summary)) {
+    return {
+      isLead: false,
+      isQualified: false,
+      bucket: "insurance",
+      label: BUCKET_LABEL.insurance,
+    };
+  }
+  if (knownParty || !decision?.bucket || !FILTERING_BUCKETS.has(decision.bucket)) return decision;
   if (!sona && personAnswered(cached)) return decision;
   return { isLead: true, isQualified: false, bucket: null, label: "No Contact" };
 }
@@ -4346,9 +4371,13 @@ async function handleCallSummary(firm, req, res) {
     const knownParty = [from, to].filter(Boolean).some((phone) => (
       !firm.phoneLines[phone] && (isActiveClient(firm, phone) || isKnownBusiness(firm, phone))
     ));
-    const { isLead, isQualified, bucket, label: leadLabel } = holdUnverifiedCall(classified, { sona, cached, knownParty, outbound });
+    const { isLead, isQualified, bucket, label: leadLabel } = holdUnverifiedCall(classified, {
+      sona, cached, knownParty, outbound, summary,
+    });
     if (leadLabel === "No Contact" && classified.label !== leadLabel) {
       console.log(`[${firm.id}][lead] Held ${classified.label} as No Contact until someone talks to them`);
+    } else if (bucket === "insurance" && classified.bucket !== "insurance") {
+      console.log(`[${firm.id}][lead] Insurance caller kept off leads (${classified.label})`);
     }
 
     const fromDisplay = formatFrom(firm, from);

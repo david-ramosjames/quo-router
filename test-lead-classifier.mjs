@@ -21,8 +21,10 @@ const harness = [
   grab("lastTenDigits"),
   grab("isOwnLine"),
   grab("MAJOR_INSURER"),
+  grab("FROM_INSURER_NAME"),
   grab("namesMajorInsurer"),
   grab("looksLikeNonPiLegalInquiry"),
+  grab("looksLikeInboundInsuranceCaller"),
   grab("looksLikeInsuranceCompanyCall"),
   grab("looksLikePersonalInjury"),
   `const BUCKET_LABEL = { insurance: "Excluded · Insurance company", non_pi: "Lead · Outside practice", return_call: "Return call" };`,
@@ -68,6 +70,10 @@ const CASES = [
     summary: "Caller asked whether the firm handles divorce and child custody. Intake explained the firm only handles personal injury." },
   { name: "insurance adjuster on a claim", want: "not_lead",
     summary: "Adjuster from Progressive called regarding claim number 44-8812 to discuss the demand package and request updated medical records." },
+  { name: "inbound AAA Insurance leaving a message is not a lead", want: "not_lead",
+    summary: "Vanessa Hansken from AAA Insurance called to leave a message for Matt Ray regarding an existing client, Juanita Zuleika. The caller provided her contact information and claim number to follow up on the client's reported injuries and request an email address." },
+  { name: "inbound insurance representative is not a lead", want: "not_lead",
+    summary: "An insurance representative called on behalf of American County Mutual Fire Insurance to request confirmation regarding reaching out to a client about property damage." },
   // Deliberately does NOT set activeClient: the guard would short-circuit it.
   // This checks the prompt itself still recognizes an open matter from wording.
   { name: "open client asking about settlement", want: "not_lead",
