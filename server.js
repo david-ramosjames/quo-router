@@ -4273,11 +4273,13 @@ async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerNam
     description: "Grade the intake agent's performance on this call.",
     maxTokens: 700,
     schema: CALL_GRADE_SCHEMA,
-    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed.
+    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed. Grade only an intake lead: a person asking the firm for help with a new matter, or staff calling that person back about the matter.
+
+If the other party is an insurance company, adjuster, medical provider, vendor, or this is existing-client file work, set grading_status to out_of_scope and overall_score to null.
 
 Classify the track first.
 injury_lead: a real personal-injury lead or consult. Score only C1 Greeting 10, C2 Compassion 15, C3 Control and listening 15, C4 Qualification 15, C5 Tailored firm value 15, C6 Catch release or next step 20, C7 Lead source 5, C8 Close 5.
-other: not a PI lead (property damage only, ordinary workers' comp, family, criminal, immigration, vendor, wrong number, existing-client admin). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
+other: a non-PI intake lead (family, criminal, immigration, or another legal matter the person wants help with). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
 
 met = full points, partial = half, missed = zero. not_applicable and not_observable stay out of the denominator. overall_score = round(100 * earned / observable applicable weight). If observable weight is under 50, grading_status is insufficient_evidence and overall_score is null. out_of_scope only for dead air or a silent agent. reason is one or two sentences naming why the score landed where it did. Do not invent quotes.`,
     user: `Handler: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
@@ -4512,7 +4514,8 @@ async function handleCallSummary(firm, req, res) {
     }
     const transcript = await fetchCallTranscript(firm, callId);
     const matter = await findClientMatter(firm, externalPhone);
-    if (!sona) {
+    // Insurance, vendors, medical offices, and existing-client calls are not intake leads.
+    if (!sona && isLead) {
       const handlerId = isInbound
         ? (cached?.answeredBy || cached?.userId || null)
         : (cached?.userId || cached?.answeredBy || null);
