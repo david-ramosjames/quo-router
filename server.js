@@ -1503,6 +1503,15 @@ function taggableOwner(name) {
   return text;
 }
 
+function consultationSource(summary, transcript) {
+  const summaryText = String(summary || "").trim().slice(0, 2000);
+  const spoken = String(transcript || "").trim().slice(0, 8000);
+  if (!spoken) {
+    return `Call summary:\n${summaryText}\n\nNo transcript was available. A summary that only names an injury is not a consultation.`;
+  }
+  return `Call summary:\n${summaryText}\n\nTranscript:\n${spoken}`;
+}
+
 function leadPhoneE164(phone) {
   const digits = String(phone || "").replace(/\D/g, "");
   if (digits.length === 10) return `+1${digits}`;
@@ -1769,7 +1778,7 @@ async function recordClassifiedCall(firm, {
 // Grade and sentiment are decisions on the lead. A new call may revise both.
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
-  phone, isQualified, summary, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
+  phone, isQualified, summary, transcript = null, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
   holdExclusion = false,
 }) {
   handledBy = taggableOwner(handledBy);
@@ -1811,9 +1820,9 @@ grade is the personal-injury strength of the case, not how far the lead has gott
 sentiment is how the person sounds about moving forward: positive, neutral, or negative. It is not the same as the grade. A strong case can be a reluctant caller.
 not_a_lead is true only when this call is not someone seeking legal help: spam, a vendor, an employment inquiry, an existing client, an insurance company, another law office, or a wrong number. It is false when the person wants legal help, including immigration, criminal, family, or any other matter outside personal injury. Those are still leads. A workplace injury, work accident, or workers' compensation question is a lead even when the team has not consulted yet, workers' compensation insurance exists, or no other driver was involved. It is false when there is a possible injury, even a thin one, or when the call does not say. Do not mark not_a_lead because the caller is unsure or the firm still needs facts.
 not_interested is true only when the caller rejects the firm or says they are no longer interested. It is false when they are unsure, shopping, or still willing to talk.
-consultation is true only when this phone call itself was a meaningful back-and-forth about an injury, not a brief question. It is false for a missed call, a voicemail, a call that only scheduled a later consultation, or a call that never became a real conversation. Scheduling a consultation is not the consultation. Whether the firm wants the case is not the consultation.
+consultation is true only when this call itself was a meaningful discussion of the potential case. Use the transcript when it is present. Look for a substantive exchange about the incident, who was responsible, the injuries, and treatment. Not every one of those topics has to come up, but enough of them must be discussed that this was a real case conversation. Naming an injury, asking one or two questions, or a short injury-related call is not enough. It is false for a brief workers' compensation inquiry that is referred out without that discussion, and for any call whose only outcome is an immediate referral. It is false for a missed call, a voicemail, a call that only scheduled a later consultation, or a call that never became a real conversation. Scheduling a consultation is not the consultation. Whether the firm wants the case is not the consultation. When no transcript is available, do not treat a summary that only lists an injury as a consultation.
 Reasons are one short sentence each. Do not invent facts.`,
-      user: sourceText.slice(0, 6000),
+      user: consultationSource(sourceText, transcript),
     });
   }
 
@@ -4525,6 +4534,7 @@ async function handleCallSummary(firm, req, res) {
     // a follow-up window, treat the call as a follow-up (log + merge into the
     // existing intake); otherwise a qualified lead opens a new intake.
     const externalPhone = firm.phoneLines[from] ? to : from;
+    const transcript = await fetchCallTranscript(firm, callId);
     if (isLead || bucket) {
       const handledBy = sona
         ? "Sona"
@@ -4533,6 +4543,7 @@ async function handleCallSummary(firm, req, res) {
         phone: externalPhone,
         isQualified,
         summary: summaryText,
+        transcript,
         quoLink: deepLink,
         callId,
         handledBy,
@@ -4542,7 +4553,6 @@ async function handleCallSummary(firm, req, res) {
         holdExclusion: leadLabel === "No Contact",
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
-    const transcript = await fetchCallTranscript(firm, callId);
     const matter = await findClientMatter(firm, externalPhone);
     // Insurance, vendors, medical offices, and existing-client calls are not intake leads.
     if (!sona && isLead) {
