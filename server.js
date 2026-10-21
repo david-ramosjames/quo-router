@@ -4349,14 +4349,41 @@ const CALL_GRADE_SCHEMA = {
   type: "object",
   properties: {
     grading_status: { type: "string", enum: ["graded", "insufficient_evidence", "out_of_scope"] },
+    jobs: { type: "string", enum: ["screen", "intake", "both"] },
     track: { type: "string", enum: ["injury_lead", "other"] },
+    screen_handler: { type: ["string", "null"] },
+    intake_handler: { type: ["string", "null"] },
+    screen_score: { type: ["integer", "null"] },
+    intake_score: { type: ["integer", "null"] },
     overall_score: { type: ["integer", "null"] },
     reason: { type: "string" },
   },
-  required: ["grading_status", "track", "overall_score", "reason"],
+  required: [
+    "grading_status",
+    "jobs",
+    "track",
+    "screen_handler",
+    "intake_handler",
+    "screen_score",
+    "intake_score",
+    "overall_score",
+    "reason",
+  ],
 };
 
-// RJL intake rubric (quo-reporting intakeGradingRubric.md), scored 0–100 and stored as A–F.
+function normalizeCallJobs(value, track) {
+  const raw = String(value || "").toLowerCase().trim();
+  if (raw === "screen" || raw === "intake" || raw === "both") return raw;
+  return track === "other" ? "screen" : "both";
+}
+
+function cleanHandlerLabel(value, fallback) {
+  const name = String(value || "").replace(/\s+/g, " ").trim();
+  if (!name || /^unknown$/i.test(name) || /^null$/i.test(name)) return fallback || null;
+  return name.slice(0, 120);
+}
+
+// RJL intake rubric: screen (injury?) on every lead call; full intake only when injury-related.
 async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerName, direction, quoLink, phone, leadId, firmPhone }) {
   if (!callId || !llmConfigured() || !firm.caseDbUrl) return;
   const text = String(transcript || "").trim();
@@ -4369,55 +4396,116 @@ async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerNam
   const score = await llmExtract({
     label: `${firm.id}][call-grade`,
     name: "grade_intake_call",
-    description: "Grade the intake agent's performance on this call.",
-    maxTokens: 700,
+    description: "Grade screen and intake jobs on this lead call.",
+    maxTokens: 900,
     schema: CALL_GRADE_SCHEMA,
-    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed.
+    system: `You grade Ramos James Law lead-call performance from a transcript. Grade the agent(s), not case strength and not whether a contract was signed.
 
-Score ONLY new intake leads: a person asking the firm for help with a new matter, or staff calling that person back about signing / qualifying that new matter.
+There are TWO jobs on a lead:
+1) SCREEN — on every lead call, decide if this is injury / personal-injury related (or correctly stop as non-PI). Greeting, listening, enough facts for scope, correct PI vs non-PI decision, clear next step or referral when non-PI.
+2) INTAKE — only when injury-related: full PI intake (qualify incident/injury/liability, firm value, contract or same-day attorney next step, lead source, close).
 
-Set grading_status to out_of_scope and overall_score to null when:
+For THIS recording set jobs to:
+- screen — only screening happened (including correctly identifying non-PI and stopping)
+- intake — this call continued or performed full intake without (re)screening (e.g. a follow-up that picks up intake)
+- both — this call screened AND did full intake work
+
+Identify screen_handler and intake_handler from the transcript (agent self-intros / who spoke). They may be the same person or two people (transfer). If only one agent is identifiable, use that name for every job performed on this call. If a job was not performed, set that handler to null.
+
+Score ONLY new intake leads: a person asking the firm for help with a new matter, or staff calling that person back about that matter.
+
+Set grading_status to out_of_scope and all scores to null when:
 - existing client or known lead about ongoing treatment, case status, medical appointments, insurance, or message relay to their attorney/paralegal
 - insurance company, adjuster, medical provider, or vendor
 - dead air, hold-only, or silent agent
 
-Classify the track first (only if this is a new lead).
-injury_lead: a real personal-injury new lead or consult. Score only C1 Greeting 10, C2 Compassion 15, C3 Control and listening 15, C4 Qualification 15, C5 Tailored firm value 15, C6 Catch release or next step 20, C7 Lead source 5, C8 Close 5.
-other: a non-PI new intake inquiry (family, criminal, immigration, or another legal matter the person wants help with). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
+track:
+- injury_lead when the matter is (or is treated as) a PI / injury lead
+- other when the caller wanted help on a non-PI matter
 
-met = full points, partial = half, missed = zero. not_applicable and not_observable stay out of the denominator. overall_score = round(100 * earned / observable applicable weight). If observable weight is under 50, grading_status is insufficient_evidence and overall_score is null. reason is one or two sentences naming why the score landed where it did. Do not invent quotes.`,
-    user: `Handler: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
+Scoring (0–100 integers):
+- screen_score when jobs is screen or both. Weight: greeting/professionalism 20, listening/facts 20, correct scope decision 30, explanation/referral or clear handoff 20, close/next step 10. Do not require a PI value pitch or contract offer on screen-only / non-PI.
+- intake_score when jobs is intake or both AND track is injury_lead. Weight: C1 Greeting 10, C2 Compassion 15, C3 Control 15, C4 Qualification 15, C5 Firm value 15, C6 Catch/release/next step 20, C7 Lead source 5, C8 Close 5.
+- overall_score = intake_score when present, else screen_score.
+met = full points, partial = half, missed = zero. If observable weight is under 50 for a job, set that job's score to null. If no usable score remains, grading_status is insufficient_evidence.
+reason is one or two sentences on why the scores landed where they did. Do not invent quotes.`,
+    user: `Default handler if names are unclear: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
   });
-  if (!score || score.grading_status !== "graded" || !Number.isFinite(Number(score.overall_score))) {
+  if (!score || score.grading_status !== "graded") {
     console.log(`[${firm.id}][call-grade] ${callId} ${score?.grading_status || "ungraded"}`);
     return;
   }
-  const numeric = Math.max(0, Math.min(100, Math.round(Number(score.overall_score))));
-  const letter = letterForCallScore(numeric);
+  const track = score.track === "other" ? "other" : "injury_lead";
+  const jobs = normalizeCallJobs(score.jobs, track);
+  const screenNumeric = Number.isFinite(Number(score.screen_score))
+    ? Math.max(0, Math.min(100, Math.round(Number(score.screen_score))))
+    : null;
+  const intakeNumeric = Number.isFinite(Number(score.intake_score))
+    ? Math.max(0, Math.min(100, Math.round(Number(score.intake_score))))
+    : null;
+  let overallNumeric = Number.isFinite(Number(score.overall_score))
+    ? Math.max(0, Math.min(100, Math.round(Number(score.overall_score))))
+    : null;
+  if (overallNumeric == null) {
+    overallNumeric = intakeNumeric != null ? intakeNumeric : screenNumeric;
+  }
+  if (overallNumeric == null) {
+    console.log(`[${firm.id}][call-grade] ${callId} insufficient_evidence`);
+    return;
+  }
+  if (jobs === "screen" || jobs === "both") {
+    // Screen should have a score when that job ran.
+  } else if (intakeNumeric == null && screenNumeric == null) {
+    console.log(`[${firm.id}][call-grade] ${callId} insufficient_evidence`);
+    return;
+  }
+  const letter = letterForCallScore(overallNumeric);
+  const screenLetter = screenNumeric != null ? letterForCallScore(screenNumeric) : null;
+  const intakeLetter = intakeNumeric != null ? letterForCallScore(intakeNumeric) : null;
+  const screenHandler =
+    (jobs === "screen" || jobs === "both"
+      ? cleanHandlerLabel(score.screen_handler, handler)
+      : cleanHandlerLabel(score.screen_handler, null)) ||
+    (jobs === "screen" || jobs === "both" ? handler : null);
+  const intakeHandler =
+    (jobs === "intake" || jobs === "both"
+      ? cleanHandlerLabel(score.intake_handler, handler)
+      : cleanHandlerLabel(score.intake_handler, null)) ||
+    (jobs === "intake" || jobs === "both" ? handler : null);
+  const primaryHandler = intakeHandler || screenHandler || handler;
   const reason = String(score.reason || "").replace(/\s+/g, " ").trim().slice(0, 400);
   let client;
   try {
     client = await connectCaseDb(firm);
     await client.query(
       `insert into public.call_grades
-         (call_id, lead_id, phone_e164, handler_id, handler_name, grade, score, reason, track, direction, quo_link, occurred_at)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+         (call_id, lead_id, phone_e164, handler_id, handler_name, grade, score, reason, track, jobs,
+          screen_handler_name, intake_handler_name, screen_grade, screen_score, intake_grade, intake_score,
+          direction, quo_link, occurred_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, now())
        on conflict (call_id) do nothing`,
       [
         callId,
         leadId || null,
         leadPhoneE164(phone),
         handlerId || null,
-        handler,
+        primaryHandler,
         letter,
-        numeric,
+        overallNumeric,
         reason || null,
-        score.track === "other" ? "other" : "injury_lead",
+        track,
+        jobs,
+        screenHandler,
+        intakeHandler,
+        screenLetter,
+        screenNumeric,
+        intakeLetter,
+        intakeNumeric,
         direction || null,
         quoLink || null,
       ],
     );
-    console.log(`[${firm.id}][call-grade] ${callId} ${letter} (${numeric}) ${handler}`);
+    console.log(`[${firm.id}][call-grade] ${callId} ${jobs} ${letter} (${overallNumeric}) screen=${screenHandler || "—"} intake=${intakeHandler || "—"}`);
   } catch (err) {
     console.error(`[${firm.id}][call-grade] Could not save ${callId}:`, err.message);
   } finally {
