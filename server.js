@@ -2770,7 +2770,12 @@ async function loadQuoUsers(firm) {
     const users = json.data || [];
     firm.quoUsersCache.clear();
     for (const user of users) {
-      const name = [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+      const name = cleanQuoDisplayName(
+        [user.firstName, user.lastName].filter(Boolean).join(" ").trim() ||
+          user.name ||
+          user.email ||
+          "",
+      );
       if (user.id && name) firm.quoUsersCache.set(user.id, name);
     }
     console.log(`[${firm.id}][quo-users] Loaded ${firm.quoUsersCache.size} users`);
@@ -2779,9 +2784,61 @@ async function loadQuoUsers(firm) {
   }
 }
 
+function cleanQuoDisplayName(name) {
+  return String(name || "")
+    .replace(/\s+ES\s+\d{3,}\s*$/i, "")
+    .replace(/\s+#?\d{3,5}\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function getQuoUserName(firm, userId) {
   if (!userId) return null;
-  return firm.quoUsersCache.get(userId) || null;
+  const raw = firm.quoUsersCache.get(userId);
+  if (!raw) return null;
+  return cleanQuoDisplayName(raw) || raw;
+}
+
+function matchHandlerFromTranscript(transcript, candidateNames) {
+  const text = String(transcript || "");
+  if (!text || !candidateNames?.length) return null;
+  const head = text.slice(0, 3500);
+  const sorted = [...candidateNames]
+    .filter((n) => n && String(n).trim().length >= 2)
+    .map((n) => cleanQuoDisplayName(n) || String(n).trim())
+    .sort((a, b) => b.length - a.length);
+  for (const name of sorted) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const intro = new RegExp(
+      `(?:this is|i(?:'m| am)|my name is|speaking(?: with)?|` +
+        `hablas?\\s+con|le\\s+habla|mi\\s+nombre\\s+es|soy)\\s+${esc}\\b` +
+        `|\\b${esc}\\s+(?:speaking|here)`,
+      "i",
+    );
+    if (intro.test(head) || intro.test(text)) return name;
+  }
+  for (const name of sorted) {
+    if (name.split(/\s+/).length < 2) continue;
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`\\b${esc}\\b`, "i").test(head)) return name;
+  }
+  return null;
+}
+
+/**
+ * Prefer staff name from transcript (matched against Quo user / staff names).
+ * Fall back to phone-line label (Intake / Leads / Paralegal) — not Quo answeredBy
+ * display names, which often look like the contact rather than the agent.
+ */
+function resolveCallHandlerName(firm, { transcript, firmPhone }) {
+  const displayNames = [...(firm.quoUsersCache?.values?.() || [])]
+    .map((n) => cleanQuoDisplayName(n))
+    .filter(Boolean);
+  const fromTranscript = matchHandlerFromTranscript(transcript, displayNames);
+  if (fromTranscript) return fromTranscript;
+  const line = firmPhone && firm.phoneLines?.[firmPhone];
+  if (line) return String(line);
+  return null;
 }
 
 async function fetchCallFromQuo(firm, callId) {
@@ -4300,11 +4357,14 @@ const CALL_GRADE_SCHEMA = {
 };
 
 // RJL intake rubric (quo-reporting intakeGradingRubric.md), scored 0–100 and stored as A–F.
-async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerName, direction, quoLink, phone, leadId }) {
+async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerName, direction, quoLink, phone, leadId, firmPhone }) {
   if (!callId || !llmConfigured() || !firm.caseDbUrl) return;
   const text = String(transcript || "").trim();
   if (text.length < 350) return;
-  const handler = handlerName || "Unknown";
+  const handler =
+    resolveCallHandlerName(firm, { transcript: text, firmPhone }) ||
+    (firmPhone && firm.phoneLines?.[firmPhone]) ||
+    "Unknown";
   const clipped = text.length > 28000 ? `${text.slice(0, 28000)}\n\n[transcript truncated]` : text;
   const score = await llmExtract({
     label: `${firm.id}][call-grade`,
@@ -4312,15 +4372,20 @@ async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerNam
     description: "Grade the intake agent's performance on this call.",
     maxTokens: 700,
     schema: CALL_GRADE_SCHEMA,
-    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed. Grade only an intake lead: a person asking the firm for help with a new matter, or staff calling that person back about the matter.
+    system: `You grade Ramos James Law intake-agent performance from a transcript. Grade the agent, not the strength of the case and not whether a contract was signed.
 
-If the other party is an insurance company, adjuster, medical provider, vendor, or this is existing-client file work, set grading_status to out_of_scope and overall_score to null.
+Score ONLY new intake leads: a person asking the firm for help with a new matter, or staff calling that person back about signing / qualifying that new matter.
 
-Classify the track first.
-injury_lead: a real personal-injury lead or consult. Score only C1 Greeting 10, C2 Compassion 15, C3 Control and listening 15, C4 Qualification 15, C5 Tailored firm value 15, C6 Catch release or next step 20, C7 Lead source 5, C8 Close 5.
-other: a non-PI intake lead (family, criminal, immigration, or another legal matter the person wants help with). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
+Set grading_status to out_of_scope and overall_score to null when:
+- existing client or known lead about ongoing treatment, case status, medical appointments, insurance, or message relay to their attorney/paralegal
+- insurance company, adjuster, medical provider, or vendor
+- dead air, hold-only, or silent agent
 
-met = full points, partial = half, missed = zero. not_applicable and not_observable stay out of the denominator. overall_score = round(100 * earned / observable applicable weight). If observable weight is under 50, grading_status is insufficient_evidence and overall_score is null. out_of_scope only for dead air or a silent agent. reason is one or two sentences naming why the score landed where it did. Do not invent quotes.`,
+Classify the track first (only if this is a new lead).
+injury_lead: a real personal-injury new lead or consult. Score only C1 Greeting 10, C2 Compassion 15, C3 Control and listening 15, C4 Qualification 15, C5 Tailored firm value 15, C6 Catch release or next step 20, C7 Lead source 5, C8 Close 5.
+other: a non-PI new intake inquiry (family, criminal, immigration, or another legal matter the person wants help with). Score only O1 Greeting 20, O2 Listening 20, O3 Correct scope 30, O4 Explanation and referral 20, O5 Close 10. Do not penalize a missing contract pitch on this track.
+
+met = full points, partial = half, missed = zero. not_applicable and not_observable stay out of the denominator. overall_score = round(100 * earned / observable applicable weight). If observable weight is under 50, grading_status is insufficient_evidence and overall_score is null. reason is one or two sentences naming why the score landed where it did. Do not invent quotes.`,
     user: `Handler: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
   });
   if (!score || score.grading_status !== "graded" || !Number.isFinite(Number(score.overall_score))) {
@@ -4559,6 +4624,7 @@ async function handleCallSummary(firm, req, res) {
       const handlerId = isInbound
         ? (cached?.answeredBy || cached?.userId || null)
         : (cached?.userId || cached?.answeredBy || null);
+      const firmPhone = firm.phoneLines[from] ? from : (firm.phoneLines[to] ? to : null);
       await gradeIntakeCall(firm, {
         callId,
         transcript,
@@ -4568,6 +4634,7 @@ async function handleCallSummary(firm, req, res) {
         quoLink: deepLink,
         phone: externalPhone,
         leadId: matter?.leadId || null,
+        firmPhone,
       }).catch((err) => console.error(`[${firm.id}][call-grade] Error:`, err.message));
     }
     const laterCall = matter?.promoted || (matter?.intakeCallId && matter.intakeCallId !== callId);
