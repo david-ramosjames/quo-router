@@ -1551,9 +1551,8 @@ const BUCKET_LABEL = {
   non_pi: "Lead · Outside practice",
 };
 
-// Store the classification without putting an excluded call into the work queue.
 // A return call is merged onto the lead that phone already has.
-// A non-PI legal inquiry is still a lead, then closed as outside practice.
+// A classification never closes a lead. It leaves a suggestion a person confirms.
 async function recordClassifiedCall(firm, {
   phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
 }) {
@@ -1698,76 +1697,78 @@ async function recordClassifiedCall(firm, {
       }
     }
 
-    const closeReason = "not_a_lead";
-    const grade = outside ? "C" : null;
-    const reason = outside ? "Sought legal help outside personal injury." : (BUCKET_LABEL[bucket] || bucket);
-    const decline = outside ? "Referred" : null;
-    const tags = outside ? ["QUALIFIED NO", "DEC: Referred"] : null;
+    const reason = BUCKET_LABEL[bucket] || bucket;
+    const detail = summaryText ? `${reason}: ${summaryText}` : reason;
     if (row) {
+      if (["Lost", "Referred"].includes(row.lead_status)) {
+        await client.query(
+          `update public.leads set
+             case_detail = case
+               when $2::text is null then case_detail
+               when case_detail is null or case_detail = '' then $2
+               when position($2 in case_detail) > 0 then case_detail
+               else right(case_detail || E'\n\n' || $2, 15000)
+             end
+           where id = $1`,
+          [row.id, detail],
+        );
+        await client.query(
+          `insert into public.lead_events (lead_id, event_type, actor, payload)
+           values ($1, 'return_call', 'quo-router', $2::jsonb)`,
+          [row.id, JSON.stringify({ call_id: callId || null, bucket })],
+        );
+        return;
+      }
       await client.query(
         `update public.leads set
-           caller_class = $2,
-           lead_status = 'Lost',
-           follow_up = false,
-           sequence = 'stop',
-           close_reason = $3,
-           grade = coalesce($4, grade),
-           grade_reason = $5,
-           grade_source = case when $4::text is null then grade_source else 'quo-router' end,
-           decline_reason = coalesce($6, decline_reason),
-           callrail_tags = case
-             when $7::text[] is null then callrail_tags
-             else (
-               select coalesce(array_agg(distinct tag), '{}')
-               from unnest(coalesce(callrail_tags, '{}'::text[]) || $7::text[]) as tag
-             )
-           end,
-           summary = coalesce($8, summary),
-           slack_permalink = coalesce($9, slack_permalink)
-         where id = $1`,
-        [row.id, bucket, closeReason, grade, reason, decline, tags, summaryText, slackPermalink || null],
-      );
-      await client.query(
-        `update public.lead_jobs set status = 'skipped', detail = $2 where lead_id = $1 and status = 'pending'`,
-        [row.id, reason],
+           close_suggestion = 'not_a_lead',
+           grade_reason = coalesce(grade_reason, $2),
+           summary = coalesce(summary, $3),
+           slack_permalink = coalesce(slack_permalink, $4),
+           case_detail = case
+             when $5::text is null then case_detail
+             when case_detail is null or case_detail = '' then $5
+             when position($5 in case_detail) > 0 then case_detail
+             else right(case_detail || E'\n\n' || $5, 15000)
+           end
+         where id = $1
+           and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
+        [row.id, reason, summaryText, slackPermalink || null, detail],
       );
       await client.query(
         `insert into public.lead_events (lead_id, event_type, actor, payload)
-         values ($1, $2, 'quo-router', $3::jsonb)`,
-        [row.id, outside ? "outside_practice" : "not_a_lead", JSON.stringify({ caller_class: bucket, call_id: callId || null })],
+         values ($1, 'close_suggested', 'quo-router', $2::jsonb)`,
+        [row.id, JSON.stringify({ close_suggestion: "not_a_lead", caller_class: bucket, call_id: callId || null })],
       );
-      console.log(`[${firm.id}][lead] Classified ${row.id} as ${bucket}`);
+      console.log(`[${firm.id}][lead] Suggested not-a-lead (${bucket}) for ${row.id}`);
       return;
     }
 
     const inserted = await client.query(
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
-         summary, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
-         grade, grade_reason, grade_source, follow_up, close_reason, caller_class,
-         decline_reason, callrail_tags
+         summary, quo_link, intake_call_id, owner_name, slack_permalink,
+         grade_reason, follow_up, close_suggestion
        ) values (
-         current_date, $1, $2, 'Call', 'Call', 'Lost', 'needs_info', $3,
-         $4, 'stop', $5, $6, $7, $8,
-         $9, $10, case when $9::text is null then null else 'quo-router' end,
-         false, $11, $12,
-         $13, $14::text[]
+         current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
+         $4, $5, $6, $7, $8,
+         $9, true, 'not_a_lead'
        )
        on conflict (intake_call_id) do nothing
        returning id`,
       [
         phone || null, phoneE164, arrival || null, summaryText, quoLink || null, callId || null,
-        handledBy || null, slackPermalink || null, grade, reason, closeReason, bucket, decline, tags,
+        handledBy || null, slackPermalink || null, reason,
       ],
     );
     const id = inserted.rows[0]?.id;
     if (!id) return;
     await client.query(
       `insert into public.lead_events (lead_id, event_type, actor, payload)
-       values ($1, $2, 'quo-router', $3::jsonb)`,
-      [id, outside ? "outside_practice" : "not_a_lead", JSON.stringify({ caller_class: bucket, call_id: callId || null })],
+       values ($1, 'close_suggested', 'quo-router', $2::jsonb)`,
+      [id, JSON.stringify({ close_suggestion: "not_a_lead", caller_class: bucket, call_id: callId || null })],
     );
-    console.log(`[${firm.id}][lead] Stored ${bucket} call ${id} outside the work queue`);
+    console.log(`[${firm.id}][lead] Opened ${bucket} call ${id} for a person to close`);
   } catch (err) {
     console.error(`[${firm.id}][lead] Could not store classification:`, err.message);
   } finally {
