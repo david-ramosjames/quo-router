@@ -13,13 +13,28 @@ export function nextSequence({ text, isQualified, existing }) {
   return "needs_info";
 }
 
-function firstPhone(text, toE164) {
-  const matches = String(text || "").match(/(?:\+?1[\s.-]*)?(?:\(?\d{3}\)?[\s.-]*)\d{3}[\s.-]*\d{4}/g) || [];
+function boundedPhone(text, toE164) {
+  const matches = String(text || "").match(/(?:^|[^\d])(?:\+?1[\s.-]*)?(?:\(?\d{3}\)?[\s.-]*)\d{3}[\s.-]*\d{4}(?!\d)/g) || [];
   for (const raw of matches) {
     const e164 = toE164(raw);
     if (e164) return e164;
   }
   return null;
+}
+
+function labeledLine(text, label) {
+  return text.match(new RegExp(`(?:^|\\n)\\s*>?\\s*\\*?\\s*${label}\\s*:\\s*\\*?([^\\n]+)`, "i"))?.[1] ?? "";
+}
+
+/** The caller's number. CallRail links and the destination line are not a phone. */
+export function firstPhone(text, toE164) {
+  const clean = String(text || "")
+    .replace(/<https?:\/\/[^>|]+(?:\|[^>]+)?>/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ");
+  const labeled = boundedPhone(`${labeledLine(clean, "Phone")}\n${labeledLine(clean, "From")}`, toE164);
+  if (labeled) return labeled;
+  const withoutDestination = clean.replace(/(?:^|\n)\s*>?\s*\*?\s*To\s*:[^\n]*/gi, "\n");
+  return boundedPhone(withoutDestination, toE164);
 }
 
 function firstEmail(text) {
@@ -204,6 +219,7 @@ export async function absorbLeadChannel(firm, deps) {
         continue;
       }
       const phoneE164 = firstPhone(text, deps.leadPhoneE164);
+      const callNotice = /callrail\.com|\bnew call\b/i.test(text);
       const found = await client.query(
         `select id, kind, case_detail, sequence, signed_case, case_id, lead_status
          from public.leads
@@ -273,13 +289,14 @@ export async function absorbLeadChannel(firm, deps) {
            lead_date, lead_name, phone, phone_e164, email, case_type, lead_source, source_channel, lead_status, kind, arrival,
            case_detail, sequence, follow_up, slack_channel_id, slack_message_ts
          ) values (
-           current_date, $9, $1, $1, $2, $10, $11, 'Web form', 'New', $3, 'form',
+           current_date, $9, $1, $1, $2, $10, $11, $12, 'New', $3, $13,
            $4, $5, $6, $7, $8
          )
          returning id`,
         [
           phoneE164, firstEmail(text), kind, caseDetail, sequence,
           sequence !== "stop", channelId, message.ts, clientName, facts.accident, facts.source,
+          callNotice ? "Call" : "Web form", callNotice ? "human_call" : "form",
         ],
       );
       const id = inserted.rows[0]?.id || null;

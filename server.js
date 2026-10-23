@@ -806,31 +806,36 @@ async function postToSlack(webhookUrl, text) {
 }
 
 // --- Slack message searching (firm-agnostic; operates on message list) ---
+function slackText(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && typeof value.text === "string") return value.text;
+  return "";
+}
+
 function getFullMessageText(msg) {
-  let parts = [msg.text || ""];
+  let parts = [slackText(msg.text)];
   if (msg.attachments) {
     for (const att of msg.attachments) {
-      parts.push(att.text || "", att.fallback || "", att.pretext || "", att.title || "");
+      parts.push(slackText(att.text), slackText(att.fallback), slackText(att.pretext), slackText(att.title));
       if (att.fields) {
-        for (const f of att.fields) parts.push(f.title || "", f.value || "");
+        for (const f of att.fields) parts.push(slackText(f.title), slackText(f.value));
       }
     }
   }
   if (msg.blocks) {
     for (const block of msg.blocks) {
-      if (block.text?.text) parts.push(block.text.text);
+      parts.push(slackText(block.text));
       if (block.fields) {
-        for (const f of block.fields) parts.push(f.text || "");
+        for (const f of block.fields) parts.push(slackText(f.text));
       }
       if (block.elements) {
         for (const el of block.elements) {
-          parts.push(el.text || el.value || "");
-          if (el.text?.text) parts.push(el.text.text);
+          parts.push(slackText(el.text), slackText(el.value));
         }
       }
     }
   }
-  return parts.join(" ");
+  return parts.filter(Boolean).join(" ");
 }
 
 function searchChannelHistoryForPhone(messages, phoneNumber) {
