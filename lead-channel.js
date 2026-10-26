@@ -22,7 +22,8 @@ export async function phoneSignedRecently(client, phoneE164) {
        and occurred_at >= now() - interval '30 days'
        and (
          content ilike '%received your signed documents%'
-         or content ilike '%documentos firmados%'
+         or content ilike '%recibió sus documentos firmados%'
+         or content ilike '%recibio sus documentos firmados%'
        )
      limit 1`,
     [phoneE164],
