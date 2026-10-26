@@ -4,7 +4,7 @@ import path from "path";
 import crypto from "crypto";
 import dns from "node:dns";
 import { fileURLToPath } from "url";
-import { absorbLeadChannel, nextSequence } from "./lead-channel.js";
+import { absorbLeadChannel, nextSequence, phoneSignedRecently } from "./lead-channel.js";
 import { loadStaffDirectory, matchStaff, staffPromptLine } from "./staff-directory.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
@@ -1526,6 +1526,23 @@ function leadPhoneE164(phone) {
 
 // A property dispute or a wrong number is not a lead.
 // A crash, fall, bite, or work injury stays a lead. Workers' compensation, no other driver, and no consultation yet do not change that.
+function caseTypeIsLead(value) {
+  const type = String(value || "").trim().toLowerCase();
+  if (!type || type === "tbd" || type === "unknown / no response") return false;
+  return [
+    "auto accident",
+    "wrongful death",
+    "work injury",
+    "sexual assault / child abuse",
+    "premises liability",
+    "pedestrian / bicycle / scooter",
+    "other injury",
+    "dog bite",
+    "commercial / 18 wheeler",
+    "non-pi legal matter",
+  ].includes(type);
+}
+
 function callIsNotALead(text, score) {
   const body = String(text || "");
   if (/\b(work(?:place)? injur(?:y|ies)|work accident|workers?'? compensation|company vehicle|on the job|car accident|truck|motorcycle|pedestrian|rear-?ended|slip and fall|dog bite|18-wheeler)\b/i.test(body)) {
@@ -1672,6 +1689,10 @@ async function recordClassifiedCall(firm, {
         return;
       }
       if (!row) {
+        if (await phoneSignedRecently(client, phoneE164)) {
+          console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
+          return;
+        }
         const inserted = await client.query(
           `insert into public.leads (
              lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
@@ -1749,6 +1770,10 @@ async function recordClassifiedCall(firm, {
       return;
     }
 
+    if (await phoneSignedRecently(client, phoneE164)) {
+      console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
+      return;
+    }
     const inserted = await client.query(
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
@@ -1840,7 +1865,7 @@ Reasons are one short sentence each. Do not invent facts.`,
     const found = await client.query(
       `select id, kind, sequence, intake_call_id, signed_case, case_id, lead_status,
               agreement_status, agreement_sent_at, consultation_date, grade,
-              callrail_tags, qualified, decline_reason, close_reason
+              callrail_tags, qualified, decline_reason, close_reason, close_suggestion, case_type
        from public.leads
        where ($1::text is not null and intake_call_id = $1)
           or ($2::text is not null and phone_e164 = $2
@@ -1855,7 +1880,9 @@ Reasons are one short sentence each. Do not invent facts.`,
     const kind = isQualified ? "pursue" : (existing?.kind || "needs_info");
     const contractOut = Boolean(existing?.agreement_sent_at)
       || ["sent", "viewed", "signed", "completed"].includes(existing?.agreement_status || "");
-    const flagged = !holdExclusion && callIsNotALead(sourceText, score) && !contractOut;
+    const qualifiedYes = existing?.qualified === true || (existing?.callrail_tags || []).includes("QUALIFIED YES");
+    const established = contractOut || qualifiedYes || caseTypeIsLead(existing?.case_type);
+    const flagged = !holdExclusion && callIsNotALead(sourceText, score) && !established;
     const suggestion = flagged ? "not_a_lead" : (!holdExclusion && score?.not_interested ? "not_interested" : null);
     // Decline, rejection, and not-a-lead stay open until a person confirms them.
     const closeNow = false;
@@ -1945,6 +1972,12 @@ Reasons are one short sentence each. Do not invent facts.`,
            where id = $1 and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
           [existing.id, suggestion],
         );
+      } else if (established && existing.close_suggestion === "not_a_lead") {
+        await client.query(
+          `update public.leads set close_suggestion = null
+           where id = $1 and close_suggestion = 'not_a_lead'`,
+          [existing.id],
+        );
       }
       await client.query(
         `insert into public.lead_events (lead_id, event_type, actor, payload)
@@ -1962,6 +1995,10 @@ Reasons are one short sentence each. Do not invent facts.`,
       return;
     }
 
+    if (await phoneSignedRecently(client, phoneE164)) {
+      console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
+      return;
+    }
     const inserted = await client.query(
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,

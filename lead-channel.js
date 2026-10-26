@@ -4,6 +4,32 @@
 
 import { loadStaffDirectory, matchStaff } from "./staff-directory.js";
 
+/** A phone that signed in the last 30 days is the same client, not a new lead. */
+export async function phoneSignedRecently(client, phoneE164) {
+  if (!phoneE164) return false;
+  const signedLead = await client.query(
+    `select id from public.leads
+     where phone_e164 = $1
+       and (signed_case = true or lead_status in ('Signed', 'Promoted'))
+       and coalesce(date_signed, signed_at::date, lead_date, created_at::date) >= (current_date - interval '30 days')
+     limit 1`,
+    [phoneE164],
+  );
+  if (signedLead.rows[0]) return true;
+  const signedText = await client.query(
+    `select id from public.intake_interactions
+     where phone_e164 = $1
+       and occurred_at >= now() - interval '30 days'
+       and (
+         content ilike '%received your signed documents%'
+         or content ilike '%documentos firmados%'
+       )
+     limit 1`,
+    [phoneE164],
+  );
+  return Boolean(signedText.rows[0]);
+}
+
 const SEQUENCES = new Set(["want_to_sign", "needs_info", "referral", "stop"]);
 
 export function nextSequence({ text, isQualified, existing }) {
@@ -282,6 +308,11 @@ export async function absorbLeadChannel(firm, deps) {
 
       if (!phoneE164) {
         await remember(client, channelId, message.ts, null);
+        continue;
+      }
+      if (await phoneSignedRecently(client, phoneE164)) {
+        await remember(client, channelId, message.ts, null);
+        console.log(`[${firm.id}][lead-channel] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
         continue;
       }
       const inserted = await client.query(
