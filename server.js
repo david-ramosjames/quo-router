@@ -1575,8 +1575,20 @@ const BUCKET_LABEL = {
 
 // A return call is merged onto the lead that phone already has.
 // A classification never closes a lead. It leaves a suggestion a person confirms.
+/** These classes are never new work-queue leads. Update an open lead if one exists; do not open a new row. */
+const NEVER_OPEN_LEAD_BUCKETS = new Set([
+  "spam",
+  "vendor",
+  "employment",
+  "existing_client",
+  "insurance",
+  "other_law_office",
+  "wrong_number",
+]);
+
 async function recordClassifiedCall(firm, {
   phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+  outbound = false,
 }) {
   handledBy = taggableOwner(handledBy);
   if (!firm.caseDbUrl || !bucket) return;
@@ -1747,6 +1759,7 @@ async function recordClassifiedCall(firm, {
       }
       await client.query(
         `update public.leads set
+           caller_class = coalesce(caller_class, $6),
            close_suggestion = 'not_a_lead',
            grade_reason = coalesce(grade_reason, $2),
            summary = coalesce(summary, $3),
@@ -1759,7 +1772,7 @@ async function recordClassifiedCall(firm, {
            end
          where id = $1
            and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
-        [row.id, reason, summaryText, slackPermalink || null, detail],
+        [row.id, reason, summaryText, slackPermalink || null, detail, bucket],
       );
       await client.query(
         `insert into public.lead_events (lead_id, event_type, actor, payload)
@@ -1770,6 +1783,21 @@ async function recordClassifiedCall(firm, {
       return;
     }
 
+    // Insurance, vendors, existing clients, spam, and other excluded classes are
+    // not work-queue leads. Outbound firm dials are case work on someone we already
+    // know — do not open a New row for staff to close by hand.
+    if (
+      NEVER_OPEN_LEAD_BUCKETS.has(bucket)
+      || isActiveClient(firm, phoneE164 || phone)
+      || outbound
+    ) {
+      console.log(
+        `[${firm.id}][lead] Skipped a new lead for ${phoneE164 || phone}; ${
+          outbound ? "outbound firm call" : `classified as ${bucket}`
+        }`,
+      );
+      return;
+    }
     if (await phoneSignedRecently(client, phoneE164)) {
       console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
       return;
@@ -1778,17 +1806,17 @@ async function recordClassifiedCall(firm, {
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, quo_link, intake_call_id, owner_name, slack_permalink,
-         grade_reason, follow_up, close_suggestion
+         grade_reason, follow_up, close_suggestion, caller_class
        ) values (
          current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
          $4, $5, $6, $7, $8,
-         $9, true, 'not_a_lead'
+         $9, true, 'not_a_lead', $10
        )
        on conflict (intake_call_id) do nothing
        returning id`,
       [
         phone || null, phoneE164, arrival || null, summaryText, quoLink || null, callId || null,
-        handledBy || null, slackPermalink || null, reason,
+        handledBy || null, slackPermalink || null, reason, bucket,
       ],
     );
     const id = inserted.rows[0]?.id;
@@ -1810,12 +1838,12 @@ async function recordClassifiedCall(firm, {
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
   phone, isQualified, summary, transcript = null, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
-  holdExclusion = false,
+  holdExclusion = false, outbound = false,
 }) {
   handledBy = taggableOwner(handledBy);
   if (bucket) {
     await recordClassifiedCall(firm, {
-      phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink,
+      phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink, outbound,
     });
     return;
   }
@@ -2492,7 +2520,7 @@ async function findClientMatter(firm, phone) {
 // is promoted. SMS Follow-Up sends through Quo, so those texts arrive here too.
 // Outbound callbacks still fill the form when the conversation is about the
 // lead. Firm-sent referrals/declines do not — those facts are not the client's.
-async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, slackPermalink, extractText }) {
+async function captureFollowUp(firm, { phone, type, direction, sourceId, content, transcript, quoLink, slackPermalink, extractText, data }) {
   if (!sourceId) return;
   const matter = await findClientMatter(firm, phone);
   const window = getFollowUpWindow(firm, phone);
@@ -2501,7 +2529,7 @@ async function captureFollowUp(firm, { phone, type, direction, sourceId, content
   const { inserted, missingTable } = await insertInteraction(firm, {
     intakeCallId, phone: phoneKey(phone), phoneE164: leadPhoneE164(phone),
     leadId: matter?.leadId || null, type, direction, sourceId, content, transcript,
-    quoLink, slackPermalink,
+    quoLink, slackPermalink, data,
   });
   if (!inserted && !missingTable) return;
   if (inserted) {
@@ -4230,7 +4258,10 @@ async function handleMessages(firm, req, res) {
     const msgId = obj.id || extractField(payload, "data.object.id", "data.id");
     await captureFollowUp(firm, {
       phone: externalPhone, type: "text", direction: isOutbound ? "outbound" : "inbound",
-      sourceId: msgId, content: body, quoLink: null, slackPermalink, extractText: body,
+      sourceId: msgId,
+      content: `From: ${fromDisplay}\nTo: ${toDisplay}\nMessage: ${body}`,
+      quoLink: null, slackPermalink, extractText: body,
+      data: { from, to, from_display: fromDisplay, to_display: toDisplay },
     }).catch((err) => console.error(`[${firm.id}][history] Error:`, err.message));
   } catch (err) {
     console.error(`[${firm.id}][messages] Error:`, err.message);
@@ -4747,6 +4778,7 @@ async function handleCallSummary(firm, req, res) {
         slackPermalink: slackMessagePermalink,
         bucket,
         holdExclusion: leadLabel === "No Contact",
+        outbound: !isInbound,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
     const matter = await findClientMatter(firm, externalPhone);

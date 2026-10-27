@@ -7,6 +7,8 @@ import { loadStaffDirectory, matchStaff } from "./staff-directory.js";
 /** A phone that signed in the last 30 days is the same client, not a new lead. */
 export async function phoneSignedRecently(client, phoneE164) {
   if (!phoneE164) return false;
+  const digits = String(phoneE164).replace(/\D/g, "");
+  const tail = digits.length >= 10 ? digits.slice(-10) : digits;
   const signedLead = await client.query(
     `select id from public.leads
      where phone_e164 = $1
@@ -28,7 +30,18 @@ export async function phoneSignedRecently(client, phoneE164) {
      limit 1`,
     [phoneE164],
   );
-  return Boolean(signedText.rows[0]);
+  if (signedText.rows[0]) return true;
+  // Original signed lead may already be gone. A Docket case on this phone still means
+  // they are a client, not a new intake lead.
+  if (!tail) return false;
+  const signedCase = await client.query(
+    `select id from public.cases
+     where right(regexp_replace(coalesce(client_phone, ''), '\\D', '', 'g'), 10) = $1
+       and to_timestamp(created_at / 1000.0) >= now() - interval '30 days'
+     limit 1`,
+    [tail],
+  );
+  return Boolean(signedCase.rows[0]);
 }
 
 const SEQUENCES = new Set(["want_to_sign", "needs_info", "referral", "stop"]);
