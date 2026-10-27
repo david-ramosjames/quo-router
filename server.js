@@ -1798,7 +1798,7 @@ async function recordClassifiedCall(firm, {
       );
       return;
     }
-    if (await phoneSignedRecently(client, phoneE164)) {
+    if (await phoneSignedRecently(client, phoneE164) && !looksLikeNewOrAdditionalAccident(summaryText)) {
       console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
       return;
     }
@@ -2023,7 +2023,7 @@ Reasons are one short sentence each. Do not invent facts.`,
       return;
     }
 
-    if (await phoneSignedRecently(client, phoneE164)) {
+    if (await phoneSignedRecently(client, phoneE164) && !looksLikeNewOrAdditionalAccident(sourceText)) {
       console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
       return;
     }
@@ -3888,13 +3888,32 @@ Reply with ONLY the label. No explanation.`,
   }
 }
 
+function looksLikeNewOrAdditionalAccident(text) {
+  const t = String(text || "");
+  if (looksLikePersonalInjury(t)) return true;
+  return /\b(?:another|new|second|additional|different)\s+(?:accident|crash|wreck|collision|incident|injury|case|matter)\b|\bjust (?:got |was )?(?:in|hit|rear-?ended|t\-?boned)\b|\b(?:was|got) (?:just )?(?:in|hit in) (?:a |an )?(?:accident|crash|wreck)\b|\bnew (?:injury|claim) (?:from|after)\b/i.test(t);
+}
+
+/** Leads / Intake / RGV — lines where new intakes usually arrive. */
+function isLeadIntakeLine(firm, phoneFrom, phoneTo) {
+  const labels = [firm.phoneLines?.[phoneFrom], firm.phoneLines?.[phoneTo]].filter(Boolean);
+  return labels.some((label) => /\b(leads?|intake|rgv)\b/i.test(String(label)));
+}
+
 async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
   const phones = [phoneFrom, phoneTo].filter(Boolean);
+  let activeClientMayBeNewMatter = false;
   for (const phone of phones) {
     if (firm.phoneLines[phone]) continue;
-    // Active clients aren't leads. A former client (closed case) is allowed
-    // through to classification — they may be calling about a new matter.
+    // Active clients aren't leads unless the summary looks like a new/additional
+    // accident. Closed clients fall through — same as #lead-calls.
     if (isActiveClient(firm, phone)) {
+      const preview = extractText(payload);
+      if (preview && looksLikeNewOrAdditionalAccident(preview)) {
+        activeClientMayBeNewMatter = true;
+        console.log(`[${firm.id}][lead] Active client may be a new accident: ${getContactName(firm, phone)}`);
+        continue;
+      }
       console.log(`[${firm.id}][lead] Skipping — existing client: ${getContactName(firm, phone)}`);
       return { isLead: false, isQualified: false, bucket: "existing_client", label: "Excluded · Existing client" };
     }
@@ -3931,9 +3950,9 @@ async function classifyLead(firm, payload, phoneFrom, phoneTo, cached) {
   }
 
   // Staff calling a carrier (or an adjuster calling the firm) is insurance work,
-  // not someone seeking a lawyer. Do not send it to the model — it will guess
-  // "non_pi" and that bucket still posts into #lead-calls.
-  if (looksLikeInsuranceCompanyCall(text, outbound)) {
+  // not someone seeking a lawyer. On Leads/Intake/RGV keep classifying — those
+  // lines are for intakes and false insurance labels are more costly there.
+  if (looksLikeInsuranceCompanyCall(text, outbound) && !isLeadIntakeLine(firm, phoneFrom, phoneTo)) {
     console.log(`[${firm.id}][lead] Insurance-company call — not a lead`);
     return { isLead: false, isQualified: false, bucket: "insurance", label: BUCKET_LABEL.insurance };
   }
@@ -4001,6 +4020,9 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
     const contextLines = [
       lineLabel ? `Firm line involved: "${lineLabel}"` : null,
       outbound ? "This call was placed BY the firm (outbound). The firm is following up on a client or doing case work. Do not classify it as spam, a robocall, a wrong number, or a lead. Only answer \"insurance\" if an insurance company or adjuster is actually on the call." : null,
+      activeClientMayBeNewMatter
+        ? "The outside number belongs to an ACTIVE client of this firm, but the summary may describe a NEW or ADDITIONAL accident. Answer \"qualified_lead\" or \"non_pi\" only if they are clearly seeking help for a new incident. Otherwise answer \"existing_client\"."
+        : null,
       `This firm is named "${firm.name}". Speech-to-text often misspells that. A nearby misspelling is still this firm — not another law office and not an insurance company.`,
       contactName
         ? `The outside number is a saved contact named "${contactName}". A saved contact whose matter is closed may still be a new lead.`
@@ -4757,15 +4779,15 @@ async function handleCallSummary(firm, req, res) {
     // human-answered call summaries.
     await postToCaseChannel(firm, caseText, from, to, { includeLA: sona });
 
-    // Intake (opt-in). Best-effort, after routing. If this caller is already in
-    // a follow-up window, treat the call as a follow-up (log + merge into the
-    // existing intake); otherwise a qualified lead opens a new intake.
+    // Intake Manager lead create mirrors #lead-calls: only inbound isLead calls
+    // open a new work-queue lead. Excluded buckets may annotate an existing open
+    // lead, but never open a New row. Outbound firm dials never open a new lead.
     const externalPhone = firm.phoneLines[from] ? to : from;
     const transcript = await fetchCallTranscript(firm, callId);
-    if (isLead || bucket) {
-      const handledBy = sona
-        ? "Sona"
-        : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || null);
+    const handledBy = sona
+      ? "Sona"
+      : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || null);
+    if (isLead && isInbound) {
       await recordLeadDecision(firm, {
         phone: externalPhone,
         isQualified,
@@ -4778,6 +4800,18 @@ async function handleCallSummary(firm, req, res) {
         slackPermalink: slackMessagePermalink,
         bucket,
         holdExclusion: leadLabel === "No Contact",
+        outbound: false,
+      }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
+    } else if (bucket) {
+      await recordClassifiedCall(firm, {
+        phone: externalPhone,
+        bucket,
+        summary: summaryText,
+        quoLink: deepLink,
+        callId,
+        handledBy,
+        arrival: sona ? "sona" : "human_call",
+        slackPermalink: slackMessagePermalink,
         outbound: !isInbound,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     }
