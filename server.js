@@ -2839,14 +2839,24 @@ async function loadQuoUsers(firm) {
     }
     const json = await res.json();
     const users = json.data || [];
+    const staff = await loadStaffDirectory(firm).catch(() => []);
+    const staffByEmail = new Map(
+      staff
+        .filter((person) => person.email && !/^(referred|legal assistant)$/i.test(person.name))
+        .map((person) => [String(person.email).trim().toLowerCase(), person.name]),
+    );
     firm.quoUsersCache.clear();
     for (const user of users) {
-      const name = cleanQuoDisplayName(
+      const quoName = cleanQuoDisplayName(
         [user.firstName, user.lastName].filter(Boolean).join(" ").trim() ||
           user.name ||
           user.email ||
           "",
       );
+      const email = String(user.email || "").trim().toLowerCase();
+      const fromDirectory = email ? staffByEmail.get(email) : null;
+      // Prefer the staff directory when Quo labels seats generically (Intake Specialist, Attorney 1).
+      const name = fromDirectory || quoName;
       if (user.id && name) firm.quoUsersCache.set(user.id, name);
     }
     console.log(`[${firm.id}][quo-users] Loaded ${firm.quoUsersCache.size} users`);
@@ -2897,19 +2907,15 @@ function matchHandlerFromTranscript(transcript, candidateNames) {
 }
 
 /**
- * Prefer staff name from transcript (matched against Quo user / staff names).
- * Fall back to phone-line label (Intake / Leads / Paralegal) — not Quo answeredBy
- * display names, which often look like the contact rather than the agent.
+ * Who handled the call is the Quo user on answeredBy / userId — never a phone-line
+ * label (Leads, RJL Main Line) and never an LLM guess from the transcript.
  */
-function resolveCallHandlerName(firm, { transcript, firmPhone }) {
-  const displayNames = [...(firm.quoUsersCache?.values?.() || [])]
-    .map((n) => cleanQuoDisplayName(n))
-    .filter(Boolean);
-  const fromTranscript = matchHandlerFromTranscript(transcript, displayNames);
-  if (fromTranscript) return fromTranscript;
-  const line = firmPhone && firm.phoneLines?.[firmPhone];
-  if (line) return String(line);
-  return null;
+function resolveCallHandlerName(firm, { handlerId, handlerName }) {
+  return (
+    cleanQuoDisplayName(handlerName) ||
+    getQuoUserName(firm, handlerId) ||
+    null
+  );
 }
 
 async function fetchCallFromQuo(firm, callId) {
@@ -4473,21 +4479,12 @@ function normalizeCallJobs(value, track) {
   return track === "other" ? "screen" : "both";
 }
 
-function cleanHandlerLabel(value, fallback) {
-  const name = String(value || "").replace(/\s+/g, " ").trim();
-  if (!name || /^unknown$/i.test(name) || /^null$/i.test(name)) return fallback || null;
-  return name.slice(0, 120);
-}
-
 // RJL intake rubric: screen (injury?) on every lead call; full intake only when injury-related.
 async function gradeIntakeCall(firm, { callId, transcript, handlerId, handlerName, direction, quoLink, phone, leadId, firmPhone }) {
   if (!callId || !llmConfigured() || !firm.caseDbUrl) return;
   const text = String(transcript || "").trim();
   if (text.length < 350) return;
-  const handler =
-    resolveCallHandlerName(firm, { transcript: text, firmPhone }) ||
-    (firmPhone && firm.phoneLines?.[firmPhone]) ||
-    "Unknown";
+  const handler = resolveCallHandlerName(firm, { handlerId, handlerName }) || "Unknown";
   const clipped = text.length > 28000 ? `${text.slice(0, 28000)}\n\n[transcript truncated]` : text;
   const score = await llmExtract({
     label: `${firm.id}][call-grade`,
@@ -4506,7 +4503,7 @@ For THIS recording set jobs to:
 - intake — this call continued or performed full intake without (re)screening (e.g. a follow-up that picks up intake)
 - both — this call screened AND did full intake work
 
-Identify screen_handler and intake_handler from the transcript (agent self-intros / who spoke). They may be the same person or two people (transfer). If only one agent is identifiable, use that name for every job performed on this call. If a job was not performed, set that handler to null.
+Do not invent agent names. Set screen_handler and intake_handler to null (the Quo user who answered is stored separately). If a job was not performed, leave that handler null.
 
 Score ONLY new intake leads: a person asking the firm for help with a new matter, or staff calling that person back about that matter.
 
@@ -4525,7 +4522,7 @@ Scoring (0–100 integers):
 - overall_score = intake_score when present, else screen_score.
 met = full points, partial = half, missed = zero. If observable weight is under 50 for a job, set that job's score to null. If no usable score remains, grading_status is insufficient_evidence.
 reason is one or two sentences on why the scores landed where they did. Do not invent quotes.`,
-    user: `Default handler if names are unclear: ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
+    user: `Quo handler on this call (do not invent other names): ${handler}\nDirection: ${direction || "unknown"}\n\nTRANSCRIPT:\n${clipped}`,
   });
   if (!score || score.grading_status !== "graded") {
     console.log(`[${firm.id}][call-grade] ${callId} ${score?.grading_status || "ungraded"}`);
@@ -4558,17 +4555,11 @@ reason is one or two sentences on why the scores landed where they did. Do not i
   const letter = letterForCallScore(overallNumeric);
   const screenLetter = screenNumeric != null ? letterForCallScore(screenNumeric) : null;
   const intakeLetter = intakeNumeric != null ? letterForCallScore(intakeNumeric) : null;
-  const screenHandler =
-    (jobs === "screen" || jobs === "both"
-      ? cleanHandlerLabel(score.screen_handler, handler)
-      : cleanHandlerLabel(score.screen_handler, null)) ||
-    (jobs === "screen" || jobs === "both" ? handler : null);
-  const intakeHandler =
-    (jobs === "intake" || jobs === "both"
-      ? cleanHandlerLabel(score.intake_handler, handler)
-      : cleanHandlerLabel(score.intake_handler, null)) ||
-    (jobs === "intake" || jobs === "both" ? handler : null);
-  const primaryHandler = intakeHandler || screenHandler || handler;
+  // Only the Quo user on the call — never transcript guesses or line labels.
+  const quoHandler = handler !== "Unknown" ? handler : null;
+  const screenHandler = jobs === "screen" || jobs === "both" ? quoHandler : null;
+  const intakeHandler = jobs === "intake" || jobs === "both" ? quoHandler : null;
+  const primaryHandler = intakeHandler || screenHandler || quoHandler || "Unknown";
   const reason = String(score.reason || "").replace(/\s+/g, " ").trim().slice(0, 400);
   let client;
   try {
