@@ -2,23 +2,53 @@
 
 ## Changes Summary
 
-This fix addresses the issue where ANY call event was stopping the SMS follow-up flow, even very short calls (e.g., under 60 seconds where staff left a voicemail). 
+This fix addresses the issue where quo-router was stopping the SMS follow-up flow for short outbound calls by changing the lead's `sequence` to "needs_info" (calls only, no texts).
+
+### Problem
+
+**Example:** Rachel Kay Schuyler had an automated text sent at 11:35 AM. At 1:11 PM, staff made an outbound call lasting under 60 seconds (left voicemail). After that call, quo-router changed the lead's sequence to "needs_info", which stopped the SMS follow-up flow (`TEXTS: Off` in intake-manager).
+
+This was happening regardless of call duration — even a 30-second voicemail drop was treated as a "conversation complete" event that stopped texts.
+
+### Solution
+
+**Rule:** Quo-router will NOT change a lead's sequence to a no-texts sequence ("needs_info" or "stop") because of an outbound call under 2 minutes. The lead's existing text-active sequence is preserved.
+
+**Division of Responsibility:**
+
+- **quo-router** (this repo): Routes webhooks, updates database fields (`sequence`, `follow_up`, `text_sequence_status`), posts to Slack channels. For calls under 2 minutes, preserves ANY text-active sequence (anything except "needs_info" or "stop").
+
+- **follow-up-text** (separate repo): Reads database fields to decide whether to send texts. For outbound calls under 120 seconds (LONG_OUTBOUND_SECONDS), keeps the series running and posts its own Slack review card with 'Keep texting' and 'Stop follow-ups' buttons. Handles the "stop texts" decision for short calls.
+
+**Important:** quo-router does NOT post its own "Stop texts" buttons or handle button clicks. The follow-up-text service already owns that workflow for short outbound calls.
 
 ### New Behavior
 
 **Calls under 2 minutes:**
-- SMS follow-up flow CONTINUES by default
-- Slack notification in #lead-calls includes a "Stop texts" button for manual control
-- The `sequence` field remains "want_to_sign" (which allows texts) instead of changing to "needs_info"
+- quo-router preserves the existing sequence (doesn't change to "needs_info")
+- Database: `sequence` stays as-is (e.g., "want_to_sign", "referral", etc.)
+- follow-up-text continues the SMS flow and posts its own review card with stop buttons
 
 **Calls 2 minutes or longer:**
-- SMS follow-up flow STOPS automatically (existing behavior)
-- The `sequence` field changes to "needs_info" (calls only, no texts)
-- This is the correct behavior for longer conversations
+- quo-router changes sequence to "needs_info" (existing behavior)
+- Database: `sequence = 'needs_info'` (calls only, no texts)
+- follow-up-text reads this and stops sending texts
+
+### Sequences Explained
+
+| Sequence | Texts? | Description |
+|----------|--------|-------------|
+| `want_to_sign` | ✅ Yes | Pursuit - wants to sign |
+| `referral` | ✅ Yes | Referral case |
+| `needs_info` | ❌ No | Calls only - already spoke |
+| `stop` | ❌ No | Stopped - closed/lost |
+| `null` (new lead) | ✅ Yes | Defaults to "want_to_sign" |
+
+Short calls preserve ANY text-active sequence (everything except "needs_info" and "stop").
 
 ## Configuration Required
 
-### 1. Call Duration Threshold
+### 1. Adjust Threshold (Optional)
 
 The threshold is set via the `SHORT_CALL_THRESHOLD_SECONDS` constant in `server.js`:
 
@@ -31,27 +61,17 @@ To change the threshold:
 2. Modify the constant value (in seconds)
 3. Redeploy the service
 
-### 2. Slack Interactive Components
+**Note:** This should match follow-up-text's `LONG_OUTBOUND_SECONDS` threshold (currently 120 seconds) to keep behavior consistent.
 
-The "Stop texts" button requires Slack to send button click events to this service.
+### 2. No Slack Configuration Needed
 
-**Setup Steps:**
+Unlike the original implementation, this fix does NOT require:
+- ❌ Slack Interactivity configuration
+- ❌ Request URL setup
+- ❌ Signing secret
+- ❌ Additional endpoints
 
-1. Go to your Slack App settings: https://api.slack.com/apps
-2. Select your Quo Router app
-3. Navigate to **"Interactivity & Shortcuts"**
-4. Enable **"Interactivity"**
-5. Set the **Request URL** to:
-   ```
-   https://your-quo-router-domain.com/slack/interactions
-   ```
-6. Click **"Save Changes"**
-
-### 3. Verify Slack Bot Token
-
-The bot token must have these scopes (should already be configured):
-- `chat:write` - to post messages
-- `chat:write.public` - to post to public channels
+The follow-up-text service handles Slack buttons for short call reviews.
 
 ## How It Works
 
@@ -67,79 +87,120 @@ The bot token must have these scopes (should already be configured):
    [firmId][call-summary] Cache miss for AC123... — recovered from/to via Quo API (duration: 45s)
    ```
 
+3. Duration is shown in the Slack notification:
+   ```
+   🔥 *Qualified Lead Call*
+   Handled By: Jackie
+   From: (512) 764-3037
+   To: +15127643037 (45s)
+   Summary: ...
+   ```
+
 ### Sequence Preservation Logic
 
-For existing leads:
-
 ```javascript
-// Short call (<2 min) + would change to "needs_info" + currently "want_to_sign"
-if (isShortCall && proposedSequence === "needs_info" && existing.sequence === "want_to_sign") {
-  sequence = "want_to_sign"; // Keep texts active
+// Determine if this is a short call
+const isShortCall = callDurationSeconds != null && callDurationSeconds < 120;
+
+// What sequence would normally be set?
+const proposedSequence = nextSequence({ text, isQualified, existing });
+
+// Does the existing sequence allow texts?
+const existingAllowsTexts = 
+  existing?.sequence !== "needs_info" && 
+  existing?.sequence !== "stop";
+
+// For short calls, preserve text-active sequences
+if (isShortCall && proposedSequence === "needs_info" && existingAllowsTexts) {
+  sequence = existing?.sequence || "want_to_sign";
+  console.log(`Short call (45s < 120s) — preserving sequence=${sequence} to keep SMS follow-up active`);
+} else {
+  sequence = proposedSequence;
 }
 ```
 
-### Slack Button Action
+### Database Updates
 
-When someone clicks "Stop texts":
+quo-router updates these fields in `public.leads`:
 
-1. Slack sends a POST to `/slack/interactions`
-2. Router updates the lead:
-   ```sql
-   UPDATE leads 
-   SET sequence = 'needs_info',
-       follow_up = false,
-       text_sequence_status = 'stopped'
-   WHERE phone_e164 = $1
-   ```
-3. Slack message updates to show "✅ SMS follow-up stopped"
-4. follow-up-text service (separate repo) will see the stopped status and not send more texts
+- **`sequence`**: Preserved for short calls (e.g., "want_to_sign"), changed to "needs_info" for long calls
+- **`follow_up`**: Only changed when `closeNow = true` (not affected by this fix)
+- **`text_sequence_status`**: Only changed when `closeNow = true` (not affected by this fix)
+
+follow-up-text reads these fields to decide whether to send texts.
+
+### What quo-router Does NOT Do
+
+- ❌ Does NOT call follow-up-text's `/intake/stop` endpoint
+- ❌ Does NOT post "Stop texts" buttons (follow-up-text posts its own review cards)
+- ❌ Does NOT handle Slack button interactions
+- ❌ Does NOT directly control follow-up-text's behavior
+
+quo-router only affects text flow by setting database fields that follow-up-text reads.
 
 ## Testing
 
-### Test a Short Call
+### Test a Short Call (Under 2 Minutes)
 
-1. Make a test call to your Quo number
+1. Make a test outbound call to a lead
 2. Answer and hang up within 2 minutes (e.g., 45 seconds)
 3. Wait for the `/call-summary` webhook
 4. Check #lead-calls in Slack:
    - Should show duration: `(45s)`
-   - Should have a red "Stop texts" button
+   - Normal notification (no quo-router button)
 5. Check console logs:
    ```
    [firmId][lead] Short call (45s < 120s) — preserving sequence=want_to_sign to keep SMS follow-up active
    ```
-6. In intake-manager, the lead should show:
+6. Check database:
+   ```sql
+   SELECT sequence, follow_up, text_sequence_status 
+   FROM leads WHERE phone_e164 = '+15127643037';
+   -- sequence should be "want_to_sign" (or whatever it was before)
+   -- follow_up should be true
+   ```
+7. follow-up-text should post its own review card with 'Keep texting' / 'Stop follow-ups' buttons
+8. In intake-manager, the lead should show:
    - TEXTS: On (or "active")
-   - SEQUENCE: want_to_sign
+   - SEQUENCE: want_to_sign (or whatever text-active sequence it had)
 
-### Test a Long Call
+### Test a Long Call (2+ Minutes)
 
-1. Make a test call
+1. Make a test outbound call
 2. Answer and stay on the line for 2+ minutes
 3. Hang up and wait for webhook
-4. Check #lead-calls: no "Stop texts" button (normal behavior)
-5. Check intake-manager:
+4. Check #lead-calls: shows duration `(135s)` (normal behavior)
+5. Check console logs: no preservation message
+6. Check database:
+   ```sql
+   SELECT sequence FROM leads WHERE phone_e164 = '+15127643037';
+   -- sequence should be "needs_info"
+   ```
+7. In intake-manager:
    - TEXTS: Off (stopped)
    - SEQUENCE: needs_info
 
-### Test the Stop Button
+### Test Sequence Preservation Coverage
 
-1. After a short call appears in #lead-calls
-2. Click the "Stop texts" button
-3. Button should change to "✅ SMS follow-up stopped"
-4. Check intake-manager: TEXTS should now be Off
-5. Check console logs:
-   ```
-   [firmId][slack-interaction] Stopped SMS follow-up for +15127643037 (callId: AC123...)
-   ```
+Create leads with different starting sequences and verify short calls preserve them:
+
+| Starting Sequence | After Short Call | Expected |
+|-------------------|------------------|----------|
+| `want_to_sign` | `want_to_sign` | ✅ Preserved |
+| `referral` | `referral` | ✅ Preserved |
+| `needs_info` | `needs_info` | ℹ️ Already no-texts, stays no-texts |
+| `stop` | `stop` | ℹ️ Already stopped, stays stopped |
+| `null` (new) | `want_to_sign` | ✅ Defaulted to text-active |
+
+### Test Inbound Calls
+
+Inbound calls are NOT affected by this fix (inbound calls already had different logic). Verify they continue working as before:
+
+1. Make an inbound test call (lead calls the firm)
+2. Answer and hang up within 2 minutes
+3. Behavior should be unchanged from before this fix
 
 ## Troubleshooting
-
-### Button doesn't work
-
-- Check that the Slack Request URL is set correctly
-- Verify the Request URL returns 200 OK (test with Slack's "Verify" button)
-- Check console logs for `[slack-interaction]` errors
 
 ### Duration is always null
 
@@ -147,44 +208,58 @@ When someone clicks "Stop texts":
 - Verify Quo API key is valid: `QUO_API_KEY` or `FIRM_<ID>_QUO_API_KEY`
 - Check console logs for `[call-check]` errors
 
-### Texts still stop on short calls
+### Texts still stop on short outbound calls
 
-- Verify the lead existed and had `sequence = "want_to_sign"` before the call
+- Verify the lead had a text-active sequence before the call (`want_to_sign`, `referral`, etc.)
 - Check console logs for the preservation message
-- Verify `SHORT_CALL_THRESHOLD_SECONDS` is set correctly
+- Verify `SHORT_CALL_THRESHOLD_SECONDS = 120` (matches follow-up-text)
+- Check if the call was actually under 2 minutes in the logs
 
-### Texts don't stop on long calls
+### Texts don't stop on long outbound calls
 
-- Check that the call duration is actually >= 120 seconds
+- Check that the call duration is actually >= 120 seconds in logs
 - Verify `nextSequence()` is returning "needs_info" for non-qualified calls
 - Check the `isQualified` flag in call processing
 
-## Database Impact
+### Short call SMS flow continues but no follow-up-text review card
 
-The fix updates the `public.leads` table when a call is processed:
-
-- **Short calls:** `sequence` remains unchanged (typically "want_to_sign")
-- **Long calls:** `sequence` changes to "needs_info" (existing behavior)
-- **Button click:** Sets `sequence = 'needs_info'`, `follow_up = false`, `text_sequence_status = 'stopped'`
-
-Events are logged to `public.lead_events`:
-```json
-{
-  "event_type": "sequence_changed",
-  "actor": "slack-button",
-  "payload": {
-    "sequence": "needs_info",
-    "reason": "Short call SMS stopped via Slack button",
-    "call_id": "AC123..."
-  }
-}
-```
+- This is a follow-up-text issue, not quo-router
+- Check follow-up-text logs and configuration
+- Verify follow-up-text's `LONG_OUTBOUND_SECONDS` threshold matches quo-router's
 
 ## Related Services
 
-This fix only addresses quo-router. The follow-up-text service (separate repo) reads:
-- `leads.sequence` - if "needs_info" or "stop", don't send texts
-- `leads.follow_up` - if false, don't send texts
-- `leads.text_sequence_status` - if "stopped", don't send texts
+### quo-router (this repo)
 
-A parallel fix is being implemented in follow-up-text for the same issue.
+**Role:** Routes Quo webhooks → database updates → Slack notifications
+
+**Controls text flow via:**
+- Database field: `leads.sequence`
+  - For short calls: preserves text-active sequences
+  - For long calls: changes to "needs_info"
+- Database field: `leads.follow_up` (only when closing leads)
+- Database field: `leads.text_sequence_status` (only when closing leads)
+
+**Does NOT:**
+- Call follow-up-text APIs
+- Post "Stop texts" buttons
+- Handle button clicks
+
+### follow-up-text (separate repo)
+
+**Role:** Reads database → sends automated texts → posts Slack review cards
+
+**Controls text flow via:**
+- Reads `leads.sequence` - stops if "needs_info" or "stop"
+- Reads `leads.follow_up` - stops if false
+- Reads `leads.text_sequence_status` - stops if "stopped"
+- For short outbound calls (<120s): keeps series running, posts review card with stop buttons
+- Handles button clicks: updates database when user clicks 'Stop follow-ups'
+
+**Parallel fix:** follow-up-text PR #1 fixes the same issue in its own codebase (was stopping on any call event, now preserves flow for calls <120s).
+
+## Migration Notes
+
+No data migration needed. The fix preserves existing behavior for long calls and only changes behavior for short calls (now they keep texts active instead of stopping them).
+
+Existing leads are not affected — the fix applies only to new call events processed after deployment.
