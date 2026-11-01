@@ -38,6 +38,11 @@ const SLACK_USERS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const CASE_STATUS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const CALL_CHECK_DELAY_MS = 185 * 1000;
 
+// Calls shorter than this threshold (in seconds) should not stop the SMS follow-up flow.
+// Short calls (<2 minutes): SMS follow-up continues, Slack notification includes "Stop texts" button.
+// Long calls (≥2 minutes): SMS follow-up stops automatically (sequence changes to "needs_info").
+const SHORT_CALL_THRESHOLD_SECONDS = 120; // 2 minutes
+
 // === Firm Registry ===
 const firms = new Map(); // firmId -> Firm object
 
@@ -1838,7 +1843,7 @@ async function recordClassifiedCall(firm, {
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
   phone, isQualified, summary, transcript = null, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
-  holdExclusion = false, outbound = false,
+  holdExclusion = false, outbound = false, callDurationSeconds = null,
 }) {
   handledBy = taggableOwner(handledBy);
   if (bucket) {
@@ -1918,11 +1923,26 @@ Reasons are one short sentence each. Do not invent facts.`,
     const gradeReason = flagged
       ? (score?.not_a_lead_reason || score?.grade_reason || "Not a personal-injury lead.")
       : (score?.grade_reason || null);
-    const sequence = closeNow ? "stop" : nextSequence({
+    
+    // For short calls (under 2 minutes), don't change the sequence to stop the SMS follow-up flow.
+    // The sequence will be preserved if it's "want_to_sign" (which allows texts).
+    const isShortCall = callDurationSeconds != null && callDurationSeconds < SHORT_CALL_THRESHOLD_SECONDS;
+    const proposedSequence = closeNow ? "stop" : nextSequence({
       text: sourceText,
       isQualified,
       existing: existing?.sequence || null,
     });
+    
+    // If this is a short call and we're about to change to "needs_info" (calls only),
+    // preserve the existing sequence if it allows texts ("want_to_sign").
+    const sequence = (isShortCall && proposedSequence === "needs_info" && existing?.sequence === "want_to_sign")
+      ? existing.sequence
+      : proposedSequence;
+    
+    if (isShortCall && proposedSequence === "needs_info" && existing?.sequence === "want_to_sign") {
+      console.log(`[${firm.id}][lead] Short call (${callDurationSeconds}s < ${SHORT_CALL_THRESHOLD_SECONDS}s) — preserving sequence=${sequence} to keep SMS follow-up active`);
+    }
+    
     const detailLine = summaryText ? `Call: ${summaryText}` : null;
     const thisConsult = score?.consultation === true;
     const consultDate = existing?.consultation_date || (thisConsult ? chicagoToday() : null);
@@ -3228,7 +3248,7 @@ async function getSlackThreadPermalink(firm, channelId, parentTs, messagePermali
 // would cost two history fetches and a 5s retry for nothing).
 // mentionUsers: always @-mention, even when not threaded.
 async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
-  { mentionUsersIfThreaded = [], skipThreadSearch = false, mentionUsers = [], threadRetry = true } = {}) {
+  { mentionUsersIfThreaded = [], skipThreadSearch = false, mentionUsers = [], threadRetry = true, blocks = null } = {}) {
   if (firm.slackBotToken && firm.slackLeadCallsChannelId) {
     try {
       const phones = [phoneFrom, phoneTo].filter(Boolean);
@@ -3243,7 +3263,16 @@ async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
       const finalText = mentionUsers.length
         ? insertMentionsAfterTitle(text, mentionUsers)
         : (threadTs ? insertMentionsAfterTitle(text, mentionUsersIfThreaded) : text);
-      const body = { channel: firm.slackLeadCallsChannelId, text: finalText };
+      const body = { channel: firm.slackLeadCallsChannelId };
+      
+      // Use blocks if provided, otherwise use text
+      if (blocks) {
+        body.blocks = blocks;
+        body.text = finalText; // fallback text for notifications
+      } else {
+        body.text = finalText;
+      }
+      
       if (threadTs) {
         body.thread_ts = threadTs;
         console.log(`[${firm.id}][lead-calls] Replying in thread ${threadTs}`);
@@ -4616,7 +4645,16 @@ async function handleCallSummary(firm, req, res) {
     // both would be "N/A" and the summary would post useless numbers or (with
     // the phone-line filter on) be dropped entirely. Fall back to the Quo API.
     let cached = callId ? getCachedCall(firm, callId) : null;
-    if (callId && (!cached?.from || !cached?.to)) {
+    let callDurationSeconds = null;
+    
+    // Try to get duration from the webhook payload first
+    if (obj.duration != null) {
+      callDurationSeconds = Number(obj.duration);
+    } else if (obj.billableSeconds != null) {
+      callDurationSeconds = Number(obj.billableSeconds);
+    }
+    
+    if (callId && (!cached?.from || !cached?.to || callDurationSeconds == null)) {
       const call = await fetchCallFromQuo(firm, callId);
       if (call?.from || call?.to) {
         cached = {
@@ -4627,11 +4665,26 @@ async function handleCallSummary(firm, req, res) {
           answeredBy: cached?.answeredBy || call.answeredBy,
           userId: cached?.userId || call.userId,
         };
+        // Extract duration from the API call if not already set
+        if (callDurationSeconds == null) {
+          if (call.duration != null) {
+            callDurationSeconds = Number(call.duration);
+          } else if (call.billableSeconds != null) {
+            callDurationSeconds = Number(call.billableSeconds);
+          }
+        }
         cacheCall(firm, callId, cached);
-        console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API`);
+        console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API (duration: ${callDurationSeconds || 'unknown'}s)`);
       } else {
         console.warn(`[${firm.id}][call-summary] Cache miss for ${callId} and Quo API lookup failed — from/to unknown`);
       }
+    }
+    
+    // Sanitize duration
+    if (callDurationSeconds != null && Number.isFinite(callDurationSeconds) && callDurationSeconds >= 0) {
+      callDurationSeconds = Math.round(callDurationSeconds);
+    } else {
+      callDurationSeconds = null;
     }
     const from = safe(cached?.from);
     const to = safe(cached?.to);
@@ -4684,8 +4737,42 @@ async function handleCallSummary(firm, req, res) {
       const qualTag = bucket === "non_pi"
         ? "📋 *Lead · Outside practice*"
         : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
-      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
+      
+      const isShortCall = callDurationSeconds != null && callDurationSeconds < SHORT_CALL_THRESHOLD_SECONDS;
+      const durationNote = callDurationSeconds != null ? ` (${callDurationSeconds}s)` : "";
+      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}`;
+      
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
+      
+      // For short calls, add an interactive button to stop SMS follow-up
+      if (isShortCall && firm.slackBotToken) {
+        leadPostOpts.blocks = [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: leadText,
+            },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: {
+                  type: "plain_text",
+                  text: "Stop texts",
+                },
+                style: "danger",
+                value: JSON.stringify({ phone: externalPhone, callId }),
+                action_id: "stop_sms_followup",
+              },
+            ],
+          },
+        ];
+        console.log(`[${firm.id}][call-summary] Short call (${callDurationSeconds}s) — adding 'Stop texts' button to #lead-calls post`);
+      }
+      
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
       slackMessagePermalink = leadPost?.permalink || null;
       leadParentTs = leadPost?.parentTs || null;
@@ -4792,6 +4879,7 @@ async function handleCallSummary(firm, req, res) {
         bucket,
         holdExclusion: leadLabel === "No Contact",
         outbound: false,
+        callDurationSeconds,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     } else if (bucket) {
       await recordClassifiedCall(firm, {
@@ -4881,6 +4969,114 @@ app.post("/webhooks/quo/:firmId/messages", withFirm(handleMessages));
 app.post("/webhooks/email/:firmId", express.urlencoded({ extended: true, limit: "10mb" }), withFirm(handleInboundEmail));
 app.post("/webhooks/quo/:firmId/calls", withFirm(handleCalls));
 app.post("/webhooks/quo/:firmId/call-summary", withFirm(handleCallSummary));
+
+// Slack interactive actions (button clicks, etc.)
+app.post("/slack/interactions", express.urlencoded({ extended: true }), async (req, res) => {
+  // Slack sends the payload as form-encoded in the "payload" field
+  const payload = JSON.parse(req.body.payload || "{}");
+  
+  // Acknowledge immediately
+  res.status(200).send();
+  
+  try {
+    const action = payload.actions?.[0];
+    if (!action) return;
+    
+    if (action.action_id === "stop_sms_followup") {
+      const data = JSON.parse(action.value || "{}");
+      const phone = data.phone;
+      const callId = data.callId;
+      
+      // Find the firm based on the team_id or by iterating through firms
+      let targetFirm = null;
+      for (const firm of firms.values()) {
+        if (firm.caseDbUrl) {
+          // Try to find the lead by phone
+          targetFirm = firm;
+          break;
+        }
+      }
+      
+      if (!targetFirm || !targetFirm.caseDbUrl || !phone) {
+        console.error(`[slack-interaction] Could not stop SMS follow-up: firm not found or missing phone`);
+        return;
+      }
+      
+      // Update the lead to stop SMS follow-up
+      let client;
+      try {
+        client = await connectCaseDb(targetFirm);
+        const phoneE164 = leadPhoneE164(phone);
+        
+        await client.query(
+          `update public.leads 
+           set sequence = 'needs_info',
+               follow_up = false,
+               text_sequence_status = case 
+                 when text_sequence_status = 'active' then 'stopped' 
+                 else text_sequence_status 
+               end
+           where phone_e164 = $1
+             and lead_status not in ('Lost', 'Referred', 'Signed', 'Promoted')
+           order by created_at desc
+           limit 1`,
+          [phoneE164]
+        );
+        
+        await client.query(
+          `insert into public.lead_events (lead_id, event_type, actor, payload)
+           select id, 'sequence_changed', 'slack-button', $2::jsonb
+           from public.leads
+           where phone_e164 = $1
+             and lead_status not in ('Lost', 'Referred', 'Signed', 'Promoted')
+           order by created_at desc
+           limit 1`,
+          [phoneE164, JSON.stringify({ sequence: "needs_info", reason: "Short call SMS stopped via Slack button", call_id: callId })]
+        );
+        
+        console.log(`[${targetFirm.id}][slack-interaction] Stopped SMS follow-up for ${phoneE164} (callId: ${callId})`);
+        
+        // Update the Slack message to show the action was taken
+        if (targetFirm.slackBotToken && payload.container?.message_ts && payload.container?.channel_id) {
+          await fetch("https://slack.com/api/chat.update", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${targetFirm.slackBotToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              channel: payload.container.channel_id,
+              ts: payload.container.message_ts,
+              blocks: payload.message.blocks.map((block, idx) => {
+                // Remove the actions block (the button)
+                if (block.type === "actions") {
+                  return {
+                    type: "context",
+                    elements: [
+                      {
+                        type: "mrkdwn",
+                        text: "✅ SMS follow-up stopped",
+                      },
+                    ],
+                  };
+                }
+                return block;
+              }),
+            }),
+          });
+        }
+      } catch (err) {
+        console.error(`[${targetFirm?.id || "unknown"}][slack-interaction] Error stopping SMS follow-up:`, err.message);
+      } finally {
+        if (client) {
+          try { await client.end(); } catch { /* ignore */ }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[slack-interaction] Error handling interaction:", err.message);
+  }
+});
 
 // Legacy routes — route to default firm so existing Quo webhook URLs keep working
 function withDefaultFirm(handler) {
