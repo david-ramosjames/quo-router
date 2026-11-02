@@ -38,6 +38,11 @@ const SLACK_USERS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const CASE_STATUS_REFRESH_INTERVAL = 30 * 60 * 1000;
 const CALL_CHECK_DELAY_MS = 185 * 1000;
 
+// Calls shorter than this threshold (in seconds) should not stop the SMS follow-up flow.
+// Short calls (<2 minutes): SMS follow-up continues (sequence preserved).
+// Long calls (≥2 minutes): SMS follow-up stops automatically (sequence changes to "needs_info").
+const SHORT_CALL_THRESHOLD_SECONDS = 120; // 2 minutes
+
 // === Firm Registry ===
 const firms = new Map(); // firmId -> Firm object
 
@@ -1510,9 +1515,8 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 
   let parentTs = threadTs;
   if (!parentTs && phone && channelId === firm.slackLeadCallsChannelId) {
-    // Only the lead-calls channel has a phone-indexed history helper.
-    const messages = await fetchLeadChannelHistory(firm);
-    parentTs = searchChannelHistoryForPhone(messages, phone);
+    // Use findThreadByPhone which has retry logic for recent posts
+    parentTs = await findThreadByPhone(firm, phone, { retry: true });
   }
 
   try {
@@ -1932,7 +1936,7 @@ async function recordClassifiedCall(firm, {
 // Intake Manager is where a person corrects them. This does not send texts.
 async function recordLeadDecision(firm, {
   phone, isQualified, summary, transcript = null, quoLink, callId, handledBy, arrival, slackPermalink, bucket = null,
-  holdExclusion = false, outbound = false,
+  holdExclusion = false, outbound = false, callDurationSeconds = null,
 }) {
   handledBy = taggableOwner(handledBy);
   if (bucket) {
@@ -2012,11 +2016,29 @@ Reasons are one short sentence each. Do not invent facts.`,
     const gradeReason = flagged
       ? (score?.not_a_lead_reason || score?.grade_reason || "Not a personal-injury lead.")
       : (score?.grade_reason || null);
-    const sequence = closeNow ? "stop" : nextSequence({
+    
+    // For short calls (under 2 minutes), don't change the sequence to stop the SMS follow-up flow.
+    // Preserve ANY text-active sequence (anything except "needs_info" and "stop").
+    const isShortCall = callDurationSeconds != null && callDurationSeconds < SHORT_CALL_THRESHOLD_SECONDS;
+    const proposedSequence = closeNow ? "stop" : nextSequence({
       text: sourceText,
       isQualified,
       existing: existing?.sequence || null,
     });
+    
+    // If this is a short call and we're about to change to "needs_info" (calls only),
+    // preserve the existing sequence if it currently allows texts.
+    // Sequences that allow texts: "want_to_sign", "referral", null (new leads), or any non-stop/needs_info value.
+    // Sequences that don't allow texts: "needs_info", "stop"
+    const existingAllowsTexts = existing?.sequence !== "needs_info" && existing?.sequence !== "stop";
+    const sequence = (isShortCall && proposedSequence === "needs_info" && existingAllowsTexts)
+      ? (existing?.sequence || "want_to_sign") // preserve existing, or default to want_to_sign for new leads
+      : proposedSequence;
+    
+    if (isShortCall && proposedSequence === "needs_info" && existingAllowsTexts) {
+      console.log(`[${firm.id}][lead] Short call (${callDurationSeconds}s < ${SHORT_CALL_THRESHOLD_SECONDS}s) — preserving sequence=${sequence} to keep SMS follow-up active`);
+    }
+    
     const detailLine = summaryText ? `Call: ${summaryText}` : null;
     const thisConsult = score?.consultation === true;
     const consultDate = existing?.consultation_date || (thisConsult ? chicagoToday() : null);
@@ -4717,7 +4739,16 @@ async function handleCallSummary(firm, req, res) {
     // both would be "N/A" and the summary would post useless numbers or (with
     // the phone-line filter on) be dropped entirely. Fall back to the Quo API.
     let cached = callId ? getCachedCall(firm, callId) : null;
-    if (callId && (!cached?.from || !cached?.to)) {
+    let callDurationSeconds = null;
+    
+    // Try to get duration from the webhook payload first
+    if (obj.duration != null) {
+      callDurationSeconds = Number(obj.duration);
+    } else if (obj.billableSeconds != null) {
+      callDurationSeconds = Number(obj.billableSeconds);
+    }
+    
+    if (callId && (!cached?.from || !cached?.to || callDurationSeconds == null)) {
       const call = await fetchCallFromQuo(firm, callId);
       if (call?.from || call?.to) {
         cached = {
@@ -4728,11 +4759,26 @@ async function handleCallSummary(firm, req, res) {
           answeredBy: cached?.answeredBy || call.answeredBy,
           userId: cached?.userId || call.userId,
         };
+        // Extract duration from the API call if not already set
+        if (callDurationSeconds == null) {
+          if (call.duration != null) {
+            callDurationSeconds = Number(call.duration);
+          } else if (call.billableSeconds != null) {
+            callDurationSeconds = Number(call.billableSeconds);
+          }
+        }
         cacheCall(firm, callId, cached);
-        console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API`);
+        console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API (duration: ${callDurationSeconds || 'unknown'}s)`);
       } else {
         console.warn(`[${firm.id}][call-summary] Cache miss for ${callId} and Quo API lookup failed — from/to unknown`);
       }
+    }
+    
+    // Sanitize duration
+    if (callDurationSeconds != null && Number.isFinite(callDurationSeconds) && callDurationSeconds >= 0) {
+      callDurationSeconds = Math.round(callDurationSeconds);
+    } else {
+      callDurationSeconds = null;
     }
     const from = safe(cached?.from);
     const to = safe(cached?.to);
@@ -4785,7 +4831,10 @@ async function handleCallSummary(firm, req, res) {
       const qualTag = bucket === "non_pi"
         ? "📋 *Lead · Outside practice*"
         : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
-      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}${linkLine}`;
+      
+      const durationNote = callDurationSeconds != null ? ` (${callDurationSeconds}s)` : "";
+      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}`;
+      
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
       slackMessagePermalink = leadPost?.permalink || null;
@@ -4893,6 +4942,7 @@ async function handleCallSummary(firm, req, res) {
         bucket,
         holdExclusion: leadLabel === "No Contact",
         outbound: false,
+        callDurationSeconds,
       }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
     } else if (bucket) {
       await recordClassifiedCall(firm, {
