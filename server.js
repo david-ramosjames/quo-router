@@ -1480,9 +1480,8 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 
   let parentTs = threadTs;
   if (!parentTs && phone && channelId === firm.slackLeadCallsChannelId) {
-    // Only the lead-calls channel has a phone-indexed history helper.
-    const messages = await fetchLeadChannelHistory(firm);
-    parentTs = searchChannelHistoryForPhone(messages, phone);
+    // Use findThreadByPhone which has retry logic for recent posts
+    parentTs = await findThreadByPhone(firm, phone, { retry: true });
   }
 
   try {
