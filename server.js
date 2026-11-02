@@ -82,13 +82,26 @@ const SECRET_FIELDS = [
 // then legacy un-prefixed env (default firm only), then UI-stored secrets.
 // Env always wins so an existing env-based deployment can never be overridden
 // by a value saved through the admin UI.
-function pickSecretValue(firmId, storedSecrets, key) {
+// Env-var prefixes for a firmId. Hyphens become underscores (Railway/POSIX
+// friendly); the hyphenated form is still checked so older names keep working.
+function firmEnvNames(firmId, key) {
   const upper = firmId.toUpperCase();
-  const perFirm = process.env[`FIRM_${upper}_${key}`];
-  if (perFirm) return perFirm;
+  const names = [`FIRM_${upper.replace(/-/g, "_")}_${key}`];
+  if (upper.includes("-")) names.push(`FIRM_${upper}_${key}`);
+  return names;
+}
+
+function envHasFirmSecret(firmId, key) {
+  return firmEnvNames(firmId, key).some((name) => process.env[name]);
+}
+
+function pickSecretValue(firmId, storedSecrets, key) {
+  for (const name of firmEnvNames(firmId, key)) {
+    if (process.env[name]) return process.env[name];
+  }
   const legacyOk = firmId === DEFAULT_FIRM_ID
-    && !process.env[`FIRM_${upper}_QUO_API_KEY`]
-    && !process.env[`FIRM_${upper}_SLACK_BOT_TOKEN`];
+    && !envHasFirmSecret(firmId, "QUO_API_KEY")
+    && !envHasFirmSecret(firmId, "SLACK_BOT_TOKEN");
   if (legacyOk && process.env[key]) return process.env[key];
   return (storedSecrets && storedSecrets[key]) || null;
 }
@@ -116,13 +129,12 @@ function resolveFirmSecrets(firmId, storedSecrets) {
 // For the admin UI: report where each credential comes from without leaking it.
 // Returns { <key>: "env" | "stored" | null }.
 function secretSources(firmId, storedSecrets) {
-  const upper = firmId.toUpperCase();
   const legacyOk = firmId === DEFAULT_FIRM_ID
-    && !process.env[`FIRM_${upper}_QUO_API_KEY`]
-    && !process.env[`FIRM_${upper}_SLACK_BOT_TOKEN`];
+    && !envHasFirmSecret(firmId, "QUO_API_KEY")
+    && !envHasFirmSecret(firmId, "SLACK_BOT_TOKEN");
   const out = {};
   for (const { key } of SECRET_FIELDS) {
-    if (process.env[`FIRM_${upper}_${key}`]) out[key] = "env";
+    if (envHasFirmSecret(firmId, key)) out[key] = "env";
     else if (legacyOk && process.env[key]) out[key] = "env";
     else if (storedSecrets && storedSecrets[key]) out[key] = "stored";
     else out[key] = null;
@@ -182,9 +194,9 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     // Slack app/bot to tag when a client asks for a call back. Accepts an App ID
     // (A…, resolved to the bot's member id via users.list) or a member id directly.
     callbackBotId: (config.callbackBotId || "").trim(),
-    // When true, only route events where `from` or `to` matches one of the
-    // firm's phone lines (allowlist). Off by default so firms route everything.
-    restrictToPhoneLines: !!config.restrictToPhoneLines,
+    // Listed phone lines are the allowlist. Uncheck in admin only if this
+    // firm's Quo account should post every number, including other tenants.
+    restrictToPhoneLines: config.restrictToPhoneLines !== false,
     caseStatusConfig: normalizeCaseStatusConfig(config),
     intakeConfig: normalizeIntakeConfig(config),
     storedSecrets: storedSecrets || {},
@@ -218,6 +230,9 @@ function registerFirms() {
       const firm = makeFirm(firmId, firmConfig || {});
       firm.source = "file";
       firms.set(firmId, firm);
+      if (!firm.slackBotToken && !firm.slackWebhooks.leadCalls) {
+        console.warn(`[firms] "${firmId}" has no Slack credentials yet — posts wait until Postgres or FIRM_${firmId.toUpperCase().replace(/-/g, "_")}_* env vars load`);
+      }
     }
   }
   // Legacy fallback: if no firms.json/FIRMS_CONFIG, synthesize a default firm from legacy env vars
@@ -306,6 +321,7 @@ async function initFirmStore() {
     pgPool = new Pool({
       connectionString: DATABASE_URL,
       ssl: process.env.DATABASE_SSL === "disable" ? false : { rejectUnauthorized: false },
+      connectionTimeoutMillis: 8000,
     });
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS firms (
@@ -332,8 +348,36 @@ async function initFirmStore() {
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
+    if (pgPool) {
+      try { await pgPool.end(); } catch { /* ignore */ }
+    }
     pgPool = null;
   }
+}
+
+let firmStoreRetry = null;
+function scheduleFirmStoreRetry() {
+  if (firmStoreRetry || pgPool || !DATABASE_URL) return;
+  firmStoreRetry = setTimeout(async () => {
+    firmStoreRetry = null;
+    const known = new Set(firms.keys());
+    const waiting = [...firms.values()]
+      .filter((f) => !f.slackBotToken && !f.slackWebhooks.leadCalls)
+      .map((f) => f.id);
+    await initFirmStore();
+    if (!pgPool) {
+      scheduleFirmStoreRetry();
+      return;
+    }
+    await loadFirmsFromDb();
+    for (const firm of firms.values()) {
+      if (!known.has(firm.id) || waiting.includes(firm.id)) {
+        loadFirmCaches(firm).catch((err) =>
+          console.error(`[${firm.id}][startup] Cache load error:`, err.message)
+        );
+      }
+    }
+  }, 30000);
 }
 
 function rowToConfig(row) {
@@ -342,7 +386,7 @@ function rowToConfig(row) {
     practiceArea: row.practice_area,
     phoneLines: row.phone_lines || {},
     leadThreadTagUsers: row.lead_thread_tag_users || [],
-    restrictToPhoneLines: !!row.restrict_to_phone_lines,
+    restrictToPhoneLines: row.restrict_to_phone_lines !== false,
     callbackBotId: row.callback_bot_id || "",
     caseStatusConfig: row.case_status_config || {},
     intakeConfig: row.intake_config || {},
@@ -353,19 +397,16 @@ async function loadFirmsFromDb() {
   if (!pgPool) return 0;
   try {
     const { rows } = await pgPool.query("SELECT * FROM firms ORDER BY id");
-    let count = 0;
+    let added = 0;
     for (const row of rows) {
       if (row.id.startsWith("_")) continue;
       const secrets = decryptSecrets(row.secrets);
-      // The default firm's base comes from firms.json (so it always exists, even
-      // with an empty DB). If a DB row also exists — written when it's edited in
-      // the admin UI — overlay it so UI config (incl. case-status + CASE_DB_URL)
-      // persists across redeploys. firms.json phone lines are kept if the DB row
-      // has none, so a partial row can't wipe the default firm.
-      if (row.id === DEFAULT_FIRM_ID) {
-        const existing = firms.get(row.id);
-        const dbConfig = rowToConfig(row);
-        const base = existing ? {
+      const dbConfig = rowToConfig(row);
+      const existing = firms.get(row.id);
+      // Overlay DB config onto a firms.json stub so Slack secrets survive a
+      // Postgres blip without dropping the firm (or its pending timers).
+      if (existing) {
+        const base = {
           name: existing.name,
           practiceArea: existing.practiceArea,
           phoneLines: existing.phoneLines,
@@ -374,23 +415,31 @@ async function loadFirmsFromDb() {
           callbackBotId: existing.callbackBotId,
           caseStatusConfig: existing.caseStatusConfig,
           intakeConfig: existing.intakeConfig,
-        } : {};
+        };
         const merged = { ...base, ...dbConfig };
         if (!dbConfig.phoneLines || Object.keys(dbConfig.phoneLines).length === 0) {
           merged.phoneLines = base.phoneLines || {};
         }
-        const f = makeFirm(row.id, merged, { ...(existing?.storedSecrets || {}), ...secrets });
-        f.source = "db";
-        firms.set(row.id, f);
+        existing.name = merged.name;
+        existing.practiceArea = merged.practiceArea;
+        existing.phoneLines = merged.phoneLines;
+        existing.leadThreadTagUsers = merged.leadThreadTagUsers;
+        existing.restrictToPhoneLines = merged.restrictToPhoneLines;
+        existing.callbackBotId = merged.callbackBotId;
+        existing.caseStatusConfig = merged.caseStatusConfig;
+        existing.intakeConfig = merged.intakeConfig;
+        existing.storedSecrets = { ...(existing.storedSecrets || {}), ...secrets };
+        applyFirmSecrets(existing);
+        existing.source = "db";
         continue;
       }
-      const firm = makeFirm(row.id, rowToConfig(row), secrets);
+      const firm = makeFirm(row.id, dbConfig, secrets);
       firm.source = "db";
       firms.set(row.id, firm);
-      count++;
+      added++;
     }
-    console.log(`[db] Loaded ${count} firm(s) from Postgres`);
-    return count;
+    console.log(`[db] Loaded ${rows.length} firm row(s) from Postgres (${added} new)`);
+    return added;
   } catch (err) {
     console.error("[db] Error loading firms from Postgres:", err.message);
     return 0;
@@ -553,26 +602,12 @@ function isOwnLine(firm, number) {
   return false;
 }
 
-// When a firm has restrictToPhoneLines on, an event is only routed if one of its
-// parties is a configured line. Returns true if the event should be SKIPPED.
+// Listed phone lines are the allowlist. An event is skipped unless `from` or
+// `to` matches a configured line — including leftover webhooks for another
+// tenant's numbers. Returns true if the event should be SKIPPED.
 function blockedByPhoneLineFilter(firm, from, to) {
-  const foreign = !isOwnLine(firm, from) && !isOwnLine(firm, to);
-  if (firm.restrictToPhoneLines) return foreign;
-  // Filter off: still flag events where neither party is one of this firm's
-  // lines. With several firms on one Quo account (or webhooks pointed at more
-  // than one firm endpoint), that means another firm's traffic is being routed
-  // into this firm's Slack — turn on "Only route events for the phone lines
-  // above" for this firm.
-  if (foreign && Object.keys(firm.phoneLines || {}).length) {
-    firm._warnedForeign = firm._warnedForeign || new Set();
-    const key = `${from}|${to}`;
-    if (!firm._warnedForeign.has(key)) {
-      firm._warnedForeign.add(key);
-      if (firm._warnedForeign.size > 500) firm._warnedForeign.clear();
-      console.warn(`[${firm.id}] Routing ${from} → ${to}, but neither is a configured phone line for this firm — enable the phone-line filter if this is another firm's traffic`);
-    }
-  }
-  return false;
+  if (!Object.keys(firm.phoneLines || {}).length) return false;
+  return !isOwnLine(firm, from) && !isOwnLine(firm, to);
 }
 
 function insertMentionsAfterTitle(text, userIds) {
@@ -610,7 +645,7 @@ function isSpanish(text) {
 
 // Google's translate_a/single is the undocumented endpoint the Translate widget
 // uses — free, but rate-limited and frequently blocked from datacenter IPs, so
-// it fails intermittently. Fall back to Claude, which we already have a key for.
+// it fails intermittently. Fall back to the configured LLM (OpenAI here).
 async function translateViaGoogle(text) {
   const url = new URL("https://translate.googleapis.com/translate_a/single");
   url.searchParams.set("client", "gtx");
@@ -620,7 +655,7 @@ async function translateViaGoogle(text) {
   url.searchParams.set("q", text);
   const res = await fetch(url.toString());
   if (!res.ok) {
-    console.warn(`[translate] Google responded ${res.status} — falling back to Claude`);
+    console.warn(`[translate] Google responded ${res.status} — falling back to the LLM`);
     return null;
   }
   const json = await res.json();
@@ -1543,6 +1578,27 @@ function caseTypeIsLead(value) {
   ].includes(type);
 }
 
+/** Staff already marked this as a real lead — auto call buckets must not flip it. */
+function leadIsStaffEstablished(row) {
+  if (!row) return false;
+  const agreement = String(row.agreement_status || "").toLowerCase();
+  const contractOut = Boolean(row.agreement_sent_at)
+    || ["sent", "viewed", "signed", "completed"].includes(agreement);
+  const tags = Array.isArray(row.callrail_tags) ? row.callrail_tags : [];
+  const qualifiedYes = row.qualified === true || tags.includes("QUALIFIED YES");
+  const arrival = String(row.arrival || "").toLowerCase();
+  const identity = String(row.identity_status || "").toLowerCase();
+  // Manual creates and staff-confirmed identity stay open leads even without a case type yet
+  // (Jose Espinoza-style bounce-backs after reopen).
+  return contractOut
+    || qualifiedYes
+    || row.desired_case === true
+    || row.priority === true
+    || caseTypeIsLead(row.case_type)
+    || arrival === "manual"
+    || identity === "confirmed";
+}
+
 function callIsNotALead(text, score) {
   const body = String(text || "");
   if (/\b(work(?:place)? injur(?:y|ies)|work accident|workers?'? compensation|company vehicle|on the job|car accident|truck|motorcycle|pedestrian|rear-?ended|slip and fall|dog bite|18-wheeler)\b/i.test(body)) {
@@ -1636,13 +1692,17 @@ async function recordClassifiedCall(firm, {
 
     const byCall = callId
       ? await client.query(
-        `select id, signed_case, case_id, lead_status from public.leads where intake_call_id = $1 limit 1`,
+        `select id, signed_case, case_id, lead_status, case_type, qualified, desired_case, priority,
+                agreement_status, agreement_sent_at, callrail_tags, arrival, identity_status
+         from public.leads where intake_call_id = $1 limit 1`,
         [callId],
       )
       : { rows: [] };
     const byPhone = !byCall.rows[0] && phoneE164
       ? await client.query(
-        `select id, signed_case, case_id, lead_status from public.leads
+        `select id, signed_case, case_id, lead_status, case_type, qualified, desired_case, priority,
+                agreement_status, agreement_sent_at, callrail_tags, arrival, identity_status
+         from public.leads
          where phone_e164 = $1
          order by case when signed_case or case_id is not null or lead_status in ('Signed', 'Promoted') then 0 else 1 end,
                   created_at desc
@@ -1651,6 +1711,31 @@ async function recordClassifiedCall(firm, {
       )
       : { rows: [] };
     const row = byCall.rows[0] || byPhone.rows[0];
+    // Staff already made this a real lead (case type, qualified, desired, priority,
+    // or a contract out). Auto buckets like insurance must not overwrite that.
+    if (row && leadIsStaffEstablished(row) && NEVER_OPEN_LEAD_BUCKETS.has(bucket)) {
+      const detail = summaryText ? `${BUCKET_LABEL[bucket] || bucket}: ${summaryText}` : null;
+      if (detail) {
+        await client.query(
+          `update public.leads set
+             summary = coalesce(summary, $2),
+             case_detail = case
+               when case_detail is null or case_detail = '' then $3
+               when position($3 in case_detail) > 0 then case_detail
+               else right(case_detail || E'\n\n' || $3, 15000)
+             end
+           where id = $1`,
+          [row.id, summaryText, detail],
+        );
+      }
+      await client.query(
+        `insert into public.lead_events (lead_id, event_type, actor, payload)
+         values ($1, 'return_call', 'quo-router', $2::jsonb)`,
+        [row.id, JSON.stringify({ call_id: callId || null, bucket, kept_staff_lead: true })],
+      );
+      console.log(`[${firm.id}][lead] Kept staff lead ${row.id}; ignored auto ${bucket} bucket`);
+      return;
+    }
     if (row?.signed_case || row?.case_id || ["Promoted", "Signed"].includes(row?.lead_status)) {
       const detail = summaryText ? `Later call: ${summaryText}` : null;
       if (detail) {
@@ -1675,6 +1760,15 @@ async function recordClassifiedCall(firm, {
 
     if (outside) {
       const reason = "Sought legal help outside personal injury.";
+      if (row && leadIsStaffEstablished(row)) {
+        await client.query(
+          `insert into public.lead_events (lead_id, event_type, actor, payload)
+           values ($1, 'return_call', 'quo-router', $2::jsonb)`,
+          [row.id, JSON.stringify({ call_id: callId || null, bucket, kept_staff_lead: true })],
+        );
+        console.log(`[${firm.id}][lead] Kept staff lead ${row.id}; ignored auto non_pi bucket`);
+        return;
+      }
       if (row && !["Lost", "Referred"].includes(row.lead_status)) {
         await client.query(
           `update public.leads set
@@ -2414,6 +2508,13 @@ async function mergeIntoIntake(firm, intakeCallId, extracted) {
 }
 
 async function insertInteraction(firm, rec) {
+  if (!firm.caseDbUrl) {
+    if (!firm._warnedNoCaseDb) {
+      firm._warnedNoCaseDb = true;
+      console.warn(`[${firm.id}][follow-up] CASE_DB_URL not set — skipping interaction inserts`);
+    }
+    return { inserted: false };
+  }
   const table = firm.intakeConfig?.interactionsTable || "public.intake_interactions";
   if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$/i.test(table)) {
     console.error(`[${firm.id}][follow-up] Invalid interactions table "${table}"`);
@@ -5224,7 +5325,9 @@ function validateFirmBody(body) {
       phoneLines: phoneLines || {},
       leadThreadTagUsers: leadThreadTagUsers || [],
       callbackBotId: typeof body?.callbackBotId === "string" ? body.callbackBotId.trim() : "",
-      restrictToPhoneLines: !!(body && body.restrictToPhoneLines),
+      restrictToPhoneLines: body && Object.prototype.hasOwnProperty.call(body, "restrictToPhoneLines")
+        ? !!body.restrictToPhoneLines
+        : true,
       caseStatusConfig: {
         query: typeof csc.query === "string" ? csc.query.trim() : "",
         closedValues: Array.isArray(csc.closedValues) ? csc.closedValues : undefined,
@@ -5405,11 +5508,9 @@ async function loadFirmCaches(firm) {
 }
 
 (async () => {
-  // 1. Register firms.json/env firms first (includes the default firm).
+  // 1. Register firms.json/env firms first so webhooks for every committed
+  // firm (ramosjames, trucking-chicas, …) work even if Postgres is down.
   registerFirms();
-  // 2. Connect to Postgres and load any firms added via the admin UI.
-  await initFirmStore();
-  await loadFirmsFromDb();
 
   console.log(
     LLM_PROVIDER === "openai" ? `[llm] Using OpenAI (${OPENAI_MODEL})`
@@ -5417,14 +5518,30 @@ async function loadFirmCaches(firm) {
     : `[llm] No OPENAI_API_KEY or ANTHROPIC_API_KEY set — lead classification, call-back detection, intake extraction and translation fallback are disabled`,
   );
 
-  // 3. Start listening once all firms are known, so no webhook 404s at boot.
   app.listen(PORT, () => {
     console.log(`Quo Slack Router listening on port ${PORT}`);
   });
 
-  // 4. Warm each firm's caches (Slack channels/users, Quo contacts/users) in the background.
   for (const firm of firms.values()) {
-    await loadFirmCaches(firm);
+    loadFirmCaches(firm).catch((err) =>
+      console.error(`[${firm.id}][startup] Cache load error:`, err.message)
+    );
+  }
+
+  // 2. Overlay admin-UI firms/secrets from Postgres. Retry if the private
+  // host isn't reachable yet — trucking-chicas Slack tokens live there.
+  await initFirmStore();
+  if (pgPool) {
+    await loadFirmsFromDb();
+    for (const firm of firms.values()) {
+      if (firm.source === "db") {
+        loadFirmCaches(firm).catch((err) =>
+          console.error(`[${firm.id}][startup] Cache load error:`, err.message)
+        );
+      }
+    }
+  } else {
+    scheduleFirmStoreRetry();
   }
   console.log(`[startup] All firms initialized`);
 })();
