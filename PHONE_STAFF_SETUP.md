@@ -109,7 +109,15 @@ QUO_ROUTER_FIRM_ID=ramosjames
 QUO_ROUTER_REPORT_TOKEN=long-random-string
 ```
 
-The Daily Call Report will include **Available but did not answer** totals for that day.
+4. Apply the companion patch (this agent could not push to that repo):
+
+```bash
+cd quo-lead-review
+git apply /path/to/quo-router/patches/quo-lead-review-availability-misses.patch
+# or: git am /path/to/quo-router/patches/quo-lead-review-availability-misses.patch
+```
+
+The Daily Call Report will then include **Available but did not answer** totals for that day (deterministic section + email metric tile).
 
 ### 9. Redeploy and smoke-test
 
