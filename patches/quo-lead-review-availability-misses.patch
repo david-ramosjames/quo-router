@@ -1,0 +1,229 @@
+From de88c343fd16280ff2ffbeface4f01b4cf779550 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 5 Nov 2026 19:58:20 +0000
+Subject: [PATCH] Include available-but-did-not-answer counts from quo-router
+
+Daily Call Report fetches phone-staff availability misses for the report
+window and prepends a deterministic count block plus an email metric tile.
+---
+ .env.example |   7 ++++
+ prompts.js   |   4 +-
+ report.js    | 104 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 111 insertions(+), 4 deletions(-)
+
+diff --git a/.env.example b/.env.example
+index fbfbbbf..97f5337 100644
+--- a/.env.example
++++ b/.env.example
+@@ -58,6 +58,13 @@ SLACK_BOT_TOKEN=
+ SLACK_CHANNEL=lead-calls
+ SLACK_INCLUDE_THREADS=true
+ 
++# ── quo-router phone-staff availability (optional) ────────────────────────────
++# Daily Call Report includes "available but did not answer" counts from missed/Sona
++# events tracked by quo-router. Requires DATABASE_URL + phoneStaff + REPORT token there.
++QUO_ROUTER_URL=
++QUO_ROUTER_FIRM_ID=ramosjames
++QUO_ROUTER_REPORT_TOKEN=
++
+ 
+ # ── Google Sheets (OAuth — run node setup-sheets-auth.js) ─────────────────────
+ GOOGLE_CLIENT_ID=
+diff --git a/prompts.js b/prompts.js
+index 399efbc..0224da1 100644
+--- a/prompts.js
++++ b/prompts.js
+@@ -48,6 +48,7 @@ const generateDailyCallReportPrompt = ({
+   lineBreakdown,
+   contactBreakdown,
+   callBlocksFullTranscript,
++  availabilityMissSummary,
+ }) => `
+ You are a phone-quality coach and senior intake analyst for ${COMPANY_NAME}, a personal injury law firm in Austin, Texas.
+ 
+@@ -64,6 +65,7 @@ STATISTICS:
+ - Total talk time (this batch): ${totalDurationMin} minutes
+ - By line: ${lineBreakdown}
+ - Known contact vs. new/unknown: ${contactBreakdown}
++- Phone staff available but did not answer (from quo-router): ${availabilityMissSummary || '(n/a)'}
+ 
+ ${FIRM_CONTEXT}
+ 
+@@ -83,7 +85,7 @@ OUTPUT FORMAT — use EXACTLY these sections
+ 
+ ## 📞 Daily Call Report — ${dateLabel}
+ 
+-Short intro (2–3 sentences): overall intake quality for the day vs. benchmarks (volume, voicemail share if inferable, tone).
++Short intro (2–3 sentences): overall intake quality for the day vs. benchmarks (volume, voicemail share if inferable, tone). If the availability-miss statistic is elevated, mention it briefly (do not invent names beyond the provided summary).
+ 
+ ## ✅ Strong calls — specific examples
+ 
+diff --git a/report.js b/report.js
+index c02ea61..41478e8 100644
+--- a/report.js
++++ b/report.js
+@@ -38,6 +38,12 @@ const TIMEZONE        = process.env.TIMEZONE || 'America/Chicago';
+ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+ const SLACK_CHANNEL   = process.env.SLACK_CHANNEL || 'lead-calls';
+ 
++// quo-router phone-staff availability misses (available on Slack but did not answer)
++const QUO_ROUTER_URL = (process.env.QUO_ROUTER_URL || '').replace(/\/+$/, '');
++const QUO_ROUTER_FIRM_ID = process.env.QUO_ROUTER_FIRM_ID || 'ramosjames';
++const QUO_ROUTER_REPORT_TOKEN =
++  process.env.QUO_ROUTER_REPORT_TOKEN || process.env.REPORT_API_TOKEN || '';
++
+ const GOOGLE_SHEETS_ID    = process.env.GOOGLE_SHEETS_ID;
+ // Blank = entire first worksheet. Otherwise e.g. A:ZZ, or 'Master View'!A:ZZ for a specific tab.
+ const GOOGLE_SHEETS_RANGE = (process.env.GOOGLE_SHEETS_RANGE ?? '').trim();
+@@ -226,7 +232,52 @@ async function runChatCompletion(prompt, maxCompletionTokens, labelForLogs = 'Op
+   return text;
+ }
+ 
+-async function generateDailyCallReportAnalysis(callData, totalCalls, createdAfter, reportRangeLabel) {
++async function fetchAvailabilityMisses(createdAfter, createdBefore) {
++  if (!QUO_ROUTER_URL || !QUO_ROUTER_REPORT_TOKEN) {
++    return null;
++  }
++  const url = new URL(
++    `${QUO_ROUTER_URL}/api/reports/${encodeURIComponent(QUO_ROUTER_FIRM_ID)}/availability-misses`
++  );
++  if (createdAfter) url.searchParams.set('createdAfter', createdAfter);
++  if (createdBefore) url.searchParams.set('createdBefore', createdBefore);
++  const res = await fetch(url.toString(), {
++    headers: { Authorization: `Bearer ${QUO_ROUTER_REPORT_TOKEN}` },
++  });
++  if (!res.ok) {
++    const body = await res.text().catch(() => '');
++    throw new Error(`quo-router availability-misses ${res.status}: ${body.slice(0, 200)}`);
++  }
++  return res.json();
++}
++
++function formatAvailabilityMissBlock(data) {
++  if (!data) return '';
++  const byUser = Array.isArray(data.byUser) && data.byUser.length
++    ? data.byUser.map((u) => `- ${u.name || u.slackUserId}: ${u.count}`).join('\n')
++    : '- (none)';
++  return [
++    `## 📵 Available but did not answer`,
++    ``,
++    `Phone staff who were Slack-active and not already on a call when a missed call or Sona call happened:`,
++    ``,
++    `- Missed/Sona events in window: **${data.eventCount ?? 0}**`,
++    `- Events with ≥1 available staff: **${data.eventsWithAvailableStaff ?? 0}**`,
++    `- Available-but-did-not-answer count (person×event): **${data.availableButDidNotAnswerCount ?? 0}**`,
++    ``,
++    `By person:`,
++    byUser,
++    ``,
++  ].join('\n');
++}
++
++async function generateDailyCallReportAnalysis(
++  callData,
++  totalCalls,
++  createdAfter,
++  reportRangeLabel,
++  availabilityMisses = null
++) {
+   const totalDurationMin = Math.round(
+     callData.reduce((s, c) => s + (Number(c.duration) || 0), 0) / 60
+   );
+@@ -242,9 +293,23 @@ async function generateDailyCallReportAnalysis(callData, totalCalls, createdAfte
+     lineBreakdown: buildLineBreakdown(callData),
+     contactBreakdown: buildContactBreakdown(callData),
+     callBlocksFullTranscript: buildCallBlocksFullTranscript(callData),
++    availabilityMissSummary: availabilityMisses
++      ? [
++          `Events: ${availabilityMisses.eventCount ?? 0}`,
++          `Events with available staff: ${availabilityMisses.eventsWithAvailableStaff ?? 0}`,
++          `Available-but-did-not-answer count: ${availabilityMisses.availableButDidNotAnswerCount ?? 0}`,
++          `By person: ${(availabilityMisses.byUser || [])
++            .map((u) => `${u.name || u.slackUserId}=${u.count}`)
++            .join(', ') || '(none)'}`,
++        ].join(' | ')
++      : '(not configured — quo-router availability API not set)',
+   });
+ 
+-  return runChatCompletion(prompt, OPENAI_CALL_REPORT_MAX_TOKENS, 'Daily Call Report');
++  const analysis = await runChatCompletion(prompt, OPENAI_CALL_REPORT_MAX_TOKENS, 'Daily Call Report');
++  const missBlock = formatAvailabilityMissBlock(availabilityMisses);
++  if (!missBlock) return analysis;
++  // Prepend a deterministic metrics block so the count is not LLM-dependent.
++  return `${missBlock}\n${analysis}`;
+ }
+ 
+ async function generateDailyLeadReportAnalysis(
+@@ -320,6 +385,11 @@ function buildEmailHtml(analysis, stats, dateLabel, variant = 'lead') {
+       ? String(stats.sheetRows)
+       : '—';
+ 
++  const availCount =
++    stats.availableButDidNotAnswerCount != null && Number.isFinite(stats.availableButDidNotAnswerCount)
++      ? String(stats.availableButDidNotAnswerCount)
++      : '—';
++
+   const metricsRow =
+     variant === 'call'
+       ? `<table style="width:100%;border-collapse:collapse">
+@@ -338,6 +408,11 @@ function buildEmailHtml(analysis, stats, dateLabel, variant = 'lead') {
+           <div style="font-size:28px;font-weight:bold;color:#1a1a2e">${totalMinHr}</div>
+           <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.5px">Talk time</div>
+         </td>
++        <td style="width:12px"></td>
++        <td style="padding:10px 16px;background:#fff7ed;border-radius:6px;text-align:center;border:1px solid #fed7aa">
++          <div style="font-size:28px;font-weight:bold;color:#9a3412">${availCount}</div>
++          <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.5px">Available, no answer</div>
++        </td>
+       </tr>
+     </table>`
+       : `<p style="margin:0 0 10px;font-size:13px;color:#444;font-style:italic">Lead flow across three sources — not phone QA metrics.</p>
+@@ -501,6 +576,25 @@ async function runDailyReport() {
+     console.log('  Skipped (not configured).');
+   }
+ 
++  // 4b. Phone-staff availability misses from quo-router (missed/Sona while Slack-active)
++  console.log('\n[4b/8] Fetching phone-staff availability misses from quo-router...');
++  let availabilityMisses = null;
++  if (QUO_ROUTER_URL && QUO_ROUTER_REPORT_TOKEN) {
++    try {
++      availabilityMisses = await fetchAvailabilityMisses(createdAfter, createdBefore);
++      stats.availableButDidNotAnswerCount =
++        availabilityMisses?.availableButDidNotAnswerCount ?? 0;
++      stats.availabilityEvents = availabilityMisses?.eventCount ?? 0;
++      console.log(
++        `  Events=${stats.availabilityEvents}, available-but-did-not-answer count=${stats.availableButDidNotAnswerCount}`
++      );
++    } catch (err) {
++      console.warn(`  Warning: ${err.message}`);
++    }
++  } else {
++    console.log('  Skipped (set QUO_ROUTER_URL + QUO_ROUTER_REPORT_TOKEN).');
++  }
++
+   // 4–5. LLM — Daily Call Report (full transcripts) + Daily Lead Report (summaries + Slack + sheet)
+   let callAnalysis = '';
+   let leadAnalysis = '';
+@@ -508,6 +602,9 @@ async function runDailyReport() {
+     callAnalysis =
+       leadAnalysis =
+         'OPENAI_API_KEY is not configured — skipping AI analysis.';
++    if (availabilityMisses) {
++      callAnalysis = `${formatAvailabilityMissBlock(availabilityMisses)}\n${callAnalysis}`;
++    }
+     console.log('\n[5/8] Skipped Daily Call Report (no OPENAI_API_KEY).');
+     console.log('\n[6/8] Skipped Daily Lead Report (no OPENAI_API_KEY).');
+   } else {
+@@ -516,7 +613,8 @@ async function runDailyReport() {
+       callData,
+       totalFetched,
+       createdAfter,
+-      rangeLabel
++      rangeLabel,
++      availabilityMisses
+     );
+     console.log('  Done.');
+ 
+-- 
+2.43.0
+

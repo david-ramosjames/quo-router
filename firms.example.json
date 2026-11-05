@@ -14,7 +14,11 @@
       "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL",
       "FIRM_<ID>_SLACK_LEGAL_ASSISTANT_CHANNEL_ID"
     ],
-    "globalEnvVars": ["OPENAI_API_KEY (or ANTHROPIC_API_KEY)", "OPENAI_MODEL (optional)", "DEFAULT_FIRM_ID", "PORT"]
+    "optionalEnvVars": [
+      "FIRM_<ID>_SLACK_USER_TOKEN (admin xoxp- token — sets Slack status to On a call)",
+      "FIRM_<ID>_REPORT_API_TOKEN (bearer token for /api/reports/:firmId/availability-misses)"
+    ],
+    "globalEnvVars": ["OPENAI_API_KEY (or ANTHROPIC_API_KEY)", "OPENAI_MODEL (optional)", "DEFAULT_FIRM_ID", "PORT", "DATABASE_URL", "REPORT_API_TOKEN"]
   },
   "examplefirm": {
     "name": "Example Law Firm",
@@ -23,6 +27,9 @@
       "+15551234567": "Main Line",
       "+15551234568": "Outbound"
     },
-    "leadThreadTagUsers": ["U00000000", "U11111111"]
+    "leadThreadTagUsers": ["U00000000", "U11111111"],
+    "phoneStaff": [
+      { "name": "Jackie", "slackUserId": "U00000000", "quoUserId": "US00000000" }
+    ]
   }
 }
