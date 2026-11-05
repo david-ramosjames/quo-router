@@ -1,5 +1,7 @@
 # Deployment Notes for Short Call SMS Fix
 
+> **Also see:** [PHONE_STAFF_SETUP.md](./PHONE_STAFF_SETUP.md) for Quo → Slack “On a call” status, missed/Sona availability tagging, and daily-report counts.
+
 ## Changes Summary
 
 This fix addresses the issue where quo-router was stopping the SMS follow-up flow for short outbound calls by changing the lead's `sequence` to "needs_info" (calls only, no texts).

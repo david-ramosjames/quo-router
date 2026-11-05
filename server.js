@@ -6,6 +6,18 @@ import dns from "node:dns";
 import { fileURLToPath } from "url";
 import { absorbLeadChannel, nextSequence, phoneSignedRecently } from "./lead-channel.js";
 import { loadStaffDirectory, matchStaff, staffPromptLine } from "./staff-directory.js";
+import {
+  normalizePhoneStaff,
+  parsePhoneStaffText,
+  formatPhoneStaffText,
+  markPhoneStaffOnCall,
+  clearSlackOnCallStatus,
+  startAnswerWatch,
+  stopAnswerWatch,
+  attachAvailabilityToNotice,
+  ensureAvailabilityTable,
+  queryAvailabilityMisses,
+} from "./phone-staff.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
 // outbound IPv6 route, and Node 18+ returns DNS results verbatim — so a
@@ -71,6 +83,7 @@ function loadFirmConfigFile() {
 const SECRET_FIELDS = [
   { key: "QUO_API_KEY", label: "Quo API Key", secret: true },
   { key: "SLACK_BOT_TOKEN", label: "Slack Bot Token", secret: true },
+  { key: "SLACK_USER_TOKEN", label: "Slack User Token (admin xoxp- for On a call status)", secret: true },
   { key: "SLACK_TEXT_MESSAGES_WEBHOOK_URL", label: "#text-messages webhook", secret: true },
   { key: "SLACK_MISSED_CALLS_WEBHOOK_URL", label: "#missed-calls webhook", secret: true },
   { key: "SLACK_HUMAN_CALLS_WEBHOOK_URL", label: "#human-calls webhook", secret: true },
@@ -81,6 +94,7 @@ const SECRET_FIELDS = [
   { key: "SLACK_LEGAL_ASSISTANT_CHANNEL_ID", label: "#legalassistant-phone channel ID", secret: false },
   { key: "CASE_DB_URL", label: "Case DB connection string (Supabase Postgres, optional)", secret: true, revealable: true },
   { key: "EMAIL_WEBHOOK_TOKEN", label: "Inbound email webhook token (optional)", secret: true },
+  { key: "REPORT_API_TOKEN", label: "Report API token (quo-lead-review / daily reports)", secret: true },
 ];
 
 // Resolve a firm's credentials with precedence: FIRM_<ID>_<key> env var wins,
@@ -105,8 +119,10 @@ function resolveFirmSecrets(firmId, storedSecrets) {
     slackLegalAssistantChannelId: pick("SLACK_LEGAL_ASSISTANT_CHANNEL_ID"),
     quoApiKey: pick("QUO_API_KEY"),
     slackBotToken: pick("SLACK_BOT_TOKEN"),
+    slackUserToken: pick("SLACK_USER_TOKEN"),
     caseDbUrl: pick("CASE_DB_URL"),
     emailWebhookToken: pick("EMAIL_WEBHOOK_TOKEN"),
+    reportApiToken: pick("REPORT_API_TOKEN"),
     slackWebhooks: {
       textMessages: pick("SLACK_TEXT_MESSAGES_WEBHOOK_URL"),
       missedCalls: pick("SLACK_MISSED_CALLS_WEBHOOK_URL"),
@@ -184,6 +200,9 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     practiceArea: config.practiceArea || "personal injury",
     phoneLines: config.phoneLines || {},
     leadThreadTagUsers: config.leadThreadTagUsers || [],
+    // Subset of staff whose main job is answering the phone. Used for Slack
+    // "On a call" status + availability tagging on missed/Sona calls.
+    phoneStaff: normalizePhoneStaff(config),
     // Slack app/bot to tag when a client asks for a call back. Accepts an App ID
     // (A…, resolved to the bot's member id via users.list) or a member id directly.
     callbackBotId: (config.callbackBotId || "").trim(),
@@ -206,6 +225,8 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     caseStatusCache: new Map(), // caseNumber(string) -> status(string, lowercased)
     followUpWindows: new Map(), // phoneLast10 -> { intakeCallId, expiresAt }
     pendingCallbacks: new Map(), // phoneLast10 -> { callId, expiresAt }
+    onCallByCallId: new Map(), // callId -> { slackUserId, previous status, setAt }
+    answerWatchTimers: new Map(), // callId -> timeout id
   };
 }
 
@@ -334,6 +355,8 @@ async function initFirmStore() {
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS case_status_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS intake_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS callback_bot_id TEXT`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS phone_staff JSONB NOT NULL DEFAULT '[]'::jsonb`);
+    await ensureAvailabilityTable(pgPool);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
     console.error("[db] Failed to initialize Postgres — falling back to firms.json:", err.message);
@@ -347,6 +370,7 @@ function rowToConfig(row) {
     practiceArea: row.practice_area,
     phoneLines: row.phone_lines || {},
     leadThreadTagUsers: row.lead_thread_tag_users || [],
+    phoneStaff: row.phone_staff || [],
     restrictToPhoneLines: !!row.restrict_to_phone_lines,
     callbackBotId: row.callback_bot_id || "",
     caseStatusConfig: row.case_status_config || {},
@@ -375,6 +399,7 @@ async function loadFirmsFromDb() {
           practiceArea: existing.practiceArea,
           phoneLines: existing.phoneLines,
           leadThreadTagUsers: existing.leadThreadTagUsers,
+          phoneStaff: existing.phoneStaff,
           restrictToPhoneLines: existing.restrictToPhoneLines,
           callbackBotId: existing.callbackBotId,
           caseStatusConfig: existing.caseStatusConfig,
@@ -383,6 +408,9 @@ async function loadFirmsFromDb() {
         const merged = { ...base, ...dbConfig };
         if (!dbConfig.phoneLines || Object.keys(dbConfig.phoneLines).length === 0) {
           merged.phoneLines = base.phoneLines || {};
+        }
+        if (!Array.isArray(dbConfig.phoneStaff) || dbConfig.phoneStaff.length === 0) {
+          merged.phoneStaff = base.phoneStaff || [];
         }
         const f = makeFirm(row.id, merged, { ...(existing?.storedSecrets || {}), ...secrets });
         f.source = "db";
@@ -405,13 +433,14 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, secrets, restrict_to_phone_lines, case_status_config, intake_config, callback_bot_id, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, $10, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, phone_staff, secrets, restrict_to_phone_lines, case_status_config, intake_config, callback_bot_id, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10::jsonb, $11, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
        phone_lines = EXCLUDED.phone_lines,
        lead_thread_tag_users = EXCLUDED.lead_thread_tag_users,
+       phone_staff = EXCLUDED.phone_staff,
        secrets = EXCLUDED.secrets,
        restrict_to_phone_lines = EXCLUDED.restrict_to_phone_lines,
        case_status_config = EXCLUDED.case_status_config,
@@ -424,6 +453,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       config.practiceArea,
       JSON.stringify(config.phoneLines || {}),
       JSON.stringify(config.leadThreadTagUsers || []),
+      JSON.stringify(normalizePhoneStaff(config)),
       encryptSecrets(storedSecrets || {}),
       !!config.restrictToPhoneLines,
       JSON.stringify(normalizeCaseStatusConfig(config)),
@@ -466,6 +496,8 @@ function teardownFirm(firm) {
   for (const tid of firm.pendingCallChecks.values()) clearTimeout(tid);
   firm.pendingCallChecks.clear();
   firm.resolvedCalls.clear();
+  for (const tid of firm.answerWatchTimers?.values() || []) clearTimeout(tid);
+  firm.answerWatchTimers?.clear();
 }
 
 // === Firm-agnostic Utilities ===
@@ -3630,6 +3662,36 @@ function markCallResolved(firm, callId) {
   setTimeout(() => firm.resolvedCalls.delete(callId), CACHE_TTL);
 }
 
+/** Poll Quo after ringing so we can set Slack "On a call" as soon as someone answers. */
+function watchCallForPhoneStaffStatus(firm, callId) {
+  if (!callId || !firm.phoneStaff?.length) return;
+  startAnswerWatch(firm, {
+    callId,
+    fetchCall: fetchCallFromQuo,
+    onAnswered: async ({ callId: id, answeredBy }) => {
+      cacheCall(firm, id, { answeredBy });
+      await markPhoneStaffOnCall(firm, { callId: id, answeredBy });
+    },
+    onEnded: async ({ callId: id, answeredBy }) => {
+      if (answeredBy) {
+        await markPhoneStaffOnCall(firm, { callId: id, answeredBy });
+      }
+      await clearSlackOnCallStatus(firm, id);
+    },
+  });
+}
+
+/** Snapshot phone-staff availability, append to Slack text, and persist for reports. */
+async function withPhoneStaffAvailability(firm, text, { callId, eventType } = {}) {
+  try {
+    const result = await attachAvailabilityToNotice(pgPool, firm, text, { callId, eventType });
+    return result.text;
+  } catch (err) {
+    console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
+    return text;
+  }
+}
+
 async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDirection) {
   const call = await fetchCallFromQuo(firm, callId);
   if (!call) {
@@ -3692,6 +3754,12 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       const vmUrl = typeof voicemail === "string" ? voicemail : voicemail.url;
       text += `\nVoicemail: ${vmUrl}`;
     }
+    stopAnswerWatch(firm, callId);
+    await clearSlackOnCallStatus(firm, callId);
+    text = await withPhoneStaffAvailability(firm, text, {
+      callId,
+      eventType: isMenuHangup ? "menu_hangup" : "missed",
+    });
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     const externalPhone = firm.phoneLines[from] ? to : from;
@@ -3712,9 +3780,17 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     const isSona = answeredBy && (String(answeredBy).startsWith("SY") || String(answeredBy).toLowerCase().includes("sona"));
     const handlerName = getQuoUserName(firm, answeredBy);
     console.log(`[${firm.id}][call-check] Fallback: answered call for ${callId} (answeredBy: ${answeredBy}, sona: ${isSona})`);
+    stopAnswerWatch(firm, callId);
+    if (!isSona && answeredBy) {
+      await markPhoneStaffOnCall(firm, { callId, answeredBy });
+      await clearSlackOnCallStatus(firm, callId);
+    } else {
+      await clearSlackOnCallStatus(firm, callId);
+    }
     let text;
     if (isSona) {
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
+      text = await withPhoneStaffAvailability(firm, text, { callId, eventType: "sona" });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
     } else {
       const handlerLine = handlerName ? `\nHandled By: *${handlerName}*` : "";
@@ -4347,11 +4423,30 @@ async function handleCalls(firm, req, res) {
     if (eventType === "call.ringing" || status === "ringing") {
       if (direction === "incoming") {
         scheduleCallCheck(firm, callId, obj.from, obj.to, direction);
+        watchCallForPhoneStaffStatus(firm, callId);
         console.log(`[${firm.id}][calls] Ringing — scheduled API check in ${CALL_CHECK_DELAY_MS / 1000}s for ${callId}`);
       } else {
+        // Outbound: the firm dialed — if a configured phone-staff member owns
+        // the call (userId), mark them on-call as soon as Quo reports answeredBy.
+        watchCallForPhoneStaffStatus(firm, callId);
         console.log(`[${firm.id}][calls] Ringing — waiting for completion`);
       }
       return;
+    }
+
+    // Mid-call / completion updates: keep Slack "On a call" in sync whenever
+    // Quo tells us who answered, and clear it when the call ends.
+    if (obj.answeredBy) {
+      await markPhoneStaffOnCall(firm, { callId, answeredBy: obj.answeredBy }).catch((err) =>
+        console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
+      );
+    }
+    const isTerminalStatus = ["completed", "no-answer", "busy", "canceled", "cancelled", "failed"].includes(status);
+    if (isTerminalStatus) {
+      stopAnswerWatch(firm, callId);
+      await clearSlackOnCallStatus(firm, callId).catch((err) =>
+        console.warn(`[${firm.id}][phone-staff] on-call clear failed:`, err.message),
+      );
     }
 
     const hasVoicemail = voicemail && (typeof voicemail === "string" ? voicemail : voicemail.url);
@@ -4423,6 +4518,10 @@ async function handleCalls(firm, req, res) {
       text += `\nVoicemail: ${vmUrl}`;
     }
 
+    text = await withPhoneStaffAvailability(firm, text, {
+      callId,
+      eventType: isMenuHangup ? "menu_hangup" : "missed",
+    });
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
@@ -4745,11 +4844,19 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Outbound — not opening a new lead-calls post (${leadLabel})`);
     }
 
+    // Call is finished by the time we get a summary — clear any on-call status.
+    stopAnswerWatch(firm, callId);
+    if (!sona && cached?.answeredBy) {
+      await markPhoneStaffOnCall(firm, { callId, answeredBy: cached.answeredBy });
+    }
+    await clearSlackOnCallStatus(firm, callId);
+
     let text;
     if (sona) {
       const leadLink = slackMessagePermalink ? `\n<${slackMessagePermalink}|View in #lead-calls>` : "";
       console.log(`[${firm.id}][call-summary] Sona post — isLead=${isLead}, leadPermalink=${slackMessagePermalink || "null"}`);
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
+      text = await withPhoneStaffAvailability(firm, text, { callId, eventType: "sona" });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
       console.log(`[${firm.id}][call-summary] Sent to sona-calls`);
     } else {
@@ -4910,6 +5017,43 @@ async function handleCallSummary(firm, req, res) {
 app.get("/", (_req, res) => {
   const firmList = Array.from(firms.values()).map((f) => `${f.id} (${f.name})`).join(", ");
   res.send(`Quo Slack Router Running — firms: ${firmList || "(none)"}`);
+});
+
+// Daily-report helper for quo-lead-review: counts of phone staff who were
+// Slack-active (and not on another call) when a missed/Sona call happened.
+function requireReportToken(firm, req, res) {
+  const expected = firm.reportApiToken || process.env.REPORT_API_TOKEN;
+  if (!expected) {
+    res.status(503).json({ error: "REPORT_API_TOKEN not configured for this firm" });
+    return false;
+  }
+  const auth = req.headers.authorization || "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const headerToken = req.headers["x-report-token"];
+  const queryToken = typeof req.query.token === "string" ? req.query.token : "";
+  const provided = bearer || headerToken || queryToken;
+  if (!provided || provided !== expected) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+app.get("/api/reports/:firmId/availability-misses", async (req, res) => {
+  const firm = getFirm(req.params.firmId);
+  if (!firm) return res.status(404).json({ error: `Unknown firm: ${req.params.firmId}` });
+  if (!requireReportToken(firm, req, res)) return;
+  if (!pgPool) return res.status(503).json({ error: "DATABASE_URL not configured — availability events are not persisted" });
+  try {
+    const data = await queryAvailabilityMisses(pgPool, firm.id, {
+      createdAfter: req.query.createdAfter || req.query.from || null,
+      createdBefore: req.query.createdBefore || req.query.to || null,
+    });
+    res.json(data);
+  } catch (err) {
+    console.error(`[${firm.id}][reports] availability-misses error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Multi-tenant routes — firmId in URL path
@@ -5179,6 +5323,8 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     practiceArea: f.practiceArea,
     phoneLines: f.phoneLines,
     leadThreadTagUsers: f.leadThreadTagUsers,
+    phoneStaff: f.phoneStaff || [],
+    phoneStaffText: formatPhoneStaffText(f.phoneStaff || []),
     callbackBotId: f.callbackBotId || "",
     callbackBotResolved: !!resolveCallbackBotMention(f),
     restrictToPhoneLines: !!f.restrictToPhoneLines,
@@ -5201,6 +5347,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     isDefault: f.id === DEFAULT_FIRM_ID,
     hasQuoApiKey: !!f.quoApiKey,
     hasSlackBotToken: !!f.slackBotToken,
+    hasSlackUserToken: !!f.slackUserToken,
     hasLeadCallsChannel: !!f.slackLeadCallsChannelId,
     hasLegalAssistantChannel: !!f.slackLegalAssistantChannelId,
     // Per-credential source without leaking values: "env" | "stored" | null
@@ -5251,6 +5398,19 @@ function validateFirmBody(body) {
   if (leadThreadTagUsers && !Array.isArray(leadThreadTagUsers)) {
     return { error: "leadThreadTagUsers must be an array of Slack user IDs" };
   }
+  let phoneStaff = [];
+  if (typeof body?.phoneStaffText === "string") {
+    phoneStaff = parsePhoneStaffText(body.phoneStaffText);
+  } else if (Array.isArray(body?.phoneStaff)) {
+    phoneStaff = normalizePhoneStaff({ phoneStaff: body.phoneStaff });
+  } else if (body?.phoneStaffText != null || body?.phoneStaff != null) {
+    return { error: "phoneStaff must be an array or phoneStaffText a multiline Name=SLACK_ID[=QUO_ID] list" };
+  }
+  for (const person of phoneStaff) {
+    if (!/^U[A-Z0-9]+$/i.test(person.slackUserId)) {
+      return { error: `Invalid Slack user ID for phone staff "${person.name}"` };
+    }
+  }
   const csc = (body && body.caseStatusConfig) || {};
   if (csc.query && typeof csc.query === "string") {
     const q = csc.query.trim();
@@ -5273,6 +5433,7 @@ function validateFirmBody(body) {
       practiceArea: String(practiceArea || "personal injury").trim(),
       phoneLines: phoneLines || {},
       leadThreadTagUsers: leadThreadTagUsers || [],
+      phoneStaff,
       callbackBotId: typeof body?.callbackBotId === "string" ? body.callbackBotId.trim() : "",
       restrictToPhoneLines: !!(body && body.restrictToPhoneLines),
       caseStatusConfig: {
@@ -5391,6 +5552,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.practiceArea = config.practiceArea;
   firm.phoneLines = config.phoneLines;
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
+  firm.phoneStaff = normalizePhoneStaff(config);
   firm.callbackBotId = config.callbackBotId || "";
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.caseStatusConfig = normalizeCaseStatusConfig(config);

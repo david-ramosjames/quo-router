@@ -244,9 +244,19 @@
       <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
+      <label for="firm-phone-staff">Phone Staff (answer-responsible)</label>
+      <textarea id="firm-phone-staff" name="phoneStaffText" rows="4" placeholder="Jackie=U0XXXXXX=USYYYYYY
+Legal Assistant=U0AAAAAA=USBBBBBB"></textarea>
+      <div class="hint">
+        Only people whose main job is answering the phone. One per line:
+        <code>Name=SLACK_USER_ID=QUO_USER_ID</code>.
+        Quo user ID is required to auto-set Slack status to “On a call”.
+        On missed/Sona calls, available (Slack-active, not on a call) people in this list are tagged.
+      </div>
+
       <h3 style="margin-top:24px">Credentials</h3>
       <div class="hint" id="creds-note" style="margin-bottom:8px">
-        Quo API key, Slack bot token, webhook URLs, and channel IDs for this firm.
+        Quo API key, Slack bot token, Slack user token (admin <code>xoxp-</code> for On a call status), webhook URLs, and channel IDs for this firm.
       </div>
       <div id="secret-fields"></div>
 
@@ -343,6 +353,8 @@ PUBLIC_URL=https://your-host.com         # used to build the OAuth redirect URI<
       <p>The full set of credential fields (for firm id <code>smithlaw</code>, the env-var names would be):</p>
       <pre>FIRM_SMITHLAW_QUO_API_KEY
 FIRM_SMITHLAW_SLACK_BOT_TOKEN
+FIRM_SMITHLAW_SLACK_USER_TOKEN          (optional — admin xoxp- for On a call status)
+FIRM_SMITHLAW_REPORT_API_TOKEN         (optional — quo-lead-review availability counts)
 FIRM_SMITHLAW_SLACK_TEXT_MESSAGES_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_MISSED_CALLS_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_HUMAN_CALLS_WEBHOOK_URL
@@ -351,6 +363,7 @@ FIRM_SMITHLAW_SLACK_LEAD_CALLS_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_WEBHOOK_URL
 FIRM_SMITHLAW_SLACK_LEAD_CALLS_CHANNEL_ID
 FIRM_SMITHLAW_SLACK_LEGAL_ASSISTANT_CHANNEL_ID</pre>
+      <p>Phone-staff Slack status + missed/Sona availability tagging: see <code>PHONE_STAFF_SETUP.md</code>.</p>
       <p>The LLM key is shared across all firms and stays an env var — there's no per-firm version. Set <code>OPENAI_API_KEY</code> to use OpenAI, or <code>ANTHROPIC_API_KEY</code> to use Claude; if both are set, OpenAI wins. Override the model with <code>OPENAI_MODEL</code> (default <code>gpt-4o-mini</code>) or <code>ANTHROPIC_MODEL</code>. It powers lead classification, call-back detection, intake extraction, and the translation fallback — all of which quietly switch off if no key is set. The boot log line starting <code>[llm]</code> says which provider is live.</p>
     </details>
 
@@ -627,7 +640,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
               <span class="badge ${f.hasSlackBotToken ? "ok" : "missing"}">Slack ${f.hasSlackBotToken ? "✓" : "✗"}</span>
             </div>
           </div>
-          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}${f.intakeConfig?.enabled ? ' · <span class="src-tag stored">intake extraction ON</span>' : ""}${f.callbackBotId ? ` · <span class="src-tag ${f.callbackBotResolved ? "stored" : "none"}">call-back app ${f.callbackBotResolved ? "OK" : "UNRESOLVED"}</span>` : ""}</div>
+          <div class="hint">Practice area: ${escape(f.practiceArea)} · Tag users: ${escape((f.leadThreadTagUsers || []).join(", ") || "none")}${ (f.phoneStaff || []).length ? ` · <span class="src-tag stored">phone staff: ${f.phoneStaff.length}</span>` : ""}${f.hasSlackUserToken ? ' · <span class="src-tag stored">on-call status ON</span>' : ""}${f.restrictToPhoneLines ? ' · <span class="src-tag stored">phone-line filter ON</span>' : ""}${f.caseStatusConfig?.query ? ` · <span class="src-tag stored">case status: ${f.caseStatusCount} synced</span>` : ""}${f.intakeConfig?.enabled ? ' · <span class="src-tag stored">intake extraction ON</span>' : ""}${f.callbackBotId ? ` · <span class="src-tag ${f.callbackBotResolved ? "stored" : "none"}">call-back app ${f.callbackBotResolved ? "OK" : "UNRESOLVED"}</span>` : ""}</div>
           <details>
             <summary>Webhook URLs to configure in Quo</summary>
             <div class="url-block">${escape(host)}/webhooks/quo/${escape(f.id)}/messages</div>
@@ -665,6 +678,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.phoneLines.value = Object.entries(f.phoneLines || {})
       .map(([n, name]) => `${n}=${name}`).join("\n");
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
+    form.phoneStaffText.value = f.phoneStaffText || "";
     form.callbackBotId.value = f.callbackBotId || "";
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
@@ -854,6 +868,7 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       practiceArea: form.practiceArea.value.trim(),
       phoneLines: parsePhoneLines(form.phoneLines.value),
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
+      phoneStaffText: form.phoneStaffText.value,
       callbackBotId: form.callbackBotId.value.trim(),
       restrictToPhoneLines: form.restrictToPhoneLines.checked,
       caseStatusConfig: {
