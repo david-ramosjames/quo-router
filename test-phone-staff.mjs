@@ -99,6 +99,7 @@ const jackieDay = { name: "Jackie", slackUserId: "UJAC444", state: "off_shift", 
 const rosterNow = [immediate, delayed, onBreak, jackieDay];
 
 const longRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 20 });
+assert.match(longRing, /Rang for 20s/);
 assert.match(longRing, /✅ <@UIMM111>/);
 assert.match(longRing, /✅ <@UDEL222>/);
 assert.match(longRing, /Andrea Alvarado \(Break\)/);
@@ -117,9 +118,30 @@ assert.match(midRing, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(midRing, /<@UBRK333>/);
 
 const hangup = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 3 });
+assert.match(hangup, /Rang for 3s/);
 assert.match(hangup, /Caller hung up, please call back:/);
 assert.match(hangup, /✅ <@UIMM111>/);
 assert.match(hangup, /✅ <@UDEL222>/);
+
+// Inactive during shift, no Slack status → still @-mention as available.
+const roman = { name: "Roman", slackUserId: "UROM555", state: "inactive", ringAfterSeconds: 10, tag: true };
+const inactiveBlock = formatAvailabilitySlackBlock(
+  [immediate, roman, onBreak],
+  { ringSeconds: 9 },
+);
+assert.match(inactiveBlock, /Available to answer \(active, not on a call\):/);
+assert.match(inactiveBlock, /✅ <@UIMM111>/);
+assert.match(inactiveBlock, /Please call back:/);
+assert.match(inactiveBlock, /✅ <@UROM555>/);
+assert.match(inactiveBlock, /Andrea Alvarado \(Break\)/);
+assert.doesNotMatch(inactiveBlock, /Roman \(inactive\)/);
+
+const inactiveLong = formatAvailabilitySlackBlock(
+  [immediate, roman],
+  { ringSeconds: 20 },
+);
+assert.match(inactiveLong, /✅ <@UROM555>/);
+assert.doesNotMatch(inactiveLong, /Please call back/);
 assert.doesNotMatch(hangup, /Available to answer/);
 assert.match(hangup, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(hangup, /<@UBRK333>/);

@@ -713,11 +713,17 @@ function plainStatus(row) {
  * Under 5s nobody "should have answered". People with ringAfterSeconds only
  * count as available once the call rang at least that long.
  */
+function isFreeToAnswer(row) {
+  // Active, or inactive during shift with no Slack status set. Both should be
+  // @-mentioned. Break / lunch / on-call stay in the plain context list.
+  return row.state === "available" || row.state === "after_hours" || row.state === "inactive";
+}
+
 export function noticeGroups(snapshot, ringSeconds = null) {
   const fast = ringSeconds != null && ringSeconds < FAST_HANGUP_SECONDS;
   const visible = (snapshot || []).filter((r) => r.state !== "off_shift" && r.state !== "unknown");
-  const free = visible.filter((r) => r.state === "available" || r.state === "after_hours");
-  const context = visible.filter((r) => r.state !== "available" && r.state !== "after_hours");
+  const free = visible.filter(isFreeToAnswer);
+  const context = visible.filter((r) => !isFreeToAnswer(r));
   const rang = (r) => ringSeconds == null || ringSeconds >= (Number(r.ringAfterSeconds) || 0);
   const couldAnswer = free.filter(rang);
   const callbackOnly = free.filter((r) => !rang(r));
@@ -725,9 +731,17 @@ export function noticeGroups(snapshot, ringSeconds = null) {
   return { fast, couldAnswer, callbackOnly, context, accountable };
 }
 
+function formatRingDuration(ringSeconds) {
+  if (ringSeconds == null || !Number.isFinite(ringSeconds) || ringSeconds < 0) return "";
+  const secs = Math.round(ringSeconds);
+  return secs === 1 ? "1s" : `${secs}s`;
+}
+
 export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = {}) {
   const { fast, couldAnswer, callbackOnly, context } = noticeGroups(snapshot, ringSeconds);
   const lines = [];
+  const ringLabel = formatRingDuration(ringSeconds);
+  if (ringLabel) lines.push(`_Rang for ${ringLabel}_`);
   if (fast) {
     const who = [...couldAnswer, ...callbackOnly];
     if (who.length) lines.push(`*Caller hung up, please call back:*\n${checkedMentions(who)}`);
@@ -745,7 +759,7 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = 
 }
 
 export function availableFromSnapshot(snapshot) {
-  return (snapshot || []).filter((r) => r.tag || r.state === "available");
+  return (snapshot || []).filter((r) => r.tag || isFreeToAnswer(r));
 }
 
 /**
