@@ -697,8 +697,8 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
 
 const FAST_HANGUP_SECONDS = 5;
 
-function mentions(rows) {
-  return rows.map((r) => `<@${r.slackUserId}>`).join(" ");
+function checkedMentions(rows) {
+  return rows.map((r) => `✅ <@${r.slackUserId}>`).join("\n");
 }
 
 function plainStatus(row) {
@@ -730,12 +730,12 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = 
   const lines = [];
   if (fast) {
     const who = [...couldAnswer, ...callbackOnly];
-    if (who.length) lines.push(`*Caller hung up, please call back:* ${mentions(who)}`);
+    if (who.length) lines.push(`*Caller hung up, please call back:*\n${checkedMentions(who)}`);
   } else {
     if (couldAnswer.length) {
-      lines.push(`*Available to answer (active, not on a call):* ${mentions(couldAnswer)}`);
+      lines.push(`*Available to answer (active, not on a call):*\n${checkedMentions(couldAnswer)}`);
     }
-    if (callbackOnly.length) lines.push(`*Please call back:* ${mentions(callbackOnly)}`);
+    if (callbackOnly.length) lines.push(`*Please call back:*\n${checkedMentions(callbackOnly)}`);
   }
   for (const row of context) {
     lines.push(`${row.name || row.slackUserId} (${plainStatus(row)})`);

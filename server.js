@@ -3816,14 +3816,14 @@ function ringSecondsFromCall(obj, { allowTotalDuration = false } = {}) {
   return null;
 }
 
-/** Snapshot phone-staff availability, append to Slack text, and persist for reports. */
-async function withPhoneStaffAvailability(firm, text, { callId, eventType, ringSeconds = null } = {}) {
+/** Staff block for #lead-calls and #legalassistant-phone. Other channels stay plain. */
+async function phoneStaffBlock(firm, { callId, eventType, ringSeconds = null } = {}) {
   try {
-    const result = await attachAvailabilityToNotice(pgPool, firm, text, { callId, eventType, ringSeconds });
-    return result.text;
+    const result = await attachAvailabilityToNotice(pgPool, firm, "", { callId, eventType, ringSeconds });
+    return result.text || "";
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
-    return text;
+    return "";
   }
 }
 
@@ -3891,25 +3891,26 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     }
     stopAnswerWatch(firm, callId);
     await clearSlackOnCallStatus(firm, callId);
-    text = await withPhoneStaffAvailability(firm, text, {
+    const staffNote = await phoneStaffBlock(firm, {
       callId,
       eventType: isMenuHangup ? "menu_hangup" : "missed",
       ringSeconds: ringSecondsFromCall(call, { allowTotalDuration: true }),
     });
+    const intakeText = text + staffNote;
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
     if (closedClient) {
       // Former client — surface in #lead-calls too; may be a new matter.
-      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
     } else {
-      await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
     }
     if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + text : text, from, to);
+      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
     }
     await postToCaseChannel(firm, text, from, to);
   } else if (isAnswered) {
@@ -3924,9 +3925,10 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       await clearSlackOnCallStatus(firm, callId);
     }
     let text;
+    let staffNote = "";
     if (isSona) {
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
-      text = await withPhoneStaffAvailability(firm, text, {
+      staffNote = await phoneStaffBlock(firm, {
         callId,
         eventType: "sona",
         ringSeconds: ringSecondsFromCall(call),
@@ -3937,10 +3939,11 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
       await postToSlack(firm.slackWebhooks.humanCalls, text);
     }
+    const intakeText = text + staffNote;
     if (shouldRouteToLegalAssistant(firm, from, to)) {
-      await postToLegalAssistant(firm, text, from, to);
+      await postToLegalAssistant(firm, intakeText, from, to);
     }
-    await threadInLeadChannelIfMatch(firm, text, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
+    await threadInLeadChannelIfMatch(firm, intakeText, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
     // Sona answered (AI) — LA still needs to follow up. Human-answered was
     // already handled by a person, so don't ping the LA.
     await postToCaseChannel(firm, text, from, to, { includeLA: isSona });
@@ -4676,11 +4679,12 @@ async function handleCalls(firm, req, res) {
     if (ringSeconds == null && priorCall?.ringingAt) {
       ringSeconds = Math.max(0, Math.round((Date.now() - priorCall.ringingAt) / 1000));
     }
-    text = await withPhoneStaffAvailability(firm, text, {
+    const staffNote = await phoneStaffBlock(firm, {
       callId,
       eventType: isMenuHangup ? "menu_hangup" : "missed",
       ringSeconds,
     });
+    const intakeText = text + staffNote;
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
@@ -4690,17 +4694,17 @@ async function handleCalls(firm, req, res) {
     let slackPermalink = null;
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
-      const leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + text, from, to,
+      const leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       slackPermalink = leadPost?.permalink || null;
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
     } else {
-      const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      const threadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
       slackPermalink = threadPost?.permalink || null;
     }
 
     if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + text : text, from, to);
+      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
       console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone`);
     } else {
       console.log(`[${firm.id}][calls] Skipping legalassistant-phone — existing client`);
@@ -4977,6 +4981,24 @@ async function handleCallSummary(firm, req, res) {
 
     const linkLine = deepLink ? `\n<${deepLink}|View in Quo>` : "";
 
+    // Clear on-call before the staff snapshot so this call is not still "on a call".
+    stopAnswerWatch(firm, callId);
+    if (!sona && (cached?.answeredBy || cached?.userId)) {
+      await markPhoneStaffOnCall(firm, {
+        callId,
+        answeredBy: cached?.answeredBy,
+        userId: cached?.userId,
+      });
+    }
+    await clearSlackOnCallStatus(firm, callId);
+    const staffNote = sona
+      ? await phoneStaffBlock(firm, {
+          callId,
+          eventType: "sona",
+          ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
+        })
+      : "";
+
     let slackMessagePermalink = null;
     let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
@@ -4992,7 +5014,7 @@ async function handleCallSummary(firm, req, res) {
         : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
       
       const durationNote = callDurationSeconds != null ? ` (${callDurationSeconds}s)` : "";
-      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}`;
+      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}${staffNote}`;
       
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
       const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
@@ -5005,27 +5027,11 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Outbound — not opening a new lead-calls post (${leadLabel})`);
     }
 
-    // Call is finished by the time we get a summary — clear any on-call status.
-    stopAnswerWatch(firm, callId);
-    if (!sona && (cached?.answeredBy || cached?.userId)) {
-      await markPhoneStaffOnCall(firm, {
-        callId,
-        answeredBy: cached?.answeredBy,
-        userId: cached?.userId,
-      });
-    }
-    await clearSlackOnCallStatus(firm, callId);
-
     let text;
     if (sona) {
       const leadLink = slackMessagePermalink ? `\n<${slackMessagePermalink}|View in #lead-calls>` : "";
       console.log(`[${firm.id}][call-summary] Sona post — isLead=${isLead}, leadPermalink=${slackMessagePermalink || "null"}`);
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
-      text = await withPhoneStaffAvailability(firm, text, {
-        callId,
-        eventType: "sona",
-        ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
-      });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
       console.log(`[${firm.id}][call-summary] Sent to sona-calls`);
     } else {
@@ -5038,10 +5044,11 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
+    const intakeText = text + staffNote;
     let threadedInLeads = !!(isLead && isInbound);
     if (!threadedInLeads) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
-      const threadPost = await threadInLeadChannelIfMatch(firm, text, from, to, threadOpts);
+      const threadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, threadOpts);
       threadedInLeads = !!threadPost;
       slackMessagePermalink = threadPost?.permalink || null;
       leadParentTs = threadPost?.parentTs || null;
@@ -5051,7 +5058,7 @@ async function handleCallSummary(firm, req, res) {
 
     const sonaLeadOverride = sona && isLead && isInbound;
     if (isInbound && shouldRouteToLegalAssistant(firm, from, to) && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
-      await postToLegalAssistant(firm, text, from, to);
+      await postToLegalAssistant(firm, intakeText, from, to);
       console.log(`[${firm.id}][call-summary] ALSO sent to legalassistant-phone`);
     } else if (!isLead && !threadedInLeads && !isInbound) {
       console.log(`[${firm.id}][call-summary] Skipping legalassistant-phone — outbound (to=${to})`);

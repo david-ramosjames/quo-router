@@ -99,22 +99,27 @@ const jackieDay = { name: "Jackie", slackUserId: "UJAC444", state: "off_shift", 
 const rosterNow = [immediate, delayed, onBreak, jackieDay];
 
 const longRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 20 });
-assert.match(longRing, /Available to answer \(active, not on a call\):.*<@UIMM111>.*<@UDEL222>/);
+assert.match(longRing, /✅ <@UIMM111>/);
+assert.match(longRing, /✅ <@UDEL222>/);
 assert.match(longRing, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(longRing, /<@UBRK333>/);
 assert.doesNotMatch(longRing, /Jackie/);
 assert.doesNotMatch(longRing, /Please call back/);
 
 const midRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 7 });
-const availableLine = midRing.split("\n").find((line) => line.includes("Available to answer"));
-assert.match(availableLine, /<@UIMM111>/);
-assert.doesNotMatch(availableLine, /UDEL222/);
-assert.match(midRing, /Please call back:.*<@UDEL222>/);
+const midLines = midRing.split("\n");
+const availableAt = midLines.findIndex((line) => line.includes("Available to answer"));
+assert.match(midLines[availableAt + 1], /✅ <@UIMM111>/);
+assert.doesNotMatch(midLines[availableAt + 1], /UDEL222/);
+const callbackAt = midLines.findIndex((line) => line.includes("Please call back"));
+assert.match(midLines[callbackAt + 1], /✅ <@UDEL222>/);
 assert.match(midRing, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(midRing, /<@UBRK333>/);
 
 const hangup = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 3 });
-assert.match(hangup, /Caller hung up, please call back:.*<@UIMM111>.*<@UDEL222>/);
+assert.match(hangup, /Caller hung up, please call back:/);
+assert.match(hangup, /✅ <@UIMM111>/);
+assert.match(hangup, /✅ <@UDEL222>/);
 assert.doesNotMatch(hangup, /Available to answer/);
 assert.match(hangup, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(hangup, /<@UBRK333>/);
