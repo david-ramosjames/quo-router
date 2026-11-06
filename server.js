@@ -17,6 +17,7 @@ import {
   attachAvailabilityToNotice,
   ensureAvailabilityTable,
   queryAvailabilityMisses,
+  phoneStaffStatusSummary,
 } from "./phone-staff.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
@@ -3083,6 +3084,13 @@ async function fetchCallFromQuo(firm, callId) {
     if (!res.ok) {
       // Include the id and body — a bare status code isn't diagnosable.
       const body = await res.text().catch(() => "");
+      const tooManyParticipants = res.status === 400 && /too many participants/i.test(body);
+      if (tooManyParticipants) {
+        // Quo cannot return group/transfer legs via GET /calls/{id}. Webhooks
+        // still carry from/to/answeredBy — treat as a soft, permanent miss.
+        console.warn(`[${firm.id}][call-check] Quo API cannot fetch ${callId} (too many participants) — using webhook payload only`);
+        return { __unsupported: true, reason: "too_many_participants" };
+      }
       console.error(`[${firm.id}][call-check] Quo API responded ${res.status} for callId=${callId}: ${body.slice(0, 300)}`);
       return null;
     }
@@ -3766,7 +3774,15 @@ function markCallResolved(firm, callId) {
 
 /** Poll Quo after ringing so we can set Slack "On a call" as soon as someone answers. */
 function watchCallForPhoneStaffStatus(firm, callId) {
-  if (!callId || !firm.phoneStaff?.length) return;
+  if (!callId) return;
+  if (!firm.phoneStaff?.length) {
+    console.log(`[${firm.id}][phone-staff] Skip answer watch for ${callId} — phoneStaff list empty`);
+    return;
+  }
+  if (!firm.slackUserToken) {
+    console.log(`[${firm.id}][phone-staff] Skip answer watch for ${callId} — no SLACK_USER_TOKEN (xoxp-)`);
+    return;
+  }
   startAnswerWatch(firm, {
     callId,
     fetchCall: fetchCallFromQuo,
@@ -3796,7 +3812,7 @@ async function withPhoneStaffAvailability(firm, text, { callId, eventType } = {}
 
 async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDirection) {
   const call = await fetchCallFromQuo(firm, callId);
-  if (!call) {
+  if (!call || call.__unsupported) {
     console.log(`[${firm.id}][call-check] Could not verify call ${callId} via API — skipping`);
     return;
   }
@@ -4538,8 +4554,12 @@ async function handleCalls(firm, req, res) {
 
     // Mid-call / completion updates: keep Slack "On a call" in sync whenever
     // Quo tells us who answered, and clear it when the call ends.
-    if (obj.answeredBy) {
-      await markPhoneStaffOnCall(firm, { callId, answeredBy: obj.answeredBy }).catch((err) =>
+    if (obj.answeredBy || obj.userId) {
+      await markPhoneStaffOnCall(firm, {
+        callId,
+        answeredBy: obj.answeredBy,
+        userId: obj.userId,
+      }).catch((err) =>
         console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
       );
     }
@@ -4850,7 +4870,7 @@ async function handleCallSummary(firm, req, res) {
     
     if (callId && (!cached?.from || !cached?.to || callDurationSeconds == null)) {
       const call = await fetchCallFromQuo(firm, callId);
-      if (call?.from || call?.to) {
+      if (call && !call.__unsupported && (call.from || call.to)) {
         cached = {
           ...(cached || {}),
           from: cached?.from || call.from,
@@ -4869,6 +4889,8 @@ async function handleCallSummary(firm, req, res) {
         }
         cacheCall(firm, callId, cached);
         console.log(`[${firm.id}][call-summary] Cache miss for ${callId} — recovered from/to via Quo API (duration: ${callDurationSeconds || 'unknown'}s)`);
+      } else if (call?.__unsupported) {
+        console.warn(`[${firm.id}][call-summary] Cache miss for ${callId} — Quo API cannot fetch multi-party calls; relying on /calls webhook cache`);
       } else {
         console.warn(`[${firm.id}][call-summary] Cache miss for ${callId} and Quo API lookup failed — from/to unknown`);
       }
@@ -4948,8 +4970,12 @@ async function handleCallSummary(firm, req, res) {
 
     // Call is finished by the time we get a summary — clear any on-call status.
     stopAnswerWatch(firm, callId);
-    if (!sona && cached?.answeredBy) {
-      await markPhoneStaffOnCall(firm, { callId, answeredBy: cached.answeredBy });
+    if (!sona && (cached?.answeredBy || cached?.userId)) {
+      await markPhoneStaffOnCall(firm, {
+        callId,
+        answeredBy: cached?.answeredBy,
+        userId: cached?.userId,
+      });
     }
     await clearSlackOnCallStatus(firm, callId);
 
@@ -5156,6 +5182,13 @@ app.get("/api/reports/:firmId/availability-misses", async (req, res) => {
     console.error(`[${firm.id}][reports] availability-misses error:`, err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Live phone-staff readiness (admin only) — confirms list + token after deploy.
+app.get("/admin/api/firms/:id/phone-staff-status", requireAuth, (req, res) => {
+  const firm = firms.get(req.params.id);
+  if (!firm) return res.status(404).json({ error: `Firm "${req.params.id}" not found` });
+  res.json(phoneStaffStatusSummary(firm));
 });
 
 // Multi-tenant routes — firmId in URL path
@@ -5717,7 +5750,13 @@ async function loadFirmCaches(firm) {
   await loadQuoUsers(firm);
   await loadCaseStatuses(firm);
   await loadFollowUpWindows(firm);
-  console.log(`[${firm.id}][startup] Caches loaded`);
+  const ps = phoneStaffStatusSummary(firm);
+  console.log(
+    `[${firm.id}][startup] Caches loaded | phoneStaff=${ps.count} slackUserToken=${ps.hasUserToken ? "yes" : "NO"} ` +
+      (ps.count
+        ? `mapped=[${ps.staff.map((s) => `${s.name}:${s.quoUserId || "?"}`).join(", ")}]`
+        : "(add Phone Staff in admin to enable On a call + availability tags)"),
+  );
 }
 
 (async () => {

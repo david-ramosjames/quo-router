@@ -200,14 +200,41 @@ export async function clearSlackOnCallStatus(firm, callId) {
   }
 }
 
-export async function markPhoneStaffOnCall(firm, { callId, answeredBy }) {
-  if (!callId || !answeredBy || isSonaAnsweredBy(answeredBy)) return false;
-  const person = findPhoneStaffByQuoUser(firm, answeredBy);
+export async function markPhoneStaffOnCall(firm, { callId, answeredBy, userId = null }) {
+  if (!callId) return false;
+  const candidate = answeredBy || userId;
+  if (!candidate || isSonaAnsweredBy(candidate)) return false;
+  if (!firm.phoneStaff?.length) {
+    console.log(`[${firm.id}][phone-staff] No phoneStaff configured — ignoring answeredBy=${candidate}`);
+    return false;
+  }
+  const person = findPhoneStaffByQuoUser(firm, candidate)
+    || findPhoneStaffByQuoUser(firm, answeredBy)
+    || findPhoneStaffByQuoUser(firm, userId);
   if (!person) {
-    // Not in the responsible phone-staff list — ignore (attorneys etc.).
+    const mapped = (firm.phoneStaff || []).map((p) => `${p.name}:${p.quoUserId || "(no quo id)"}`).join(", ");
+    console.log(
+      `[${firm.id}][phone-staff] answeredBy/userId=${candidate} not in phoneStaff [${mapped}] — no Slack status change`,
+    );
     return false;
   }
   return setSlackOnCallStatus(firm, person.slackUserId, { callId });
+}
+
+/** One-line readiness summary for logs / admin. */
+export function phoneStaffStatusSummary(firm) {
+  const staff = firm.phoneStaff || [];
+  return {
+    count: staff.length,
+    hasUserToken: !!firm.slackUserToken,
+    hasBotToken: !!firm.slackBotToken,
+    staff: staff.map((p) => ({
+      name: p.name,
+      slackUserId: p.slackUserId,
+      quoUserId: p.quoUserId || null,
+      mapped: !!p.quoUserId,
+    })),
+  };
 }
 
 async function getPresence(firm, slackUserId) {
@@ -410,6 +437,7 @@ export function startAnswerWatch(firm, {
 
   const started = Date.now();
   let stopped = false;
+  let permanentFailLogged = false;
 
   const stop = () => {
     if (stopped) return;
@@ -428,6 +456,18 @@ export function startAnswerWatch(firm, {
     }
     try {
       const call = await fetchCall(firm, callId);
+      // Quo returns null on 400 "too many participants" and similar — polling
+      // will never recover. Fall back to webhook-driven status updates only.
+      if (call?.__unsupported) {
+        if (!permanentFailLogged) {
+          permanentFailLogged = true;
+          console.log(
+            `[${firm.id}][phone-staff] Answer watch stopped for ${callId} — Quo API cannot fetch this call (${call.reason || "unsupported"}). Will rely on webhook answeredBy.`,
+          );
+        }
+        stop();
+        return;
+      }
       if (!call) {
         schedule();
         return;
@@ -458,6 +498,7 @@ export function startAnswerWatch(firm, {
     firm.answerWatchTimers.set(callId, tid);
   };
 
+  console.log(`[${firm.id}][phone-staff] Watching ${callId} for answer → Slack on-call status`);
   // First poll soon after ringing — people often answer within a few seconds.
   const tid = setTimeout(tick, 2_000);
   firm.answerWatchTimers.set(callId, tid);
