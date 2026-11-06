@@ -1,57 +1,392 @@
 // Phone-staff availability: Quo → Slack "On a call" status, and tagging who
-// was available (but did not answer) on missed / Sona calls.
+// should have answered a missed / Sona call.
 //
 // Configured per firm via `phoneStaff`:
-//   [{ name, slackUserId, quoUserId? }]
+//   [{ name, slackUserId, quoUserId?, windows?, afterHours?, timezone? }]
 // Only this subset is tracked — attorneys / others are ignored.
+//
+// Tag someone only when all of these are true:
+//   - not already on a call
+//   - no Slack status that takes them off the phones (lunch, break, meeting, …)
+//   - the miss happened during their scheduled hours, or they are the
+//     after-hours person and nobody's shift covers that moment
+//   - Slack presence is active, or (once hours are set) away/offline with no status
+// People are not tagged outside their own hours. Until any hours are saved,
+// only Slack-active staff are tagged, same as before.
 
 const ON_CALL_STATUS_TEXT = "On a call";
 const ON_CALL_STATUS_EMOJI = ":phone:";
 const ANSWER_POLL_MS = 5_000;
 const ANSWER_POLL_MAX_MS = 3 * 60_000; // stop watching after 3 minutes of ringing
+export const DEFAULT_PHONE_STAFF_TZ = "America/Chicago";
+
+const DAY_INDEX = {
+  su: 0, sun: 0, sunday: 0,
+  m: 1, mo: 1, mon: 1, monday: 1,
+  tu: 2, tue: 2, tues: 2, tuesday: 2,
+  w: 3, we: 3, wed: 3, wednesday: 3,
+  th: 4, thu: 4, thur: 4, thurs: 4, thursday: 4,
+  f: 5, fr: 5, fri: 5, friday: 5,
+  sa: 6, sat: 6, saturday: 6,
+};
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+const BLOCKING_STATUS = [
+  /\blunch\b/i,
+  /\bbreak\b/i,
+  /\bbrb\b/i,
+  /\bbe right back\b/i,
+  /\booo\b/i,
+  /\bout of (the )?office\b/i,
+  /\bpto\b/i,
+  /\bvacation\b/i,
+  /\bholiday\b/i,
+  /\bsick\b/i,
+  /\bdoctor\b/i,
+  /\bdentist\b/i,
+  /\bappointment\b/i,
+  /\bmeeting\b/i,
+  /\bfocus\b/i,
+  /\bheads down\b/i,
+  /\bdnd\b/i,
+  /\bdo not disturb\b/i,
+  /\bbusy\b/i,
+  /\bon a call\b/i,
+  /\bon-call\b/i,
+  /\bcommute\b/i,
+  /\bpersonal\b/i,
+  /\berrand\b/i,
+  /\bstepp(?:ing|ed) away\b/i,
+];
+
+const BLOCKING_EMOJI = new Set([
+  "palm_tree", "airplane", "zzz", "hamburger", "bento", "fork_and_knife",
+  "beach_with_umbrella", "face_with_thermometer", "no_entry", "no_entry_sign", "sleeping",
+]);
 
 export function normalizePhoneStaff(config) {
   const raw = config?.phoneStaff;
   if (!Array.isArray(raw)) return [];
+  const tzDefault = String(config?.phoneStaffTimezone || "").trim() || null;
   const out = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;
     const slackUserId = String(entry.slackUserId || entry.slack_user_id || "").trim();
+    if (entry.scheduleError && !/^U[A-Z0-9]+$/i.test(slackUserId)) {
+      out.push({
+        name: String(entry.name || "phone staff").trim(),
+        slackUserId: "UINVALID",
+        quoUserId: null,
+        afterHours: false,
+        windows: [],
+        timezone: null,
+        scheduleError: entry.scheduleError,
+      });
+      continue;
+    }
     if (!/^U[A-Z0-9]+$/i.test(slackUserId)) continue;
     const name = String(entry.name || entry.displayName || slackUserId).trim();
     const quoUserId = String(entry.quoUserId || entry.quo_user_id || "").trim() || null;
-    out.push({ name, slackUserId, quoUserId });
+    const schedule = entry.scheduleError
+      ? { error: entry.scheduleError }
+      : normalizeSchedule(entry);
+    if (schedule.error) {
+      out.push({
+        name, slackUserId, quoUserId,
+        afterHours: false,
+        windows: [],
+        timezone: null,
+        scheduleError: schedule.error,
+      });
+      continue;
+    }
+    out.push({
+      name,
+      slackUserId,
+      quoUserId,
+      afterHours: !!schedule.afterHours,
+      windows: schedule.windows,
+      timezone: entry.timezone || tzDefault || (schedule.windows.length || schedule.afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
+    });
   }
   return out;
 }
 
+function normalizeSchedule(entry) {
+  if (entry.scheduleError) return { error: entry.scheduleError };
+  if (Array.isArray(entry.windows) || entry.afterHours) {
+    const windows = [];
+    for (const w of entry.windows || []) {
+      const days = [...new Set((w.days || []).map((d) => Number(d)).filter((d) => d >= 0 && d <= 6))].sort((a, b) => a - b);
+      const startMin = Number(w.startMin);
+      const endMin = Number(w.endMin);
+      if (!days.length || !Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) {
+        return { error: `Could not read hours for ${entry.name || entry.slackUserId}` };
+      }
+      windows.push({ days, startMin, endMin });
+    }
+    return { afterHours: !!entry.afterHours, windows };
+  }
+  if (typeof entry.schedule === "string") return parseStaffSchedule(entry.schedule);
+  return { afterHours: false, windows: [] };
+}
+
 export function parsePhoneStaffText(text) {
-  // One person per line: Name=SLACK_ID[=QUO_ID]  or  Name,SLACK_ID[,QUO_ID]
+  // One person per line:
+  //   Name=SLACK_ID[=QUO_ID] [| Mon-Fri 08:00-17:00]
+  //   Name=SLACK_ID=QUO_ID | after-hours
+  // Optional first line: timezone=America/Chicago
   const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const out = [];
+  let timezone = null;
   for (const line of lines) {
-    let name, slackUserId, quoUserId;
-    if (line.includes("=")) {
-      const parts = line.split("=").map((p) => p.trim());
-      [name, slackUserId, quoUserId] = parts;
+    const tz = line.match(/^timezone\s*=\s*(\S+)\s*$/i);
+    if (tz) {
+      timezone = tz[1];
+      if (!/^[A-Za-z_]+(?:\/[A-Za-z0-9_+\-]+)+$/.test(timezone)) {
+        out.push({
+          name: "timezone",
+          slackUserId: "",
+          scheduleError: `Unknown timezone "${timezone}"`,
+        });
+      }
+      continue;
+    }
+    let main = line;
+    let scheduleText = "";
+    const pipe = line.indexOf("|");
+    if (pipe >= 0) {
+      main = line.slice(0, pipe).trim();
+      scheduleText = line.slice(pipe + 1).trim();
+    }
+    let name, slackUserId, quoUserId, extra;
+    if (main.includes("=")) {
+      const parts = main.split("=").map((p) => p.trim());
+      [name, slackUserId, quoUserId, extra] = parts;
+      if (!scheduleText && extra) scheduleText = parts.slice(3).join("=").trim();
     } else {
-      const parts = line.split(/[,\t]/).map((p) => p.trim());
+      const parts = main.split(/[,\t]/).map((p) => p.trim());
       [name, slackUserId, quoUserId] = parts;
     }
     if (!slackUserId) continue;
+    const schedule = parseStaffSchedule(scheduleText);
     out.push({
       name: name || slackUserId,
       slackUserId,
       quoUserId: quoUserId || null,
+      timezone,
+      afterHours: schedule.afterHours,
+      windows: schedule.windows,
+      scheduleError: schedule.error || null,
     });
   }
-  return normalizePhoneStaff({ phoneStaff: out });
+  return normalizePhoneStaff({ phoneStaff: out, phoneStaffTimezone: timezone });
 }
 
 export function formatPhoneStaffText(staff) {
-  return (staff || [])
-    .map((p) => (p.quoUserId ? `${p.name}=${p.slackUserId}=${p.quoUserId}` : `${p.name}=${p.slackUserId}`))
-    .join("\n");
+  const people = staff || [];
+  const tz = people.find((p) => p.timezone)?.timezone;
+  const lines = [];
+  if (tz) lines.push(`timezone=${tz}`);
+  for (const p of people) {
+    const id = p.quoUserId ? `${p.name}=${p.slackUserId}=${p.quoUserId}` : `${p.name}=${p.slackUserId}`;
+    const schedule = formatStaffSchedule(p);
+    lines.push(schedule ? `${id} | ${schedule}` : id);
+  }
+  return lines.join("\n");
+}
+
+export function parseStaffSchedule(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return { afterHours: false, windows: [] };
+  let afterHours = false;
+  const rest = raw
+    .replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; })
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[|;\s]+|[|;\s]+$/g, "");
+  if (!rest) return { afterHours, windows: [] };
+  const windows = [];
+  for (const chunk of rest.split(/\s*;\s*/).filter(Boolean)) {
+    const m = chunk.match(/^([a-z][a-z,\-\s]*?)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|–|—|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)$/i);
+    if (!m) return { error: `Could not read hours "${chunk.trim()}"` };
+    const days = parseDays(m[1]);
+    const startMin = parseClock(m[2]);
+    const endMin = parseClock(m[3]);
+    if (!days?.length || startMin == null || endMin == null || startMin === endMin) {
+      return { error: `Could not read hours "${chunk.trim()}"` };
+    }
+    windows.push({ days, startMin, endMin });
+  }
+  return { afterHours, windows };
+}
+
+function parseDays(spec) {
+  const days = new Set();
+  const cleaned = spec.replace(/\s+/g, "");
+  for (const part of cleaned.split(",").filter(Boolean)) {
+    const range = part.match(/^([a-z]+)-([a-z]+)$/i);
+    const single = part.match(/^([a-z]+)$/i);
+    if (!range && !single) return null;
+    const start = DAY_INDEX[(range ? range[1] : single[1]).toLowerCase()];
+    const end = range ? DAY_INDEX[range[2].toLowerCase()] : start;
+    if (start == null || end == null) return null;
+    let d = start;
+    for (let i = 0; i < 7; i++) {
+      days.add(d);
+      if (d === end) break;
+      d = (d + 1) % 7;
+    }
+  }
+  return [...days].sort((a, b) => a - b);
+}
+
+function parseClock(raw) {
+  const m = String(raw).trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = m[2] ? Number(m[2]) : 0;
+  if (min > 59 || h > 24) return null;
+  const ap = m[3]?.toLowerCase();
+  if (ap) {
+    if (h < 1 || h > 12) return null;
+    if (ap === "pm" && h !== 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+  } else if (h === 24 && min === 0) {
+    h = 0;
+  } else if (h > 23) return null;
+  return h * 60 + min;
+}
+
+export function formatStaffSchedule(person) {
+  const parts = (person?.windows || []).map((w) => `${formatDays(w.days)} ${formatClock(w.startMin)}-${formatClock(w.endMin)}`);
+  if (person?.afterHours) parts.push("after-hours");
+  return parts.join("; ");
+}
+
+function formatDays(days) {
+  const set = [...new Set(days)].sort((a, b) => a - b);
+  const ranges = [];
+  let start = set[0];
+  let prev = set[0];
+  for (let i = 1; i <= set.length; i++) {
+    if (i < set.length && set[i] === prev + 1) {
+      prev = set[i];
+      continue;
+    }
+    ranges.push(start === prev ? DAY_NAMES[start] : `${DAY_NAMES[start]}-${DAY_NAMES[prev]}`);
+    start = set[i];
+    prev = set[i];
+  }
+  return ranges.join(",");
+}
+
+function formatClock(mins) {
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+export function zonedDayMinutes(date, timeZone = DEFAULT_PHONE_STAFF_TZ) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
+  const day = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[parts.weekday];
+  let hour = Number(parts.hour);
+  if (hour === 24) hour = 0;
+  return { day, minutes: hour * 60 + Number(parts.minute) };
+}
+
+export function isOnShift(person, now) {
+  if (!person?.windows?.length) return false;
+  const { day, minutes } = zonedDayMinutes(now, person.timezone || DEFAULT_PHONE_STAFF_TZ);
+  return person.windows.some((w) => inWindow(day, minutes, w));
+}
+
+function inWindow(day, minutes, w) {
+  if (w.endMin > w.startMin) {
+    return w.days.includes(day) && minutes >= w.startMin && minutes < w.endMin;
+  }
+  if (w.days.includes(day) && minutes >= w.startMin) return true;
+  const prev = (day + 6) % 7;
+  return w.days.includes(prev) && minutes < w.endMin;
+}
+
+export function hoursAreConfigured(staff) {
+  return (staff || []).some((p) => p.afterHours || p.windows?.length);
+}
+
+export function isOfficeCovered(staff, now) {
+  return (staff || []).some((p) => p.windows?.length && isOnShift(p, now));
+}
+
+export function blockingStatusReason(statusText, statusEmoji) {
+  const text = String(statusText || "").trim();
+  if (text && BLOCKING_STATUS.some((re) => re.test(text))) return text;
+  const emoji = String(statusEmoji || "").replace(/:/g, "");
+  if (emoji && BLOCKING_EMOJI.has(emoji)) return text || emoji;
+  return "";
+}
+
+/**
+ * Decide whether this person should be @-mentioned for a missed/Sona call.
+ * `officeCovered` is true when any scheduled shift contains `now`.
+ */
+export function classifyPhoneStaffMember(person, {
+  presence = "unknown",
+  statusText = "",
+  statusEmoji = "",
+  onCall = false,
+  now = new Date(),
+  officeCovered = false,
+  hoursConfigured = false,
+} = {}) {
+  const base = {
+    name: person.name,
+    slackUserId: person.slackUserId,
+    quoUserId: person.quoUserId || null,
+    presence,
+    statusText: String(statusText || "").trim(),
+    afterHoursDuty: false,
+    tag: false,
+  };
+  const onCallStatus = base.statusText.toLowerCase() === ON_CALL_STATUS_TEXT.toLowerCase()
+    || (statusEmoji === ON_CALL_STATUS_EMOJI && /call/i.test(base.statusText));
+  if (onCall || onCallStatus) return { ...base, state: "on_call", tag: false };
+
+  const blocked = blockingStatusReason(statusText, statusEmoji);
+  if (blocked) return { ...base, state: "status", statusText: blocked, tag: false };
+
+  const onScheduledShift = isOnShift(person, now);
+  let duty = false;
+  let afterHoursDuty = false;
+  if (!hoursConfigured) {
+    duty = true;
+  } else if (onScheduledShift) {
+    duty = true;
+  } else if (person.afterHours && !officeCovered) {
+    duty = true;
+    afterHoursDuty = true;
+  }
+  if (!duty) {
+    let why = "";
+    if (hoursConfigured && !person.windows?.length && !person.afterHours) why = "no hours set";
+    else if (person.afterHours && !onScheduledShift) why = "after hours only";
+    return { ...base, state: "off_shift", statusText: why, tag: false };
+  }
+
+  if (afterHoursDuty) {
+    return { ...base, state: "after_hours", afterHoursDuty: true, presence, tag: true };
+  }
+  if (presence === "active") return { ...base, state: "available", tag: true };
+  if (presence === "away" && hoursConfigured) return { ...base, state: "inactive", tag: true };
+  if (presence === "away") return { ...base, state: "away", tag: false };
+  return { ...base, state: "unknown", tag: false };
 }
 
 function isSonaAnsweredBy(answeredBy) {
@@ -257,33 +592,59 @@ async function getPresence(firm, slackUserId) {
   }
 }
 
+async function getSlackStatus(firm, slackUserId) {
+  if (!firm.slackBotToken || !slackUserId) return { statusText: "", statusEmoji: "" };
+  try {
+    const url = new URL("https://slack.com/api/users.info");
+    url.searchParams.set("user", slackUserId);
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${firm.slackBotToken}` },
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.warn(`[${firm.id}][phone-staff] users.info failed for ${slackUserId}: ${json.error}`);
+      return { statusText: "", statusEmoji: "" };
+    }
+    const profile = json.user?.profile || {};
+    const expires = Number(profile.status_expiration || 0);
+    if (expires && expires * 1000 <= Date.now()) return { statusText: "", statusEmoji: "" };
+    return {
+      statusText: profile.status_text || "",
+      statusEmoji: profile.status_emoji || "",
+    };
+  } catch (err) {
+    console.warn(`[${firm.id}][phone-staff] users.info error:`, err.message);
+    return { statusText: "", statusEmoji: "" };
+  }
+}
+
 /**
  * Snapshot each configured phone-staff member at the moment of a missed/Sona call.
- * A person is "available" when Slack presence is active AND they are not on a call
- * (tracked by this router).
+ * Tag people who were on shift (or the after-hours person), not on a call, and
+ * not behind a blocking Slack status.
  */
-export async function snapshotPhoneStaffAvailability(firm) {
+export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } = {}) {
   const staff = firm.phoneStaff || [];
   if (!staff.length) return [];
 
   const onCall = onCallSlackUserIds(firm);
+  const hoursConfigured = hoursAreConfigured(staff);
+  const officeCovered = isOfficeCovered(staff, now);
   const rows = [];
   for (const person of staff) {
-    let state;
-    if (onCall.has(person.slackUserId)) {
-      state = "on_call";
-    } else {
-      const presence = await getPresence(firm, person.slackUserId);
-      if (presence === "active") state = "available";
-      else if (presence === "away") state = "away";
-      else state = "unknown";
-    }
-    rows.push({
-      name: person.name,
-      slackUserId: person.slackUserId,
-      quoUserId: person.quoUserId,
-      state,
-    });
+    const [presence, status] = await Promise.all([
+      getPresence(firm, person.slackUserId),
+      getSlackStatus(firm, person.slackUserId),
+    ]);
+    rows.push(classifyPhoneStaffMember(person, {
+      presence,
+      statusText: status.statusText,
+      statusEmoji: status.statusEmoji,
+      onCall: onCall.has(person.slackUserId),
+      now,
+      officeCovered,
+      hoursConfigured,
+    }));
   }
   return rows;
 }
@@ -292,22 +653,36 @@ export function formatAvailabilitySlackBlock(snapshot, { header = "Phone staff a
   if (!snapshot?.length) return "";
   const lines = snapshot.map((row) => {
     const mention = `<@${row.slackUserId}>`;
-    if (row.state === "available") return `✅ ${mention} (active, available)`;
+    if (row.state === "available") return `✅ ${mention} (active)`;
+    if (row.state === "inactive") return `💤 ${mention} (inactive during shift, no status)`;
     if (row.state === "on_call") return `📞 ${mention} (on a call)`;
+    if (row.state === "status") return `🚫 ${mention} (status: ${row.statusText || "unavailable"})`;
+    if (row.state === "off_shift") {
+      const why = row.statusText === "no hours set" ? "no hours set"
+        : row.statusText === "after hours only" ? "after hours only"
+        : "outside scheduled hours";
+      return `⏸️ ${mention} (${why})`;
+    }
+    if (row.state === "after_hours") {
+      const extra = row.presence === "away" ? ", inactive" : row.presence === "active" ? ", active" : "";
+      return `🌙 ${mention} (after hours${extra})`;
+    }
     if (row.state === "away") return `💤 ${mention} (away)`;
     return `❓ ${mention} (presence unknown)`;
   });
-  const available = snapshot.filter((r) => r.state === "available");
+  const tagged = snapshot.filter((r) => r.tag);
   let footer = "";
-  if (available.length) {
-    const tags = available.map((r) => `<@${r.slackUserId}>`).join(" ");
-    footer = `\n⚠️ ${available.length} available but did not answer: ${tags}`;
+  if (tagged.length) {
+    const tags = tagged.map((r) => `<@${r.slackUserId}>`).join(" ");
+    footer = tagged.every((r) => r.afterHoursDuty)
+      ? `\n🌙 After hours: ${tags}`
+      : `\n⚠️ Should have answered: ${tags}`;
   }
   return `\n\n📊 *${header}:*\n${lines.join("\n")}${footer}`;
 }
 
 export function availableFromSnapshot(snapshot) {
-  return (snapshot || []).filter((r) => r.state === "available");
+  return (snapshot || []).filter((r) => r.tag || r.state === "available");
 }
 
 /**
@@ -321,7 +696,7 @@ export async function recordAvailabilityEvent(pgPool, firm, {
   occurredAt = new Date(),
 } = {}) {
   if (!pgPool || !firm || !snapshot?.length) return null;
-  const available = snapshot.filter((r) => r.state === "available").map((r) => r.slackUserId);
+  const available = snapshot.filter((r) => r.tag || r.state === "available").map((r) => r.slackUserId);
   const onCall = snapshot.filter((r) => r.state === "on_call").map((r) => r.slackUserId);
   const away = snapshot.filter((r) => r.state === "away").map((r) => r.slackUserId);
   try {

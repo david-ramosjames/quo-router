@@ -74,11 +74,14 @@ For each person whose **main job is answering the phone**:
 In the router admin UI → firm → **Phone Staff**:
 
 ```
-Jackie=U026P9FUKHC=USxxxxxxxxx
-Legal Assistant=U0ANAJK56LD=USyyyyyyyyy
+timezone=America/Chicago
+Andrea=U0AAAAAA=USyyyyyyyyy | Mon-Fri 08:00-17:00
+Jackie=U026P9FUKHC=USxxxxxxxxx | after-hours
 ```
 
-Format: `Name=SLACK_USER_ID=QUO_USER_ID` (one per line).
+Format: `Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00` (one per line).
+
+Hours are per person, in the timezone on the first line (default `America/Chicago`). Someone is not tagged outside their own hours. The person marked `after-hours` is tagged only when no scheduled shift covers the call.
 
 Or in `firms.json`:
 
@@ -124,7 +127,7 @@ The Daily Call Report will then include **Available but did not answer** totals 
 1. Redeploy quo-router.
 2. Have a listed phone-staff member answer a test call → their Slack status should show **On a call** within a few seconds.
 3. End the call → status should clear / restore.
-4. Miss a test call (or let Sona take one) while another listed person is Slack-active and not on a call → the Slack notice should list and @-mention them under **available but did not answer**.
+4. Miss a test call (or let Sona take one) during a listed person's scheduled hours, while they are Slack-active (or inactive with no status), not on a call, and without a lunch/break/meeting status → the Slack notice should @-mention them under **Should have answered**. Outside those hours, only the `after-hours` person is mentioned.
 5. Check router logs for `[phone-staff]` lines.
 
 ---
@@ -133,14 +136,16 @@ The Daily Call Report will then include **Available but did not answer** totals 
 
 For each configured phone-staff member at the moment of a missed or Sona call:
 
-| State | Meaning |
+| State | Tagged? |
 |-------|---------|
-| ✅ available | Slack presence `active` AND not currently on a Quo call tracked by this router |
-| 📞 on a call | Router already set their Slack status for another live call |
-| 💤 away | Slack presence `away` |
-| ❓ unknown | Presence API failed |
+| ✅ active, on shift, no blocking status, not on a call | Yes |
+| 💤 inactive/offline during their shift, no status set | Yes |
+| 🌙 after-hours person, and nobody's shift covers this moment | Yes |
+| 📞 on a call | No |
+| 🚫 Slack status such as lunch, break, meeting, PTO, out of office | No |
+| ⏸️ outside their scheduled hours | No |
 
-"Available but did not answer" = ✅ only. Away / already-on-call people are shown for context but not counted as misses.
+Until at least one person has hours (or is marked after-hours), inactive people are not tagged — only Slack-active staff, same as the first version. After hours are saved, working-hour staff are never tagged off shift.
 
 ---
 

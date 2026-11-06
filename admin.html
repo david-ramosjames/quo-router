@@ -235,23 +235,25 @@
       <div class="hint">Slack <strong>App ID</strong> (starts with <code>A</code>) or bot member ID. When a client who has a case — open or closed — speaks to someone and is still owed a return call, the case-channel post is prefixed with <code>@app request a call back</code>. Leave blank to disable.</div>
 
       <label class="checkbox-row">
-        <input type="checkbox" id="firm-restrict" name="restrictToPhoneLines">
+        <input type="checkbox" id="firm-restrict" name="restrictToPhoneLines" checked>
         <span>Only route events for the phone lines above</span>
       </label>
-      <div class="hint">When on, calls/texts are posted only if one party is a line listed above — events for the Quo account's other numbers are ignored. Leave off to route everything.</div>
+      <div class="hint">When phone lines are listed, calls/texts post only if one party is a line above. Other numbers on the Quo account — including leftover webhooks for another tenant — are ignored.</div>
 
       <label for="firm-tags">Lead-Thread Tag Users</label>
       <input id="firm-tags" name="leadThreadTagUsers" placeholder="U026P9FUKHC, U0ANAJK56LD">
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
       <label for="firm-phone-staff">Phone Staff (answer-responsible)</label>
-      <textarea id="firm-phone-staff" name="phoneStaffText" rows="4" placeholder="Jackie=U0XXXXXX=USYYYYYY
-Legal Assistant=U0AAAAAA=USBBBBBB"></textarea>
+      <textarea id="firm-phone-staff" name="phoneStaffText" rows="6" placeholder="timezone=America/Chicago
+Andrea=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00
+Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <div class="hint">
         Only people whose main job is answering the phone. One per line:
-        <code>Name=SLACK_USER_ID=QUO_USER_ID</code>.
+        <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
         Quo user ID is required to auto-set Slack status to “On a call”.
-        On missed/Sona calls, available (Slack-active, not on a call) people in this list are tagged.
+        Put hours on each person. They are tagged for a missed or Sona call only during those hours, and only if they were not already on a call and had no Slack status like lunch, break, or a meeting. Active people are tagged, and so is anyone inactive with no status during their shift.
+        Mark the after-hours person with <code>after-hours</code> (Jackie). That person is tagged only when nobody’s shift covers the call. Optional first line: <code>timezone=America/Chicago</code>.
       </div>
 
       <h3 style="margin-top:24px">Credentials</h3>

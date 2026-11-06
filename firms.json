@@ -9,6 +9,15 @@
       "+15125005266": "RJL Outbound",
       "+15126300907": "RJL Transfers"
     },
-    "leadThreadTagUsers": ["U026P9FUKHC", "U0ANAJK56LD"]
+    "leadThreadTagUsers": ["U026P9FUKHC", "U0ANAJK56LD"],
+    "restrictToPhoneLines": true
+  },
+  "trucking-chicas": {
+    "name": "Trucking Chicas",
+    "practiceArea": "personal injury",
+    "phoneLines": {
+      "+15127643037": "Main Line"
+    },
+    "restrictToPhoneLines": true
   }
 }

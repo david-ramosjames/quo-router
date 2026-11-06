@@ -5542,6 +5542,7 @@ function validateFirmBody(body) {
     return { error: "phoneStaff must be an array or phoneStaffText a multiline Name=SLACK_ID[=QUO_ID] list" };
   }
   for (const person of phoneStaff) {
+    if (person.scheduleError) return { error: person.scheduleError };
     if (!/^U[A-Z0-9]+$/i.test(person.slackUserId)) {
       return { error: `Invalid Slack user ID for phone staff "${person.name}"` };
     }

@@ -29,7 +29,8 @@
     },
     "leadThreadTagUsers": ["U00000000", "U11111111"],
     "phoneStaff": [
-      { "name": "Jackie", "slackUserId": "U00000000", "quoUserId": "US00000000" }
+      { "name": "Andrea", "slackUserId": "U11111111", "quoUserId": "US11111111", "timezone": "America/Chicago", "windows": [{ "days": [1, 2, 3, 4, 5], "startMin": 480, "endMin": 1020 }] },
+      { "name": "Jackie", "slackUserId": "U00000000", "quoUserId": "US00000000", "timezone": "America/Chicago", "afterHours": true, "windows": [] }
     ]
   }
 }
