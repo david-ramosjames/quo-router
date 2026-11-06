@@ -100,21 +100,23 @@ export function normalizePhoneStaff(config) {
       });
       continue;
     }
-    out.push({
-      name,
-      slackUserId,
-      quoUserId,
-      afterHours: !!schedule.afterHours,
-      windows: schedule.windows,
-      timezone: entry.timezone || tzDefault || (schedule.windows.length || schedule.afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
-    });
+      out.push({
+        name,
+        slackUserId,
+        quoUserId,
+        afterHours: !!schedule.afterHours,
+        windows: schedule.windows,
+        ringAfterSeconds: Math.max(0, Number(entry.ringAfterSeconds) || Number(schedule.ringAfterSeconds) || 0),
+        timezone: entry.timezone || tzDefault || (schedule.windows.length || schedule.afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
+      });
   }
   return out;
 }
 
 function normalizeSchedule(entry) {
+  const ringAfterSeconds = Math.max(0, Number(entry.ringAfterSeconds) || 0);
   if (entry.scheduleError) return { error: entry.scheduleError };
-  if (Array.isArray(entry.windows) || entry.afterHours) {
+  if (Array.isArray(entry.windows) || entry.afterHours || ringAfterSeconds > 0) {
     const windows = [];
     for (const w of entry.windows || []) {
       const days = [...new Set((w.days || []).map((d) => Number(d)).filter((d) => d >= 0 && d <= 6))].sort((a, b) => a - b);
@@ -125,10 +127,10 @@ function normalizeSchedule(entry) {
       }
       windows.push({ days, startMin, endMin });
     }
-    return { afterHours: !!entry.afterHours, windows };
+    return { afterHours: !!entry.afterHours, windows, ringAfterSeconds };
   }
   if (typeof entry.schedule === "string") return parseStaffSchedule(entry.schedule);
-  return { afterHours: false, windows: [] };
+  return { afterHours: false, windows: [], ringAfterSeconds: 0 };
 }
 
 export function parsePhoneStaffText(text) {
@@ -177,6 +179,7 @@ export function parsePhoneStaffText(text) {
       timezone,
       afterHours: schedule.afterHours,
       windows: schedule.windows,
+      ringAfterSeconds: schedule.ringAfterSeconds || 0,
       scheduleError: schedule.error || null,
     });
   }
@@ -196,16 +199,21 @@ export function formatPhoneStaffText(staff) {
   return lines.join("\n");
 }
 
+const RING_DELAY_PATTERN = /\brings?\s+after\s+(\d+)\s*(?:s|sec|secs|seconds)?\b/i;
+
 export function parseStaffSchedule(text) {
   const raw = String(text || "").trim();
-  if (!raw) return { afterHours: false, windows: [] };
+  if (!raw) return { afterHours: false, windows: [], ringAfterSeconds: 0 };
+  const delay = raw.match(RING_DELAY_PATTERN);
+  const ringAfterSeconds = delay ? Number(delay[1]) : 0;
   let afterHours = false;
   const rest = raw
+    .replace(new RegExp(RING_DELAY_PATTERN.source, "ig"), " ")
     .replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; })
     .replace(/\s+/g, " ")
     .trim()
     .replace(/^[|;\s]+|[|;\s]+$/g, "");
-  if (!rest) return { afterHours, windows: [] };
+  if (!rest) return { afterHours, windows: [], ringAfterSeconds };
   const windows = [];
   for (const chunk of rest.split(/\s*;\s*/).filter(Boolean)) {
     const m = chunk.match(/^([a-z][a-z,\-\s]*?)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|–|—|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)$/i);
@@ -218,7 +226,7 @@ export function parseStaffSchedule(text) {
     }
     windows.push({ days, startMin, endMin });
   }
-  return { afterHours, windows };
+  return { afterHours, windows, ringAfterSeconds };
 }
 
 function parseDays(spec) {
@@ -261,6 +269,7 @@ function parseClock(raw) {
 export function formatStaffSchedule(person) {
   const parts = (person?.windows || []).map((w) => `${formatDays(w.days)} ${formatClock(w.startMin)}-${formatClock(w.endMin)}`);
   if (person?.afterHours) parts.push("after-hours");
+  if (person?.ringAfterSeconds > 0) parts.push(`rings after ${person.ringAfterSeconds}s`);
   return parts.join("; ");
 }
 
@@ -353,6 +362,7 @@ export function classifyPhoneStaffMember(person, {
     presence,
     statusText: String(statusText || "").trim(),
     afterHoursDuty: false,
+    ringAfterSeconds: Math.max(0, Number(person.ringAfterSeconds) || 0),
     tag: false,
   };
   const onCallStatus = base.statusText.toLowerCase() === ON_CALL_STATUS_TEXT.toLowerCase()
@@ -443,58 +453,86 @@ async function getSlackProfile(firm, slackUserId) {
   }
 }
 
-export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
-  if (!firm.slackUserToken) {
-    console.log(`[${firm.id}][phone-staff] No SLACK_USER_TOKEN — skipping on-call status for ${slackUserId}`);
-    return false;
+function blankStatus() {
+  return { status_text: "", status_emoji: "", status_expiration: 0 };
+}
+
+function otherOnCallEntry(firm, slackUserId, exceptCallId) {
+  for (const [id, entry] of firm.onCallByCallId || []) {
+    if (id !== exceptCallId && entry?.slackUserId === slackUserId) return entry;
   }
-  if (!slackUserId) return false;
+  return null;
+}
 
-  // Already tracking this user on this call — don't overwrite again.
-  const existing = firm.onCallByCallId?.get(callId);
-  if (existing?.slackUserId === slackUserId) return true;
+export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
+  if (!slackUserId || !callId) return false;
 
-  const profile = await getSlackProfile(firm, slackUserId);
-  const previous = profile
-    ? {
-        status_text: profile.status_text || "",
-        status_emoji: profile.status_emoji || "",
-        status_expiration: profile.status_expiration || 0,
-      }
-    : { status_text: "", status_emoji: "", status_expiration: 0 };
+  // Quo is the source of "on a call" for tagging. Mirroring that onto the
+  // Slack profile is optional and needs an admin user token.
+  let entry = firm.onCallByCallId?.get(callId);
+  if (!(entry?.slackUserId === slackUserId)) {
+    const carried = otherOnCallEntry(firm, slackUserId, callId);
+    const profile = (!carried && firm.slackUserToken && !firm.slackStatusWriteBlocked)
+      ? await getSlackProfile(firm, slackUserId)
+      : null;
+    const previous = carried?.previous || (profile
+      ? {
+          status_text: profile.status_text || "",
+          status_emoji: profile.status_emoji || "",
+          status_expiration: profile.status_expiration || 0,
+        }
+      : blankStatus());
+    if (!firm.onCallByCallId) firm.onCallByCallId = new Map();
+    entry = {
+      slackUserId,
+      previous,
+      setAt: Date.now(),
+      slackWritten: false,
+      slackWriteAttempted: !!carried,
+    };
+    firm.onCallByCallId.set(callId, entry);
+    const person = findPhoneStaffBySlackUser(firm, slackUserId);
+    console.log(`[${firm.id}][phone-staff] On a call (from Quo): ${person?.name || slackUserId} (call ${callId})`);
+  }
 
-  // Don't clobber if they're already showing our on-call status from another call.
+  if (entry.slackWritten || entry.slackWriteAttempted || firm.slackStatusWriteBlocked || !firm.slackUserToken) {
+    return true;
+  }
+
   const alreadyOurs =
-    previous.status_text === ON_CALL_STATUS_TEXT &&
-    previous.status_emoji === ON_CALL_STATUS_EMOJI;
+    entry.previous.status_text === ON_CALL_STATUS_TEXT &&
+    entry.previous.status_emoji === ON_CALL_STATUS_EMOJI;
+  entry.slackWriteAttempted = true;
+  if (alreadyOurs) return true;
 
   try {
-    if (!alreadyOurs) {
-      const json = await slackApi(firm.slackUserToken, "users.profile.set", {
-        user: slackUserId,
-        profile: {
-          status_text: ON_CALL_STATUS_TEXT,
-          status_emoji: ON_CALL_STATUS_EMOJI,
-          status_expiration: 0,
-        },
-      });
-      if (!json.ok) {
-        console.error(`[${firm.id}][phone-staff] users.profile.set failed for ${slackUserId}: ${json.error}`);
-        return false;
-      }
-    }
-    if (!firm.onCallByCallId) firm.onCallByCallId = new Map();
-    firm.onCallByCallId.set(callId, {
-      slackUserId,
-      previous: alreadyOurs ? (firm.onCallByCallId.get(callId)?.previous || previous) : previous,
-      setAt: Date.now(),
+    const json = await slackApi(firm.slackUserToken, "users.profile.set", {
+      user: slackUserId,
+      profile: {
+        status_text: ON_CALL_STATUS_TEXT,
+        status_emoji: ON_CALL_STATUS_EMOJI,
+        status_expiration: 0,
+      },
     });
+    if (!json.ok) {
+      if (json.error === "not_admin" && !firm.slackStatusWriteBlocked) {
+        firm.slackStatusWriteBlocked = true;
+        console.warn(
+          `[${firm.id}][phone-staff] Slack user token cannot set other people's status (not_admin). ` +
+            `On-call tagging will use Quo; Slack profiles will not change.`,
+        );
+      } else if (json.error !== "not_admin") {
+        console.error(`[${firm.id}][phone-staff] users.profile.set failed for ${slackUserId}: ${json.error}`);
+      }
+      return true;
+    }
+    entry.slackWritten = true;
     const person = findPhoneStaffBySlackUser(firm, slackUserId);
     console.log(`[${firm.id}][phone-staff] Set on-call status for ${person?.name || slackUserId} (call ${callId})`);
     return true;
   } catch (err) {
     console.error(`[${firm.id}][phone-staff] set status error:`, err.message);
-    return false;
+    return true;
   }
 }
 
@@ -506,12 +544,20 @@ export async function clearSlackOnCallStatus(firm, callId) {
   // Another live call still owns this user's status — leave it alone.
   for (const other of firm.onCallByCallId.values()) {
     if (other.slackUserId === entry.slackUserId) {
+      if (entry.slackWritten && !other.slackWritten) {
+        other.previous = entry.previous;
+        other.slackWritten = true;
+      }
       console.log(`[${firm.id}][phone-staff] ${entry.slackUserId} still on another call — keeping status`);
       return false;
     }
   }
 
-  if (!firm.slackUserToken) return false;
+  if (!entry.slackWritten || !firm.slackUserToken) {
+    const person = findPhoneStaffBySlackUser(firm, entry.slackUserId);
+    console.log(`[${firm.id}][phone-staff] Call ended for ${person?.name || entry.slackUserId} (call ${callId})`);
+    return true;
+  }
   const prev = entry.previous || { status_text: "", status_emoji: "", status_expiration: 0 };
   try {
     const json = await slackApi(firm.slackUserToken, "users.profile.set", {
@@ -649,36 +695,53 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
   return rows;
 }
 
-export function formatAvailabilitySlackBlock(snapshot, { header = "Phone staff at time of call" } = {}) {
-  if (!snapshot?.length) return "";
-  const lines = snapshot.map((row) => {
-    const mention = `<@${row.slackUserId}>`;
-    if (row.state === "available") return `✅ ${mention} (active)`;
-    if (row.state === "inactive") return `💤 ${mention} (inactive during shift, no status)`;
-    if (row.state === "on_call") return `📞 ${mention} (on a call)`;
-    if (row.state === "status") return `🚫 ${mention} (status: ${row.statusText || "unavailable"})`;
-    if (row.state === "off_shift") {
-      const why = row.statusText === "no hours set" ? "no hours set"
-        : row.statusText === "after hours only" ? "after hours only"
-        : "outside scheduled hours";
-      return `⏸️ ${mention} (${why})`;
+const FAST_HANGUP_SECONDS = 5;
+
+function mentions(rows) {
+  return rows.map((r) => `<@${r.slackUserId}>`).join(" ");
+}
+
+function plainStatus(row) {
+  if (row.state === "on_call") return "on a call";
+  if (row.state === "inactive" || row.state === "away") return "inactive";
+  return row.statusText || "unavailable";
+}
+
+/**
+ * Split a snapshot by how long the caller waited.
+ * ringSeconds null means the ring time is unknown, so everyone on duty counts.
+ * Under 5s nobody "should have answered". People with ringAfterSeconds only
+ * count as available once the call rang at least that long.
+ */
+export function noticeGroups(snapshot, ringSeconds = null) {
+  const fast = ringSeconds != null && ringSeconds < FAST_HANGUP_SECONDS;
+  const visible = (snapshot || []).filter((r) => r.state !== "off_shift" && r.state !== "unknown");
+  const free = visible.filter((r) => r.state === "available" || r.state === "after_hours");
+  const context = visible.filter((r) => r.state !== "available" && r.state !== "after_hours");
+  const rang = (r) => ringSeconds == null || ringSeconds >= (Number(r.ringAfterSeconds) || 0);
+  const couldAnswer = free.filter(rang);
+  const callbackOnly = free.filter((r) => !rang(r));
+  const accountable = fast ? [] : couldAnswer;
+  return { fast, couldAnswer, callbackOnly, context, accountable };
+}
+
+export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = {}) {
+  const { fast, couldAnswer, callbackOnly, context } = noticeGroups(snapshot, ringSeconds);
+  const lines = [];
+  if (fast) {
+    const who = [...couldAnswer, ...callbackOnly];
+    if (who.length) lines.push(`*Caller hung up, please call back:* ${mentions(who)}`);
+  } else {
+    if (couldAnswer.length) {
+      lines.push(`*Available to answer (active, not on a call):* ${mentions(couldAnswer)}`);
     }
-    if (row.state === "after_hours") {
-      const extra = row.presence === "away" ? ", inactive" : row.presence === "active" ? ", active" : "";
-      return `🌙 ${mention} (after hours${extra})`;
-    }
-    if (row.state === "away") return `💤 ${mention} (away)`;
-    return `❓ ${mention} (presence unknown)`;
-  });
-  const tagged = snapshot.filter((r) => r.tag);
-  let footer = "";
-  if (tagged.length) {
-    const tags = tagged.map((r) => `<@${r.slackUserId}>`).join(" ");
-    footer = tagged.every((r) => r.afterHoursDuty)
-      ? `\n🌙 After hours: ${tags}`
-      : `\n⚠️ Should have answered: ${tags}`;
+    if (callbackOnly.length) lines.push(`*Please call back:* ${mentions(callbackOnly)}`);
   }
-  return `\n\n📊 *${header}:*\n${lines.join("\n")}${footer}`;
+  for (const row of context) {
+    lines.push(`${row.name || row.slackUserId} (${plainStatus(row)})`);
+  }
+  if (!lines.length) return "";
+  return `\n\n${lines.join("\n")}`;
 }
 
 export function availableFromSnapshot(snapshot) {
@@ -696,7 +759,9 @@ export async function recordAvailabilityEvent(pgPool, firm, {
   occurredAt = new Date(),
 } = {}) {
   if (!pgPool || !firm || !snapshot?.length) return null;
-  const available = snapshot.filter((r) => r.tag || r.state === "available").map((r) => r.slackUserId);
+  const available = snapshot
+    .filter((r) => (r.accountable != null ? r.accountable : (r.tag || r.state === "available")))
+    .map((r) => r.slackUserId);
   const onCall = snapshot.filter((r) => r.state === "on_call").map((r) => r.slackUserId);
   const away = snapshot.filter((r) => r.state === "away").map((r) => r.slackUserId);
   try {
@@ -922,10 +987,14 @@ export async function ensureAvailabilityTable(pgPool) {
 export async function attachAvailabilityToNotice(pgPool, firm, text, {
   callId,
   eventType,
+  ringSeconds = null,
 } = {}) {
   if (!firm.phoneStaff?.length) return { text, snapshot: [] };
-  const snapshot = await snapshotPhoneStaffAvailability(firm);
-  const block = formatAvailabilitySlackBlock(snapshot);
+  const raw = await snapshotPhoneStaffAvailability(firm);
+  const { accountable } = noticeGroups(raw, ringSeconds);
+  const accountableIds = new Set(accountable.map((r) => r.slackUserId));
+  const snapshot = raw.map((r) => ({ ...r, accountable: accountableIds.has(r.slackUserId) }));
+  const block = formatAvailabilitySlackBlock(snapshot, { ringSeconds });
   await recordAvailabilityEvent(pgPool, firm, { callId, eventType, snapshot });
   return { text: text + block, snapshot };
 }

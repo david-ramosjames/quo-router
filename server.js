@@ -3772,15 +3772,11 @@ function markCallResolved(firm, callId) {
   setTimeout(() => firm.resolvedCalls.delete(callId), CACHE_TTL);
 }
 
-/** Poll Quo after ringing so we can set Slack "On a call" as soon as someone answers. */
+/** Poll Quo after ringing so we know who is on a call before the call ends. */
 function watchCallForPhoneStaffStatus(firm, callId) {
   if (!callId) return;
   if (!firm.phoneStaff?.length) {
     console.log(`[${firm.id}][phone-staff] Skip answer watch for ${callId} — phoneStaff list empty`);
-    return;
-  }
-  if (!firm.slackUserToken) {
-    console.log(`[${firm.id}][phone-staff] Skip answer watch for ${callId} — no SLACK_USER_TOKEN (xoxp-)`);
     return;
   }
   startAnswerWatch(firm, {
@@ -3799,10 +3795,31 @@ function watchCallForPhoneStaffStatus(firm, callId) {
   });
 }
 
+/** How long the caller waited before someone answered or the call ended. */
+function ringSecondsFromCall(obj, { allowTotalDuration = false } = {}) {
+  if (!obj || typeof obj !== "object") return null;
+  const start = Date.parse(obj.createdAt || obj.initiatedAt || "");
+  const answered = Date.parse(obj.answeredAt || "");
+  const end = Date.parse(obj.completedAt || obj.endedAt || "");
+  if (Number.isFinite(start) && Number.isFinite(answered) && answered >= start) {
+    return Math.round((answered - start) / 1000);
+  }
+  const unanswered = !Number.isFinite(answered);
+  if (unanswered && Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+    return Math.round((end - start) / 1000);
+  }
+  if (unanswered && allowTotalDuration) {
+    const raw = obj.duration ?? obj.billableSeconds;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return Math.round(n);
+  }
+  return null;
+}
+
 /** Snapshot phone-staff availability, append to Slack text, and persist for reports. */
-async function withPhoneStaffAvailability(firm, text, { callId, eventType } = {}) {
+async function withPhoneStaffAvailability(firm, text, { callId, eventType, ringSeconds = null } = {}) {
   try {
-    const result = await attachAvailabilityToNotice(pgPool, firm, text, { callId, eventType });
+    const result = await attachAvailabilityToNotice(pgPool, firm, text, { callId, eventType, ringSeconds });
     return result.text;
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
@@ -3877,6 +3894,7 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     text = await withPhoneStaffAvailability(firm, text, {
       callId,
       eventType: isMenuHangup ? "menu_hangup" : "missed",
+      ringSeconds: ringSecondsFromCall(call, { allowTotalDuration: true }),
     });
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
@@ -3908,7 +3926,11 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     let text;
     if (isSona) {
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
-      text = await withPhoneStaffAvailability(firm, text, { callId, eventType: "sona" });
+      text = await withPhoneStaffAvailability(firm, text, {
+        callId,
+        eventType: "sona",
+        ringSeconds: ringSecondsFromCall(call),
+      });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
     } else {
       const handlerLine = handlerName ? `\nHandled By: *${handlerName}*` : "";
@@ -4533,8 +4555,18 @@ async function handleCalls(firm, req, res) {
 
     const forwardedTo = obj.forwardedTo || null;
 
+    const priorCall = callId ? getCachedCall(firm, callId) : null;
+    const isRingingEvent = eventType === "call.ringing" || status === "ringing";
     if (callId) {
-      cacheCall(firm, callId, { from: obj.from, to: obj.to, direction, answeredBy: obj.answeredBy, userId: obj.userId });
+      cacheCall(firm, callId, {
+        from: obj.from,
+        to: obj.to,
+        direction,
+        answeredBy: obj.answeredBy,
+        userId: obj.userId,
+        createdAt: obj.createdAt || priorCall?.createdAt || null,
+        ringingAt: priorCall?.ringingAt || (isRingingEvent ? Date.now() : null),
+      });
       console.log(`[${firm.id}][calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"}, forwardedTo: ${forwardedTo || "none"})`);
     }
 
@@ -4640,9 +4672,14 @@ async function handleCalls(firm, req, res) {
       text += `\nVoicemail: ${vmUrl}`;
     }
 
+    let ringSeconds = ringSecondsFromCall(obj, { allowTotalDuration: true });
+    if (ringSeconds == null && priorCall?.ringingAt) {
+      ringSeconds = Math.max(0, Math.round((Date.now() - priorCall.ringingAt) / 1000));
+    }
     text = await withPhoneStaffAvailability(firm, text, {
       callId,
       eventType: isMenuHangup ? "menu_hangup" : "missed",
+      ringSeconds,
     });
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
@@ -4984,7 +5021,11 @@ async function handleCallSummary(firm, req, res) {
       const leadLink = slackMessagePermalink ? `\n<${slackMessagePermalink}|View in #lead-calls>` : "";
       console.log(`[${firm.id}][call-summary] Sona post — isLead=${isLead}, leadPermalink=${slackMessagePermalink || "null"}`);
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\nSummary:\n${summary}${translation}\nLead: ${leadLabel}${leadLink}${linkLine}`;
-      text = await withPhoneStaffAvailability(firm, text, { callId, eventType: "sona" });
+      text = await withPhoneStaffAvailability(firm, text, {
+        callId,
+        eventType: "sona",
+        ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
+      });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
       console.log(`[${firm.id}][call-summary] Sent to sona-calls`);
     } else {

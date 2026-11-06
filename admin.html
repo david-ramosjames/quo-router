@@ -245,15 +245,14 @@
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
       <label for="firm-phone-staff">Phone Staff (answer-responsible)</label>
-      <textarea id="firm-phone-staff" name="phoneStaffText" rows="6" placeholder="timezone=America/Chicago
-Andrea=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00
+      <textarea id="firm-phone-staff" name="phoneStaffText" rows="8" placeholder="timezone=America/Chicago
+Stephany=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00
+Valeria=U0CCCCCC=USDDDDDD | Mon-Fri 08:00-17:00 rings after 10s
 Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <div class="hint">
-        Only people whose main job is answering the phone. One per line:
-        <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
-        Quo user ID is required to auto-set Slack status to “On a call”.
-        Put hours on each person. They are tagged for a missed or Sona call only during those hours, and only if they were not already on a call and had no Slack status like lunch, break, or a meeting. Active people are tagged, and so is anyone inactive with no status during their shift.
-        Mark the after-hours person with <code>after-hours</code> (Jackie). That person is tagged only when nobody’s shift covers the call. Optional first line: <code>timezone=America/Chicago</code>.
+        One per line: <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
+        Add <code>rings after 10s</code> for people the phone does not ring until the caller has waited 10 seconds. A missed call under 5 seconds says “Caller hung up, please call back” and does not say anyone should have answered. From 5 to 10 seconds, only the immediate group is “Available to answer (active, not on a call)”; the delayed group is “Please call back.”
+        Someone on a break or on a call is shown by name and status, with no @. The after-hours person is left off during the day and mentioned only when nobody’s shift covers the call.
       </div>
 
       <h3 style="margin-top:24px">Credentials</h3>
