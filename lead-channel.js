@@ -18,10 +18,14 @@ export async function phoneSignedRecently(client, phoneE164) {
     [phoneE164],
   );
   if (signedLead.rows[0]) return true;
+  // Thank-you SMS alone is not enough if it just went out — that is the same
+  // intake session (contract signed on this call). Only treat older thank-yous
+  // as proof the phone already signed so we should not open another New lead.
   const signedText = await client.query(
     `select id from public.intake_interactions
      where phone_e164 = $1
        and occurred_at >= now() - interval '30 days'
+       and occurred_at < now() - interval '6 hours'
        and (
          content ilike '%received your signed documents%'
          or content ilike '%recibió sus documentos firmados%'
