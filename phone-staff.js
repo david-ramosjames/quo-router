@@ -59,11 +59,16 @@ const BLOCKING_STATUS = [
   /\bpersonal\b/i,
   /\berrand\b/i,
   /\bstepp(?:ing|ed) away\b/i,
+  /\btranslat(?:e|ing|ion)\b/i,
+  /\bhuddle\b/i,
+  /\bin a huddle\b/i,
 ];
 
 const BLOCKING_EMOJI = new Set([
   "palm_tree", "airplane", "zzz", "hamburger", "bento", "fork_and_knife",
   "beach_with_umbrella", "face_with_thermometer", "no_entry", "no_entry_sign", "sleeping",
+  // Slack huddle / translating often use a speech bubble status emoji.
+  "speech_balloon", "speaking_head", "speaking_head_in_silhouette",
 ]);
 
 export function normalizePhoneStaff(config) {
@@ -732,12 +737,31 @@ async function getSlackStatus(firm, slackUserId) {
  *   Inbound @Andrea | Outbound @Roman | Attorney @Michael | LAs @Liz @Stephany …
  * Mentions may be <@U…> ids or @Names (including multi-word).
  */
+/** Split on | but ignore pipes inside Slack mentions (<@U123|Name>). */
+function splitTopicSections(topic) {
+  const parts = [];
+  let buf = "";
+  let inMention = false;
+  for (const ch of String(topic || "")) {
+    if (ch === "<") inMention = true;
+    else if (ch === ">") inMention = false;
+    if (ch === "|" && !inMention) {
+      parts.push(buf);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf) parts.push(buf);
+  return parts;
+}
+
 export function parsePhoneDutyTopic(topic) {
   const empty = { inbound: [], outbound: [], attorney: [], las: [], raw: String(topic || "") };
   if (!topic || !String(topic).trim()) return empty;
 
   const sections = {};
-  for (const part of String(topic).split("|")) {
+  for (const part of splitTopicSections(topic)) {
     const m = part.trim().match(/^(inbound|outbound|attorney|las)\s*:?\s*(.*)$/i);
     if (!m) continue;
     const key = m[1].toLowerCase() === "las" ? "las" : m[1].toLowerCase();
@@ -755,13 +779,14 @@ export function parsePhoneDutyTopic(topic) {
 function extractTopicMentions(segment) {
   const out = [];
   const text = String(segment || "");
-  const idRe = /<@(U[A-Z0-9]+)>/gi;
+  // Slack topics usually store <@U123> or <@U123|Display Name>.
+  const idRe = /<@(U[A-Z0-9]+)(?:\|[^>]*)?>/gi;
   let m;
   while ((m = idRe.exec(text)) !== null) out.push(m[1].toUpperCase());
 
   // Plain @Name tokens (Slack display form). Strip <@U…> first so ids aren't
   // re-parsed as names, then grab each @… until the next @ or end.
-  const withoutIds = text.replace(/<@U[A-Z0-9]+>/gi, " ");
+  const withoutIds = text.replace(/<@U[A-Z0-9]+(?:\|[^>]*)?>/gi, " ");
   const nameRe = /@([^@|]+)/g;
   while ((m = nameRe.exec(withoutIds)) !== null) {
     const name = m[1].replace(/\s+/g, " ").trim();
@@ -770,22 +795,34 @@ function extractTopicMentions(segment) {
   return out;
 }
 
+function normalizePersonNameKey(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
 /**
- * Resolve topic mention tokens to Slack user IDs via firm.slackUsers.
- * Returns { inbound, outbound, attorney, las, answerIds } where answerIds is
- * the set that should take inbound missed/Sona calls (Inbound ∪ LAs).
+ * Resolve topic mention tokens to Slack user IDs via firm.slackUsers and
+ * configured phoneStaff names. Returns { inbound, outbound, attorney, las,
+ * answerIds } where answerIds is Inbound ∪ LAs (who should take inbound misses).
  */
-export function resolvePhoneDutyRoster(parsed, slackUsers) {
+export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const map = slackUsers instanceof Map ? slackUsers : new Map(Object.entries(slackUsers || {}));
+  const staff = Array.isArray(phoneStaff) ? phoneStaff : [];
   const resolveOne = (token) => {
     const raw = String(token || "").trim();
     if (!raw) return null;
     if (/^U[A-Z0-9]+$/i.test(raw)) return raw.toUpperCase();
-    const key = raw.toLowerCase();
-    if (map.has(key)) return map.get(key);
+    const key = normalizePersonNameKey(raw);
     const first = key.split(/\s+/)[0];
-    if (first && map.has(first)) return map.get(first);
-    return null;
+    const fromMap = map.get(key) || (first ? map.get(first) : null) || map.get(raw.toLowerCase());
+    if (fromMap) return String(fromMap).toUpperCase();
+    const hit = staff.find((p) => {
+      const n = normalizePersonNameKey(p.name);
+      return n === key || (first && n.split(/\s+/)[0] === first);
+    });
+    return hit?.slackUserId ? String(hit.slackUserId).toUpperCase() : null;
   };
   const resolveList = (list) => [...new Set((list || []).map(resolveOne).filter(Boolean))];
   const inbound = resolveList(parsed?.inbound);
@@ -803,8 +840,7 @@ export function resolvePhoneDutyRoster(parsed, slackUsers) {
   };
 }
 
-export async function fetchPhoneDutyTopic(firm) {
-  const channelId = firm.slackLegalAssistantChannelId || firm.slackLeadCallsChannelId;
+async function fetchChannelTopicValue(firm, channelId) {
   if (!firm.slackBotToken || !channelId) return null;
   try {
     const url = new URL("https://slack.com/api/conversations.info");
@@ -814,7 +850,7 @@ export async function fetchPhoneDutyTopic(firm) {
     });
     const json = await res.json();
     if (!json.ok) {
-      console.warn(`[${firm.id}][phone-staff] duty topic fetch failed: ${json.error}`);
+      console.warn(`[${firm.id}][phone-staff] duty topic fetch failed (${channelId}): ${json.error}`);
       return null;
     }
     return json.channel?.topic?.value || "";
@@ -822,6 +858,23 @@ export async function fetchPhoneDutyTopic(firm) {
     console.warn(`[${firm.id}][phone-staff] duty topic fetch error:`, err.message);
     return null;
   }
+}
+
+/** Prefer a topic that has Inbound/LAs sections; check LA channel then lead-calls. */
+export async function fetchPhoneDutyTopic(firm) {
+  const channelIds = [
+    firm.slackLegalAssistantChannelId,
+    firm.slackLeadCallsChannelId,
+  ].filter(Boolean);
+  let fallback = null;
+  for (const channelId of channelIds) {
+    const topic = await fetchChannelTopicValue(firm, channelId);
+    if (topic == null) continue;
+    const parsed = parsePhoneDutyTopic(topic);
+    if (parsed.inbound.length || parsed.las.length) return topic;
+    if (fallback == null && topic) fallback = topic;
+  }
+  return fallback;
 }
 
 /**
@@ -894,15 +947,18 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
 
   const topic = await topicPromise;
   const parsed = parsePhoneDutyTopic(topic);
-  const roster = resolvePhoneDutyRoster(parsed, firm.slackUsers);
+  const roster = resolvePhoneDutyRoster(parsed, firm.slackUsers, staff);
   // Only enforce the daily topic while someone's scheduled shift covers now
   // (business-hours phone coverage). After-hours Jackie stays as-is.
   const enforce = officeCovered && roster.hasRoster;
   if (topic != null) {
     console.log(
       `[${firm.id}][phone-staff] duty topic roster inbound=${roster.inbound.length} ` +
-      `las=${roster.las.length} enforce=${enforce}`,
+      `las=${roster.las.length} answerIds=${roster.answerIds.size} enforce=${enforce}` +
+      (topic ? ` raw="${String(topic).slice(0, 120)}"` : ""),
     );
+  } else {
+    console.warn(`[${firm.id}][phone-staff] duty topic unavailable — not filtering by roster`);
   }
   const filtered = applyDutyTopicFilter(rows, roster, { enforce });
   const dutySlackUserIds = dutySlackUserIdsFromSnapshot(filtered, roster, { enforce });
@@ -911,16 +967,20 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
 
 const FAST_HANGUP_SECONDS = 5;
 
+function warningName(row, { mention = false } = {}) {
+  const base = mention ? `<@${row.slackUserId}>` : (row.name || row.slackUserId);
+  const who = row.state === "inactive" ? `${base} (inactive)` : base;
+  // :warning: (not a green check) — these people should have answered.
+  return `:warning: ${who}`;
+}
+
 function checkedNames(rows, { mention = false } = {}) {
-  return rows.map((r) => {
-    const who = mention ? `<@${r.slackUserId}>` : (r.name || r.slackUserId);
-    // :warning: (not a green check) — these people should have answered.
-    return `:warning: ${who}`;
-  }).join("\n");
+  return rows.map((r) => warningName(r, { mention })).join("\n");
 }
 
 function plainStatus(row) {
   if (row.state === "on_call") return "on a call";
+  if (row.state === "off_topic") return row.statusText || "not on today's topic";
   if (row.state === "inactive" || row.state === "away") return "inactive";
   return row.statusText || "unavailable";
 }
@@ -932,31 +992,44 @@ function plainStatus(row) {
  * count as available once the call rang at least that long.
  */
 export function isFreeToAnswer(row) {
-  // Slack-active (or after-hours coverage) — preferred for the Available list
-  // and first-round callback tags. Break / lunch / on-call stay in context.
+  // Slack-active (or after-hours coverage) — preferred for first-round tags.
+  // Break / lunch / huddle / translating / off-topic stay unavailable.
   return row.state === "available" || row.state === "after_hours";
 }
 
-/** Counts for Available Missed metrics (active + inactive on duty). */
+/**
+ * Counts for Available Missed metrics: on-topic active + on-topic inactive.
+ * Off-topic / status / on-call never count.
+ */
 export function countsTowardAvailableMissed(row) {
   return row.state === "available" || row.state === "after_hours" || row.state === "inactive";
 }
 
 export function noticeGroups(snapshot, ringSeconds = null) {
   const fast = ringSeconds != null && ringSeconds < FAST_HANGUP_SECONDS;
+  // Show off-topic as unavailable; hide only true off-shift / unknown.
   const visible = (snapshot || []).filter(
-    (r) => r.state !== "off_shift" && r.state !== "unknown" && r.state !== "off_topic",
+    (r) => r.state !== "off_shift" && r.state !== "unknown",
   );
   const free = visible.filter(isFreeToAnswer);
-  const context = visible.filter((r) => !isFreeToAnswer(r));
+  const inactiveDuty = visible.filter((r) => r.state === "inactive");
+  const context = visible.filter((r) => !isFreeToAnswer(r) && r.state !== "inactive");
   const rang = (r) => ringSeconds == null || ringSeconds >= (Number(r.ringAfterSeconds) || 0);
   const couldAnswer = free.filter(rang);
   const callbackOnly = free.filter((r) => !rang(r));
-  // Inactive on duty still counts as Available Missed even though they are not
-  // in the "Available to answer" list (they're noted as inactive instead).
-  const missEligible = visible.filter(countsTowardAvailableMissed).filter(rang);
-  const accountable = fast ? [] : missEligible;
-  return { fast, couldAnswer, callbackOnly, context, accountable };
+  const inactiveAccountable = inactiveDuty.filter(rang);
+  const inactiveCallback = inactiveDuty.filter((r) => !rang(r));
+  // On-topic inactive still counts as Available Missed (tagged last).
+  const accountable = fast ? [] : [...couldAnswer, ...inactiveAccountable];
+  return {
+    fast,
+    couldAnswer,
+    callbackOnly,
+    inactiveAccountable,
+    inactiveCallback,
+    context,
+    accountable,
+  };
 }
 
 function formatRingDuration(ringSeconds) {
@@ -966,24 +1039,33 @@ function formatRingDuration(ringSeconds) {
 }
 
 export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = {}) {
-  const { fast, couldAnswer, callbackOnly, context } = noticeGroups(snapshot, ringSeconds);
+  const {
+    fast,
+    couldAnswer,
+    callbackOnly,
+    inactiveAccountable,
+    inactiveCallback,
+    context,
+  } = noticeGroups(snapshot, ringSeconds);
   const lines = [];
   const ringLabel = formatRingDuration(ringSeconds);
   if (ringLabel) lines.push(`_Rang for ${ringLabel}_`);
-  // Status list uses names + checkmarks. Only the after-hours person is @-tagged.
-  const afterHoursOnly = [...couldAnswer, ...callbackOnly].length > 0
-    && [...couldAnswer, ...callbackOnly].every((r) => r.afterHoursDuty || r.state === "after_hours");
+  const warnActive = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
+  const afterHoursOnly = warnActive.length > 0
+    && warnActive.every((r) => r.afterHoursDuty || r.state === "after_hours");
   if (fast) {
-    const who = [...couldAnswer, ...callbackOnly];
+    const who = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
     if (who.length) {
       lines.push(`*Caller hung up, please call back:*\n${checkedNames(who, { mention: afterHoursOnly })}`);
     }
   } else {
-    if (couldAnswer.length) {
-      lines.push(`*Available to answer (active, not on a call):*\n${checkedNames(couldAnswer, { mention: afterHoursOnly })}`);
+    const availableLines = [...couldAnswer, ...inactiveAccountable];
+    if (availableLines.length) {
+      lines.push(`*Available to answer (active, not on a call):*\n${checkedNames(availableLines, { mention: afterHoursOnly })}`);
     }
-    if (callbackOnly.length) {
-      lines.push(`*Please call back:*\n${checkedNames(callbackOnly, { mention: false })}`);
+    const callbackLines = [...callbackOnly, ...inactiveCallback];
+    if (callbackLines.length) {
+      lines.push(`*Please call back:*\n${checkedNames(callbackLines, { mention: false })}`);
     }
   }
   for (const row of context) {

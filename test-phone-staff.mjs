@@ -83,6 +83,15 @@ assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "away" }).
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", onCall: true }).tag, false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).state, "status");
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).tag, false);
+assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Translating" }).state, "status");
+assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Translating" }).tag, false);
+assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "In a huddle" }).state, "status");
+assert.equal(classifyPhoneStaffMember(andrea, {
+  ...dayOpts,
+  presence: "active",
+  statusText: "",
+  statusEmoji: ":speech_balloon:",
+}).state, "status");
 assert.equal(classifyPhoneStaffMember(jackie, { ...dayOpts, presence: "active" }).tag, false);
 assert.equal(classifyPhoneStaffMember(jackie, { ...dayOpts, presence: "active" }).statusText, "after hours only");
 
@@ -134,8 +143,7 @@ assert.match(hangup, /:warning: Stephany/);
 assert.match(hangup, /:warning: Valeria/);
 assert.doesNotMatch(hangup, /<@/);
 
-// Inactive during shift → noted as inactive (not in Available list), but still
-// counts toward Available Missed metrics; escalation asks them last.
+// On-topic inactive → :warning: (counts for metrics; tagged last). Off-topic → :no_entry_sign:.
 const roman = { name: "Roman", slackUserId: "UROM555", state: "inactive", ringAfterSeconds: 10, tag: false };
 const inactiveBlock = formatAvailabilitySlackBlock(
   [immediate, roman, onBreak],
@@ -143,9 +151,9 @@ const inactiveBlock = formatAvailabilitySlackBlock(
 );
 assert.match(inactiveBlock, /Available to answer \(active, not on a call\):/);
 assert.match(inactiveBlock, /:warning: Stephany/);
-assert.doesNotMatch(inactiveBlock, /Please call back:/);
-assert.doesNotMatch(inactiveBlock, /:warning: Roman/);
-assert.match(inactiveBlock, /:no_entry_sign: Roman \(inactive\)/);
+// Rang 9s < Roman's 10s delay → Please call back with warning (still counts later).
+assert.match(inactiveBlock, /Please call back:/);
+assert.match(inactiveBlock, /:warning: Roman \(inactive\)/);
 assert.match(inactiveBlock, /:no_entry_sign: Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(inactiveBlock, /<@/);
 
@@ -153,8 +161,8 @@ const inactiveLong = formatAvailabilitySlackBlock(
   [immediate, roman],
   { ringSeconds: 20 },
 );
-assert.doesNotMatch(inactiveLong, /:warning: Roman/);
-assert.match(inactiveLong, /:no_entry_sign: Roman \(inactive\)/);
+assert.match(inactiveLong, /:warning: Roman \(inactive\)/);
+assert.doesNotMatch(inactiveLong, /:no_entry_sign: Roman/);
 assert.doesNotMatch(inactiveLong, /Please call back/);
 const inactiveMiss = noticeGroups([immediate, roman], 20);
 assert.ok(inactiveMiss.accountable.some((r) => r.slackUserId === "UROM555"));
@@ -195,6 +203,18 @@ const idTopic = parsePhoneDutyTopic(
 assert.deepEqual(idTopic.inbound, ["UAND111"]);
 assert.deepEqual(idTopic.las, ["ULIZ444", "USTE555"]);
 
+// Slack topics often include the display-name alias after the user id.
+const aliasTopic = parsePhoneDutyTopic(
+  "Inbound <@UAND111|Andrea Alvarado> | Outbound <@UROM222|Roman> | LAs <@ULIZ444|Liz Abad-Cruz> <@USTE555|Stephany Guerra>",
+);
+assert.deepEqual(aliasTopic.inbound, ["UAND111"]);
+assert.deepEqual(aliasTopic.outbound, ["UROM222"]);
+assert.deepEqual(aliasTopic.las, ["ULIZ444", "USTE555"]);
+const aliasRoster = resolvePhoneDutyRoster(aliasTopic, new Map());
+assert.ok(aliasRoster.answerIds.has("UAND111"));
+assert.ok(aliasRoster.answerIds.has("ULIZ444"));
+assert.equal(aliasRoster.answerIds.has("UROM222"), false);
+
 const users = new Map([
   ["andrea alvarado", "UAND111"],
   ["andrea", "UAND111"],
@@ -223,7 +243,9 @@ assert.equal(filtered.find((r) => r.slackUserId === "ULIZ444").tag, true);
 
 const topicBlock = formatAvailabilitySlackBlock(filtered, { ringSeconds: 20 });
 assert.match(topicBlock, /:warning: Liz/);
-assert.doesNotMatch(topicBlock, /Jissela/);
+assert.match(topicBlock, /:no_entry_sign: Jissela \(not on today's topic\)/);
+const offTopicMiss = noticeGroups(filtered, 20);
+assert.equal(offTopicMiss.accountable.some((r) => r.slackUserId === "UJIS888"), false);
 
 assert.deepEqual(
   dutySlackUserIdsFromSnapshot(filtered, dutyRoster, { enforce: true }).sort(),

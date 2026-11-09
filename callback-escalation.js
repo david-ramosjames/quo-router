@@ -112,15 +112,19 @@ function pickPreferActiveAcrossPools(pools, usedIds, count, rotation) {
 
 function freeFromSnapshot(snapshot) {
   // Active + inactive on duty both escalate; inactive is asked last within each role.
-  return (snapshot || []).filter((row) => countsTowardAvailableMissed(row) || row.tag);
+  // Off-topic / lunch / on-call never enter the tag ladder.
+  return (snapshot || []).filter(
+    (row) => row.state !== "off_topic" && (countsTowardAvailableMissed(row) || row.tag),
+  );
 }
 
 function staffByRole(firm, snapshot, role) {
-  const freeIds = new Set(freeFromSnapshot(snapshot).map((r) => r.slackUserId));
+  const free = freeFromSnapshot(snapshot);
+  const freeById = new Map(free.map((r) => [String(r.slackUserId || "").toUpperCase(), r]));
   return (firm.phoneStaff || [])
-    .filter((p) => p.role === role && freeIds.has(p.slackUserId))
+    .filter((p) => p.role === role && freeById.has(String(p.slackUserId || "").toUpperCase()))
     .map((p) => {
-      const snap = (snapshot || []).find((s) => s.slackUserId === p.slackUserId);
+      const snap = freeById.get(String(p.slackUserId || "").toUpperCase());
       return { ...p, state: snap?.state || "available" };
     });
 }

@@ -142,11 +142,11 @@ For each configured phone-staff member at the moment of a missed or Sona call:
 | State | Tagged? |
 |-------|---------|
 | ✅ Slack-active, on shift, on today's topic (Inbound/LAs), no blocking status, not on a call | Yes (tagged first) |
-| 💤 inactive/offline during their shift | Counts as Available Missed; noted as inactive; callback-tagged only after active options in that group |
+| 💤 inactive/offline during their shift, on today's topic | Counts as Available Missed; shown with :warning: (inactive); callback-tagged last |
 | 🌙 after-hours person, and nobody's shift covers this moment | Yes |
-| 📋 on phone staff but not on today's Inbound/LAs topic | No |
+| 📋 on phone staff but not on today's Inbound/LAs topic | No (shown :no_entry_sign:; not tagged; not counted) |
 | 📞 on a call | No |
-| 🚫 Slack status such as lunch, break, meeting, PTO, out of office | No |
+| 🚫 Slack status such as lunch, break, translating, huddle, meeting, PTO | No |
 | ⏸️ outside their scheduled hours | No |
 
 Prefer updating Slack status when unavailable, but inactive presence alone is enough to skip tagging. After hours are saved, working-hour staff are never tagged off shift.
