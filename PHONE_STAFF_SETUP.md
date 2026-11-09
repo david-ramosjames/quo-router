@@ -128,7 +128,10 @@ The Daily Call Report will then include **Available but did not answer** totals 
 2. Have a listed phone-staff member answer a test call → their Slack status should show **On a call** within a few seconds.
 3. End the call → status should clear / restore.
 4. Miss a test call during a listed person's scheduled hours. The staff list is added only on **#lead-calls** and **#legalassistant-phone**, with names and check marks (no @ except Jackie after hours). During business hours the router also posts **@person Please call back now** in that thread and escalates every 50s. Mark people `la primary`, `la secondary`, or `intake` in Phone Staff, and set Managers (Jon / Jaymie) under Callback escalation. #missed-calls and #sona-calls stay as the plain call notice.
-5. Check router logs for `[phone-staff]` lines.
+5. Set the **#legalassistant-phone** (or #lead-calls) channel topic each day to the duty roster, e.g.  
+   `Inbound @Andrea Alvarado | Outbound @Roman | Attorney @Michael Tucker | LAs @Liz Abad-Cruz @Stephany Guerra @Valeria @Claudia`  
+   Only **Inbound** and **LAs** are asked to answer inbound missed/Sona calls.
+6. Check router logs for `[phone-staff]` lines.
 
 ---
 
@@ -138,14 +141,15 @@ For each configured phone-staff member at the moment of a missed or Sona call:
 
 | State | Tagged? |
 |-------|---------|
-| ✅ active, on shift, no blocking status, not on a call | Yes |
-| 💤 inactive/offline during their shift, no status set | Yes |
+| ✅ Slack-active, on shift, on today's topic (Inbound/LAs), no blocking status, not on a call | Yes (tagged first) |
+| 💤 inactive/offline during their shift | Counts as Available Missed; noted as inactive; callback-tagged only after active options in that group |
 | 🌙 after-hours person, and nobody's shift covers this moment | Yes |
+| 📋 on phone staff but not on today's Inbound/LAs topic | No |
 | 📞 on a call | No |
 | 🚫 Slack status such as lunch, break, meeting, PTO, out of office | No |
 | ⏸️ outside their scheduled hours | No |
 
-Until at least one person has hours (or is marked after-hours), inactive people are not tagged — only Slack-active staff, same as the first version. After hours are saved, working-hour staff are never tagged off shift.
+Prefer updating Slack status when unavailable, but inactive presence alone is enough to skip tagging. After hours are saved, working-hour staff are never tagged off shift.
 
 ---
 
@@ -161,7 +165,7 @@ Example response fields:
 - `eventCount` — missed/Sona/menu-hangup events in range
 - `eventsWithAvailableStaff` — events where ≥1 phone staff was available
 - `availableButDidNotAnswerCount` — sum of available people across those events (a person available on 3 missed calls counts as 3)
-- `byUser` — per-person breakdown
+- `byUser` — per-person breakdown for that day's topic duty roster (Inbound ∪ LAs), including people with count 0
 
 ---
 

@@ -8,6 +8,12 @@ import {
   classifyPhoneStaffMember,
   isOfficeCovered,
   hoursAreConfigured,
+  parsePhoneDutyTopic,
+  resolvePhoneDutyRoster,
+  applyDutyTopicFilter,
+  dutySlackUserIdsFromSnapshot,
+  summarizeAvailabilityMisses,
+  noticeGroups,
 } from "./phone-staff.js";
 
 const staff = normalizePhoneStaff({
@@ -35,7 +41,7 @@ const snapshot = [
 ];
 const block = formatAvailabilitySlackBlock(snapshot);
 assert.match(block, /Available to answer \(active, not on a call\)/);
-assert.match(block, /✅ Jackie/);
+assert.match(block, /:warning: Jackie/);
 assert.doesNotMatch(block, /<@U123ABC>/);
 assert.doesNotMatch(block, /U456DEF/);
 assert.doesNotMatch(block, /U789GHI/);
@@ -73,7 +79,7 @@ const jackie = roster[1];
 const dayOpts = { now: duringShift, officeCovered: true, hoursConfigured: true };
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active" }).tag, true);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "away" }).state, "inactive");
-assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "away" }).tag, true);
+assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "away" }).tag, false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", onCall: true }).tag, false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).state, "status");
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).tag, false);
@@ -104,9 +110,9 @@ const rosterNow = [immediate, delayed, onBreak, jackieDay];
 
 const longRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 20 });
 assert.match(longRing, /Rang for 20s/);
-assert.match(longRing, /✅ Stephany/);
-assert.match(longRing, /✅ Valeria/);
-assert.match(longRing, /Andrea Alvarado \(Break\)/);
+assert.match(longRing, /:warning: Stephany/);
+assert.match(longRing, /:warning: Valeria/);
+assert.match(longRing, /:no_entry_sign: Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(longRing, /<@/);
 assert.doesNotMatch(longRing, /Jackie/);
 assert.doesNotMatch(longRing, /Please call back/);
@@ -114,40 +120,45 @@ assert.doesNotMatch(longRing, /Please call back/);
 const midRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 7 });
 const midLines = midRing.split("\n");
 const availableAt = midLines.findIndex((line) => line.includes("Available to answer"));
-assert.match(midLines[availableAt + 1], /✅ Stephany/);
+assert.match(midLines[availableAt + 1], /:warning: Stephany/);
 assert.doesNotMatch(midLines[availableAt + 1], /Valeria/);
 const callbackAt = midLines.findIndex((line) => line.includes("Please call back"));
-assert.match(midLines[callbackAt + 1], /✅ Valeria/);
-assert.match(midRing, /Andrea Alvarado \(Break\)/);
+assert.match(midLines[callbackAt + 1], /:warning: Valeria/);
+assert.match(midRing, /:no_entry_sign: Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(midRing, /<@/);
 
 const hangup = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 3 });
 assert.match(hangup, /Rang for 3s/);
 assert.match(hangup, /Caller hung up, please call back:/);
-assert.match(hangup, /✅ Stephany/);
-assert.match(hangup, /✅ Valeria/);
+assert.match(hangup, /:warning: Stephany/);
+assert.match(hangup, /:warning: Valeria/);
 assert.doesNotMatch(hangup, /<@/);
 
-// Inactive during shift, no Slack status → listed as available (name only, no @).
-const roman = { name: "Roman", slackUserId: "UROM555", state: "inactive", ringAfterSeconds: 10, tag: true };
+// Inactive during shift → noted as inactive (not in Available list), but still
+// counts toward Available Missed metrics; escalation asks them last.
+const roman = { name: "Roman", slackUserId: "UROM555", state: "inactive", ringAfterSeconds: 10, tag: false };
 const inactiveBlock = formatAvailabilitySlackBlock(
   [immediate, roman, onBreak],
   { ringSeconds: 9 },
 );
 assert.match(inactiveBlock, /Available to answer \(active, not on a call\):/);
-assert.match(inactiveBlock, /✅ Stephany/);
-assert.match(inactiveBlock, /Please call back:/);
-assert.match(inactiveBlock, /✅ Roman/);
-assert.match(inactiveBlock, /Andrea Alvarado \(Break\)/);
-assert.doesNotMatch(inactiveBlock, /Roman \(inactive\)/);
+assert.match(inactiveBlock, /:warning: Stephany/);
+assert.doesNotMatch(inactiveBlock, /Please call back:/);
+assert.doesNotMatch(inactiveBlock, /:warning: Roman/);
+assert.match(inactiveBlock, /:no_entry_sign: Roman \(inactive\)/);
+assert.match(inactiveBlock, /:no_entry_sign: Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(inactiveBlock, /<@/);
 
 const inactiveLong = formatAvailabilitySlackBlock(
   [immediate, roman],
   { ringSeconds: 20 },
 );
-assert.match(inactiveLong, /✅ Roman/);
+assert.doesNotMatch(inactiveLong, /:warning: Roman/);
+assert.match(inactiveLong, /:no_entry_sign: Roman \(inactive\)/);
 assert.doesNotMatch(inactiveLong, /Please call back/);
+const inactiveMiss = noticeGroups([immediate, roman], 20);
+assert.ok(inactiveMiss.accountable.some((r) => r.slackUserId === "UROM555"));
+assert.equal(inactiveMiss.couldAnswer.some((r) => r.slackUserId === "UROM555"), false);
 
 const roleParsed = parsePhoneStaffText(`timezone=America/Chicago
 Liz=ULIZ111=US111 | Mon-Fri 08:00-17:00 la primary
@@ -161,7 +172,7 @@ assert.equal(roleParsed[1].tier, "secondary");
 assert.equal(roleParsed[1].ringAfterSeconds, 10);
 assert.equal(roleParsed[2].role, "intake");
 assert.doesNotMatch(hangup, /Available to answer/);
-assert.match(hangup, /Andrea Alvarado \(Break\)/);
+assert.match(hangup, /:no_entry_sign: Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(hangup, /<@UBRK333>/);
 assert.doesNotMatch(hangup, /Jackie/);
 
@@ -169,5 +180,74 @@ const delayedParsed = parsePhoneStaffText("Valeria=UDEL222=US222 | Mon-Fri 08:00
 assert.equal(delayedParsed[0].ringAfterSeconds, 10);
 assert.equal(delayedParsed[0].windows[0].startMin, 480);
 assert.match(formatPhoneStaffText(delayedParsed), /rings after 10s/);
+
+const topic = parsePhoneDutyTopic(
+  "Inbound @Andrea Alvarado | Outbound @Roman | Attorney @Michael Tucker | LAs @Liz Abad-Cruz @Stephany Guerra @Valeria @Claudia",
+);
+assert.deepEqual(topic.inbound, ["Andrea Alvarado"]);
+assert.deepEqual(topic.outbound, ["Roman"]);
+assert.deepEqual(topic.attorney, ["Michael Tucker"]);
+assert.deepEqual(topic.las, ["Liz Abad-Cruz", "Stephany Guerra", "Valeria", "Claudia"]);
+
+const idTopic = parsePhoneDutyTopic(
+  "Inbound <@UAND111> | Outbound <@UROM222> | Attorney <@UATT333> | LAs <@ULIZ444> <@USTE555>",
+);
+assert.deepEqual(idTopic.inbound, ["UAND111"]);
+assert.deepEqual(idTopic.las, ["ULIZ444", "USTE555"]);
+
+const users = new Map([
+  ["andrea alvarado", "UAND111"],
+  ["andrea", "UAND111"],
+  ["roman", "UROM222"],
+  ["liz abad-cruz", "ULIZ444"],
+  ["stephany guerra", "USTE555"],
+  ["valeria", "UVAL666"],
+  ["claudia", "UCLA777"],
+  ["jissela", "UJIS888"],
+]);
+const dutyRoster = resolvePhoneDutyRoster(topic, users);
+assert.equal(dutyRoster.hasRoster, true);
+assert.ok(dutyRoster.answerIds.has("UAND111"));
+assert.ok(dutyRoster.answerIds.has("ULIZ444"));
+assert.ok(dutyRoster.answerIds.has("UVAL666"));
+assert.equal(dutyRoster.answerIds.has("UROM222"), false); // outbound only
+assert.equal(dutyRoster.answerIds.has("UJIS888"), false); // not on topic
+
+const jisselaActive = { name: "Jissela", slackUserId: "UJIS888", state: "available", tag: true };
+const lizActive = { name: "Liz", slackUserId: "ULIZ444", state: "available", tag: true };
+const filtered = applyDutyTopicFilter([jisselaActive, lizActive], dutyRoster, { enforce: true });
+assert.equal(filtered.find((r) => r.slackUserId === "UJIS888").state, "off_topic");
+assert.equal(filtered.find((r) => r.slackUserId === "UJIS888").tag, false);
+assert.equal(filtered.find((r) => r.slackUserId === "ULIZ444").state, "available");
+assert.equal(filtered.find((r) => r.slackUserId === "ULIZ444").tag, true);
+
+const topicBlock = formatAvailabilitySlackBlock(filtered, { ringSeconds: 20 });
+assert.match(topicBlock, /:warning: Liz/);
+assert.doesNotMatch(topicBlock, /Jissela/);
+
+assert.deepEqual(
+  dutySlackUserIdsFromSnapshot(filtered, dutyRoster, { enforce: true }).sort(),
+  [...dutyRoster.answerIds].sort(),
+);
+
+const missSummary = summarizeAvailabilityMisses([
+  {
+    available_slack_user_ids: ["ULIZ444", "UJIS888"],
+    duty_slack_user_ids: ["UAND111", "ULIZ444", "USTE555", "UVAL666", "UCLA777"],
+    staff_snapshot: [
+      { slackUserId: "UAND111", name: "Andrea" },
+      { slackUserId: "ULIZ444", name: "Liz" },
+      { slackUserId: "USTE555", name: "Stephany" },
+      { slackUserId: "UVAL666", name: "Valeria" },
+      { slackUserId: "UCLA777", name: "Claudia" },
+      { slackUserId: "UJIS888", name: "Jissela" },
+    ],
+  },
+]);
+assert.equal(missSummary.availableButDidNotAnswerCount, 1); // Jissela off topic → ignored
+assert.equal(missSummary.byUser.find((u) => u.slackUserId === "ULIZ444").count, 1);
+assert.equal(missSummary.byUser.find((u) => u.slackUserId === "USTE555").count, 0);
+assert.equal(missSummary.byUser.find((u) => u.slackUserId === "USTE555").onDuty, true);
+assert.equal(missSummary.byUser.some((u) => u.slackUserId === "UJIS888"), false);
 
 console.log("test-phone-staff: ok");

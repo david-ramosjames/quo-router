@@ -6,11 +6,13 @@
 // Only this subset is tracked — attorneys / others are ignored.
 //
 // Tag someone only when all of these are true:
+//   - Slack presence is active (inactive/away is noted but not tagged)
 //   - not already on a call
 //   - no Slack status that takes them off the phones (lunch, break, meeting, …)
 //   - the miss happened during their scheduled hours, or they are the
 //     after-hours person and nobody's shift covers that moment
-//   - Slack presence is active, or (once hours are set) away/offline with no status
+//   - during business hours, listed under Inbound or LAs in the daily
+//     #legalassistant-phone (or #lead-calls) channel topic
 // People are not tagged outside their own hours. Until any hours are saved,
 // only Slack-active staff are tagged, same as before.
 
@@ -450,11 +452,13 @@ export function classifyPhoneStaffMember(person, {
   }
 
   if (afterHoursDuty) {
+    // After-hours coverage still tags even if Slack shows away.
     return { ...base, state: "after_hours", afterHoursDuty: true, presence, tag: true };
   }
   if (presence === "active") return { ...base, state: "available", tag: true };
-  if (presence === "away" && hoursConfigured) return { ...base, state: "inactive", tag: true };
-  if (presence === "away") return { ...base, state: "away", tag: false };
+  // Inactive / away during shift: still counts as Available Missed, but shown as
+  // inactive in the status list and asked last during callback escalation.
+  if (presence === "away") return { ...base, state: "inactive", tag: false };
   return { ...base, state: "unknown", tag: false };
 }
 
@@ -724,17 +728,153 @@ async function getSlackStatus(firm, slackUserId) {
 }
 
 /**
+ * Parse the daily phone-duty channel topic:
+ *   Inbound @Andrea | Outbound @Roman | Attorney @Michael | LAs @Liz @Stephany …
+ * Mentions may be <@U…> ids or @Names (including multi-word).
+ */
+export function parsePhoneDutyTopic(topic) {
+  const empty = { inbound: [], outbound: [], attorney: [], las: [], raw: String(topic || "") };
+  if (!topic || !String(topic).trim()) return empty;
+
+  const sections = {};
+  for (const part of String(topic).split("|")) {
+    const m = part.trim().match(/^(inbound|outbound|attorney|las)\s*:?\s*(.*)$/i);
+    if (!m) continue;
+    const key = m[1].toLowerCase() === "las" ? "las" : m[1].toLowerCase();
+    sections[key] = extractTopicMentions(m[2] || "");
+  }
+  return {
+    inbound: sections.inbound || [],
+    outbound: sections.outbound || [],
+    attorney: sections.attorney || [],
+    las: sections.las || [],
+    raw: String(topic),
+  };
+}
+
+function extractTopicMentions(segment) {
+  const out = [];
+  const text = String(segment || "");
+  const idRe = /<@(U[A-Z0-9]+)>/gi;
+  let m;
+  while ((m = idRe.exec(text)) !== null) out.push(m[1].toUpperCase());
+
+  // Plain @Name tokens (Slack display form). Strip <@U…> first so ids aren't
+  // re-parsed as names, then grab each @… until the next @ or end.
+  const withoutIds = text.replace(/<@U[A-Z0-9]+>/gi, " ");
+  const nameRe = /@([^@|]+)/g;
+  while ((m = nameRe.exec(withoutIds)) !== null) {
+    const name = m[1].replace(/\s+/g, " ").trim();
+    if (name) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Resolve topic mention tokens to Slack user IDs via firm.slackUsers.
+ * Returns { inbound, outbound, attorney, las, answerIds } where answerIds is
+ * the set that should take inbound missed/Sona calls (Inbound ∪ LAs).
+ */
+export function resolvePhoneDutyRoster(parsed, slackUsers) {
+  const map = slackUsers instanceof Map ? slackUsers : new Map(Object.entries(slackUsers || {}));
+  const resolveOne = (token) => {
+    const raw = String(token || "").trim();
+    if (!raw) return null;
+    if (/^U[A-Z0-9]+$/i.test(raw)) return raw.toUpperCase();
+    const key = raw.toLowerCase();
+    if (map.has(key)) return map.get(key);
+    const first = key.split(/\s+/)[0];
+    if (first && map.has(first)) return map.get(first);
+    return null;
+  };
+  const resolveList = (list) => [...new Set((list || []).map(resolveOne).filter(Boolean))];
+  const inbound = resolveList(parsed?.inbound);
+  const outbound = resolveList(parsed?.outbound);
+  const attorney = resolveList(parsed?.attorney);
+  const las = resolveList(parsed?.las);
+  const answerIds = new Set([...inbound, ...las]);
+  return {
+    inbound,
+    outbound,
+    attorney,
+    las,
+    answerIds,
+    hasRoster: answerIds.size > 0,
+  };
+}
+
+export async function fetchPhoneDutyTopic(firm) {
+  const channelId = firm.slackLegalAssistantChannelId || firm.slackLeadCallsChannelId;
+  if (!firm.slackBotToken || !channelId) return null;
+  try {
+    const url = new URL("https://slack.com/api/conversations.info");
+    url.searchParams.set("channel", channelId);
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${firm.slackBotToken}` },
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.warn(`[${firm.id}][phone-staff] duty topic fetch failed: ${json.error}`);
+      return null;
+    }
+    return json.channel?.topic?.value || "";
+  } catch (err) {
+    console.warn(`[${firm.id}][phone-staff] duty topic fetch error:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * During business hours, only people listed under Inbound or LAs in today's
+ * channel topic are eligible to be Available / escalated. Outbound + Attorney
+ * are ignored for inbound missed calls. After-hours coverage is unchanged.
+ * If the topic is missing or empty, keep the existing phoneStaff schedule.
+ */
+export function applyDutyTopicFilter(rows, roster, { enforce = true } = {}) {
+  if (!enforce || !roster?.hasRoster) return rows || [];
+  return (rows || []).map((row) => {
+    if (row.afterHoursDuty || row.state === "after_hours") return row;
+    if (row.state === "off_shift" || row.state === "unknown") return row;
+    const id = String(row.slackUserId || "").toUpperCase();
+    if (roster.answerIds.has(id)) return row;
+    return {
+      ...row,
+      state: "off_topic",
+      tag: false,
+      statusText: "not on today's topic",
+    };
+  });
+}
+
+/**
+ * Slack user IDs that count for Available-missed metrics / inbound tagging.
+ * Prefer today's topic Inbound ∪ LAs; otherwise everyone on shift in the snapshot.
+ */
+export function dutySlackUserIdsFromSnapshot(rows, roster, { enforce = false } = {}) {
+  if (enforce && roster?.hasRoster) return [...roster.answerIds];
+  const ids = [];
+  for (const r of rows || []) {
+    if (!r?.slackUserId) continue;
+    if (r.state === "off_shift" || r.state === "unknown" || r.state === "off_topic") continue;
+    ids.push(r.slackUserId);
+  }
+  return [...new Set(ids)];
+}
+
+/**
  * Snapshot each configured phone-staff member at the moment of a missed/Sona call.
- * Tag people who were on shift (or the after-hours person), not on a call, and
- * not behind a blocking Slack status.
+ * Tag people who were on shift (or the after-hours person), Slack-active, not on
+ * a call, not behind a blocking status, and (by day) on the channel topic roster.
+ * Returns { rows, dutyRoster, dutySlackUserIds }.
  */
 export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } = {}) {
   const staff = firm.phoneStaff || [];
-  if (!staff.length) return [];
+  if (!staff.length) return { rows: [], dutyRoster: null, dutySlackUserIds: [] };
 
   const onCall = onCallSlackUserIds(firm);
   const hoursConfigured = hoursAreConfigured(staff);
   const officeCovered = isOfficeCovered(staff, now);
+  const topicPromise = fetchPhoneDutyTopic(firm);
   const rows = [];
   for (const person of staff) {
     const [presence, status] = await Promise.all([
@@ -751,7 +891,22 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
       hoursConfigured,
     }));
   }
-  return rows;
+
+  const topic = await topicPromise;
+  const parsed = parsePhoneDutyTopic(topic);
+  const roster = resolvePhoneDutyRoster(parsed, firm.slackUsers);
+  // Only enforce the daily topic while someone's scheduled shift covers now
+  // (business-hours phone coverage). After-hours Jackie stays as-is.
+  const enforce = officeCovered && roster.hasRoster;
+  if (topic != null) {
+    console.log(
+      `[${firm.id}][phone-staff] duty topic roster inbound=${roster.inbound.length} ` +
+      `las=${roster.las.length} enforce=${enforce}`,
+    );
+  }
+  const filtered = applyDutyTopicFilter(rows, roster, { enforce });
+  const dutySlackUserIds = dutySlackUserIdsFromSnapshot(filtered, roster, { enforce });
+  return { rows: filtered, dutyRoster: roster, dutySlackUserIds };
 }
 
 const FAST_HANGUP_SECONDS = 5;
@@ -759,7 +914,8 @@ const FAST_HANGUP_SECONDS = 5;
 function checkedNames(rows, { mention = false } = {}) {
   return rows.map((r) => {
     const who = mention ? `<@${r.slackUserId}>` : (r.name || r.slackUserId);
-    return `✅ ${who}`;
+    // :warning: (not a green check) — these people should have answered.
+    return `:warning: ${who}`;
   }).join("\n");
 }
 
@@ -776,20 +932,30 @@ function plainStatus(row) {
  * count as available once the call rang at least that long.
  */
 export function isFreeToAnswer(row) {
-  // Active, or inactive during shift with no Slack status set.
-  // Break / lunch / on-call stay in the plain context list.
+  // Slack-active (or after-hours coverage) — preferred for the Available list
+  // and first-round callback tags. Break / lunch / on-call stay in context.
+  return row.state === "available" || row.state === "after_hours";
+}
+
+/** Counts for Available Missed metrics (active + inactive on duty). */
+export function countsTowardAvailableMissed(row) {
   return row.state === "available" || row.state === "after_hours" || row.state === "inactive";
 }
 
 export function noticeGroups(snapshot, ringSeconds = null) {
   const fast = ringSeconds != null && ringSeconds < FAST_HANGUP_SECONDS;
-  const visible = (snapshot || []).filter((r) => r.state !== "off_shift" && r.state !== "unknown");
+  const visible = (snapshot || []).filter(
+    (r) => r.state !== "off_shift" && r.state !== "unknown" && r.state !== "off_topic",
+  );
   const free = visible.filter(isFreeToAnswer);
   const context = visible.filter((r) => !isFreeToAnswer(r));
   const rang = (r) => ringSeconds == null || ringSeconds >= (Number(r.ringAfterSeconds) || 0);
   const couldAnswer = free.filter(rang);
   const callbackOnly = free.filter((r) => !rang(r));
-  const accountable = fast ? [] : couldAnswer;
+  // Inactive on duty still counts as Available Missed even though they are not
+  // in the "Available to answer" list (they're noted as inactive instead).
+  const missEligible = visible.filter(countsTowardAvailableMissed).filter(rang);
+  const accountable = fast ? [] : missEligible;
   return { fast, couldAnswer, callbackOnly, context, accountable };
 }
 
@@ -821,7 +987,7 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = 
     }
   }
   for (const row of context) {
-    lines.push(`${row.name || row.slackUserId} (${plainStatus(row)})`);
+    lines.push(`:no_entry_sign: ${row.name || row.slackUserId} (${plainStatus(row)})`);
   }
   if (!lines.length) return "";
   return `\n\n${lines.join("\n")}`;
@@ -839,6 +1005,7 @@ export async function recordAvailabilityEvent(pgPool, firm, {
   callId,
   eventType,
   snapshot,
+  dutySlackUserIds = null,
   occurredAt = new Date(),
 } = {}) {
   if (!pgPool || !firm || !snapshot?.length) return null;
@@ -846,15 +1013,19 @@ export async function recordAvailabilityEvent(pgPool, firm, {
     .filter((r) => (r.accountable != null ? r.accountable : (r.tag || r.state === "available")))
     .map((r) => r.slackUserId);
   const onCall = snapshot.filter((r) => r.state === "on_call").map((r) => r.slackUserId);
-  const away = snapshot.filter((r) => r.state === "away").map((r) => r.slackUserId);
+  const away = snapshot.filter((r) => r.state === "away" || r.state === "inactive").map((r) => r.slackUserId);
+  const duty = Array.isArray(dutySlackUserIds)
+    ? [...new Set(dutySlackUserIds.filter(Boolean))]
+    : dutySlackUserIdsFromSnapshot(snapshot, null, { enforce: false });
   try {
     // Deduplicate when both the call-check fallback and /call-summary fire for
     // the same Quo call (common for Sona). Null call_id always inserts.
     const { rows } = await pgPool.query(
       `INSERT INTO phone_availability_events
          (firm_id, call_id, event_type, occurred_at,
-          available_slack_user_ids, on_call_slack_user_ids, away_slack_user_ids, staff_snapshot)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb)
+          available_slack_user_ids, on_call_slack_user_ids, away_slack_user_ids,
+          duty_slack_user_ids, staff_snapshot)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb)
        ON CONFLICT (firm_id, call_id, event_type) WHERE call_id IS NOT NULL DO NOTHING
        RETURNING id`,
       [
@@ -865,6 +1036,7 @@ export async function recordAvailabilityEvent(pgPool, firm, {
         JSON.stringify(available),
         JSON.stringify(onCall),
         JSON.stringify(away),
+        JSON.stringify(duty),
         JSON.stringify(snapshot),
       ],
     );
@@ -874,13 +1046,72 @@ export async function recordAvailabilityEvent(pgPool, firm, {
     }
     console.log(
       `[${firm.id}][phone-staff] Recorded ${eventType} availability event #${rows[0].id} ` +
-        `(available=${available.length}, on_call=${onCall.length}, away=${away.length})`,
+        `(available=${available.length}, duty=${duty.length}, on_call=${onCall.length}, away=${away.length})`,
     );
     return rows[0].id;
   } catch (err) {
     console.error(`[${firm.id}][phone-staff] Failed to record availability event:`, err.message);
     return null;
   }
+}
+
+/** Aggregate stored availability events into report metrics (topic duty roster included). */
+export function summarizeAvailabilityMisses(rows) {
+  const byUser = new Map();
+  const ensureUser = (uid, snapshot) => {
+    const id = String(uid || "");
+    if (!id) return null;
+    const snap = (snapshot || []).find((s) => s.slackUserId === id);
+    let cur = byUser.get(id);
+    if (!cur) {
+      cur = { slackUserId: id, name: snap?.name || id, count: 0, onDuty: false };
+      byUser.set(id, cur);
+    }
+    if (snap?.name) cur.name = snap.name;
+    return cur;
+  };
+
+  let availableButDidNotAnswerCount = 0;
+  let eventsWithAvailableStaff = 0;
+  for (const row of rows || []) {
+    const snapshot = row.staff_snapshot || row.staffSnapshot || [];
+    const duty = Array.isArray(row.duty_slack_user_ids)
+      ? row.duty_slack_user_ids
+      : (Array.isArray(row.dutySlackUserIds) ? row.dutySlackUserIds : null);
+    const availableRaw = Array.isArray(row.available_slack_user_ids)
+      ? row.available_slack_user_ids
+      : (Array.isArray(row.availableSlackUserIds) ? row.availableSlackUserIds : []);
+    // When a duty roster was stored (daily Slack topic), only those users count.
+    const dutySet = duty?.length ? new Set(duty.map(String)) : null;
+    const available = dutySet
+      ? availableRaw.filter((uid) => dutySet.has(String(uid)))
+      : availableRaw;
+
+    if (duty?.length) {
+      for (const uid of duty) {
+        const cur = ensureUser(uid, snapshot);
+        if (cur) cur.onDuty = true;
+      }
+    }
+    if (available.length) {
+      eventsWithAvailableStaff += 1;
+      availableButDidNotAnswerCount += available.length;
+    }
+    for (const uid of available) {
+      const cur = ensureUser(uid, snapshot);
+      if (!cur) continue;
+      cur.count += 1;
+      if (dutySet) cur.onDuty = true;
+    }
+  }
+
+  return {
+    eventsWithAvailableStaff,
+    availableButDidNotAnswerCount,
+    byUser: [...byUser.values()].sort(
+      (a, b) => b.count - a.count || Number(b.onDuty) - Number(a.onDuty) || String(a.name).localeCompare(String(b.name)),
+    ),
+  };
 }
 
 export async function queryAvailabilityMisses(pgPool, firmId, { createdAfter, createdBefore } = {}) {
@@ -897,39 +1128,23 @@ export async function queryAvailabilityMisses(pgPool, firmId, { createdAfter, cr
   }
   const { rows } = await pgPool.query(
     `SELECT id, call_id, event_type, occurred_at,
-            available_slack_user_ids, on_call_slack_user_ids, away_slack_user_ids, staff_snapshot
+            available_slack_user_ids, on_call_slack_user_ids, away_slack_user_ids,
+            duty_slack_user_ids, staff_snapshot
      FROM phone_availability_events
      WHERE ${where}
      ORDER BY occurred_at ASC`,
     params,
   );
 
-  const byUser = new Map();
-  let availableButDidNotAnswerCount = 0;
-  let eventsWithAvailableStaff = 0;
-  for (const row of rows) {
-    const available = Array.isArray(row.available_slack_user_ids) ? row.available_slack_user_ids : [];
-    if (available.length) {
-      eventsWithAvailableStaff += 1;
-      availableButDidNotAnswerCount += available.length;
-    }
-    for (const uid of available) {
-      const snap = (row.staff_snapshot || []).find((s) => s.slackUserId === uid);
-      const cur = byUser.get(uid) || { slackUserId: uid, name: snap?.name || uid, count: 0 };
-      cur.count += 1;
-      if (snap?.name) cur.name = snap.name;
-      byUser.set(uid, cur);
-    }
-  }
-
+  const summary = summarizeAvailabilityMisses(rows);
   return {
     firmId,
     createdAfter: createdAfter || null,
     createdBefore: createdBefore || null,
     eventCount: rows.length,
-    eventsWithAvailableStaff,
-    availableButDidNotAnswerCount,
-    byUser: [...byUser.values()].sort((a, b) => b.count - a.count),
+    eventsWithAvailableStaff: summary.eventsWithAvailableStaff,
+    availableButDidNotAnswerCount: summary.availableButDidNotAnswerCount,
+    byUser: summary.byUser,
     events: rows.map((r) => ({
       id: r.id,
       callId: r.call_id,
@@ -938,6 +1153,7 @@ export async function queryAvailabilityMisses(pgPool, firmId, { createdAfter, cr
       availableSlackUserIds: r.available_slack_user_ids,
       onCallSlackUserIds: r.on_call_slack_user_ids,
       awaySlackUserIds: r.away_slack_user_ids,
+      dutySlackUserIds: r.duty_slack_user_ids,
       staffSnapshot: r.staff_snapshot,
     })),
   };
@@ -1045,6 +1261,7 @@ export async function ensureAvailabilityTable(pgPool) {
       available_slack_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       on_call_slack_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       away_slack_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      duty_slack_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       staff_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb
     )
   `);
@@ -1061,6 +1278,10 @@ export async function ensureAvailabilityTable(pgPool) {
       ON phone_availability_events (firm_id, call_id, event_type)
       WHERE call_id IS NOT NULL
   `);
+  await pgPool.query(`
+    ALTER TABLE phone_availability_events
+      ADD COLUMN IF NOT EXISTS duty_slack_user_ids JSONB NOT NULL DEFAULT '[]'::jsonb
+  `);
 }
 
 /**
@@ -1073,11 +1294,16 @@ export async function attachAvailabilityToNotice(pgPool, firm, text, {
   ringSeconds = null,
 } = {}) {
   if (!firm.phoneStaff?.length) return { text, snapshot: [] };
-  const raw = await snapshotPhoneStaffAvailability(firm);
+  const { rows: raw, dutySlackUserIds } = await snapshotPhoneStaffAvailability(firm);
   const { accountable } = noticeGroups(raw, ringSeconds);
   const accountableIds = new Set(accountable.map((r) => r.slackUserId));
   const snapshot = raw.map((r) => ({ ...r, accountable: accountableIds.has(r.slackUserId) }));
   const block = formatAvailabilitySlackBlock(snapshot, { ringSeconds });
-  await recordAvailabilityEvent(pgPool, firm, { callId, eventType, snapshot });
+  await recordAvailabilityEvent(pgPool, firm, {
+    callId,
+    eventType,
+    snapshot,
+    dutySlackUserIds,
+  });
   return { text: text + block, snapshot };
 }

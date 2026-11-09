@@ -253,7 +253,9 @@ Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <div class="hint">
         One per line: <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
         Roles for callback escalation: <code>la primary</code> / <code>la secondary</code> (legal assistants) or <code>intake</code> (Roman / Andrea). Add <code>rings after 10s</code> when Quo does not ring them until 10 seconds.
-        The status list on missed/Sona posts uses names and checkmarks only (Jackie is still @-tagged after hours). Separate “Please call back now” posts tag people during business hours.
+        Slack-<strong>active</strong> people are tagged first; inactive still counts as Available Missed and is tagged only after other options. Daily duty comes from the #legalassistant-phone topic:
+        <code>Inbound @Name | Outbound @Name | Attorney @Name | LAs @Name @Name …</code> — Inbound + LAs only for inbound misses.
+        Status list uses names and checkmarks (Jackie is still @-tagged after hours). Separate “Please call back now” posts tag people during business hours.
       </div>
 
       <h3 style="margin-top:24px">Callback escalation</h3>
@@ -267,7 +269,7 @@ Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <label for="firm-esc-interval">Escalation interval (seconds)</label>
       <input id="firm-esc-interval" name="callbackEscalationInterval" type="number" min="10" step="1" value="50">
       <div class="hint">
-        Mon–Fri 7am–6pm (America/Chicago). #lead-calls asks 1 LA + 1 Intake, then widens every interval. #legalassistant-phone asks 2 primary LAs first (then secondary), and skips known non-client contacts. Stops when someone outbound-calls, green-checks, or replies “handling” / “not needed”.
+        Mon–Fri 7am–6pm (America/Chicago). #lead-calls asks 1 LA + 1 Intake, then widens every interval. #legalassistant-phone asks 2 primary LAs first (then secondary), and skips known non-client contacts. When the same call is also in #lead-calls, LA gets a “same as leads” note and no callback tags. Stops when someone outbound-calls, green-checks, or replies “handling” / “not needed”.
       </div>
 
       <h3 style="margin-top:24px">Credentials</h3>

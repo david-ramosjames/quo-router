@@ -3,17 +3,24 @@
 // people to call back, then widen the ask every intervalSeconds until someone
 // handles it or managers are tagged.
 
-import { DEFAULT_PHONE_STAFF_TZ, zonedDayMinutes, isFreeToAnswer } from "./phone-staff.js";
+import {
+  DEFAULT_PHONE_STAFF_TZ,
+  zonedDayMinutes,
+  countsTowardAvailableMissed,
+} from "./phone-staff.js";
 
 export const DEFAULT_ESCALATION_INTERVAL_SECONDS = 50;
 
-const STOP_REPLY = /\b(handling|not needed)\b/i;
+const STOP_REPLY = /\b(handling|not needed|calling)\b/i;
 const CHECK_REACTIONS = new Set([
   "white_check_mark",
   "heavy_check_mark",
   "checked",
   "ballot_box_with_check",
 ]);
+
+export const CALLBACK_STOP_HINT =
+  `_React :white_check_mark: or reply *handling* / *calling* if you're taking this — that stops further tags._`;
 
 export function normalizeCallbackEscalation(raw = {}) {
   const src = raw && typeof raw === "object" ? raw : {};
@@ -63,8 +70,49 @@ function byRotation(pool, usedIds, count, rotation) {
   return ordered.slice(0, count);
 }
 
+/** Prefer Slack-active people; only pull inactive after that pool is exhausted. */
+function byRotationPreferActive(pool, usedIds, count, rotation) {
+  if (!pool.length || count <= 0) return [];
+  const unused = pool.filter((p) => !usedIds.has(p.slackUserId));
+  const active = unused.filter((p) => p.state !== "inactive");
+  const inactive = unused.filter((p) => p.state === "inactive");
+  const fromActive = byRotation(active, usedIds, count, rotation);
+  if (fromActive.length >= count) return fromActive;
+  const need = count - fromActive.length;
+  const used = new Set([...usedIds, ...fromActive.map((p) => p.slackUserId)]);
+  return [...fromActive, ...byRotation(inactive, used, need, rotation)];
+}
+
+/**
+ * Across ordered pools (e.g. primary then secondary): take every active person
+ * first, then inactive — so inactive are last overall, not just within a tier.
+ */
+function pickPreferActiveAcrossPools(pools, usedIds, count, rotation) {
+  if (count <= 0) return [];
+  const picked = [];
+  const used = new Set(usedIds);
+  for (const pool of pools) {
+    if (picked.length >= count) break;
+    const active = (pool || []).filter((p) => p.state !== "inactive");
+    for (const p of byRotation(active, used, count - picked.length, rotation)) {
+      picked.push(p);
+      used.add(p.slackUserId);
+    }
+  }
+  for (const pool of pools) {
+    if (picked.length >= count) break;
+    const inactive = (pool || []).filter((p) => p.state === "inactive");
+    for (const p of byRotation(inactive, used, count - picked.length, rotation)) {
+      picked.push(p);
+      used.add(p.slackUserId);
+    }
+  }
+  return picked;
+}
+
 function freeFromSnapshot(snapshot) {
-  return (snapshot || []).filter((row) => isFreeToAnswer(row) || row.tag);
+  // Active + inactive on duty both escalate; inactive is asked last within each role.
+  return (snapshot || []).filter((row) => countsTowardAvailableMissed(row) || row.tag);
 }
 
 function staffByRole(firm, snapshot, role) {
@@ -91,17 +139,17 @@ export function nextLeadCallsAssignees(firm, snapshot, { usedIds = new Set(), st
 
   if (step <= 1) {
     const picked = [];
-    const laPick = byRotation(las, used, 1, rotation);
+    const laPick = byRotationPreferActive(las, used, 1, rotation);
     for (const p of laPick) {
       picked.push(p);
       used.add(p.slackUserId);
     }
-    const intakePick = byRotation(intake, used, 1, rotation + step);
+    const intakePick = byRotationPreferActive(intake, used, 1, rotation + step);
     if (intakePick.length) {
       picked.push(intakePick[0]);
       used.add(intakePick[0].slackUserId);
     } else {
-      const secondLa = byRotation(las, used, 1, rotation + 1);
+      const secondLa = byRotationPreferActive(las, used, 1, rotation + 1);
       for (const p of secondLa) {
         picked.push(p);
         used.add(p.slackUserId);
@@ -111,7 +159,7 @@ export function nextLeadCallsAssignees(firm, snapshot, { usedIds = new Set(), st
       return { kind: "request", people: picked, usedIds: [...used] };
     }
   } else {
-    const laPick = byRotation(las, used, 1, rotation + step);
+    const laPick = byRotationPreferActive(las, used, 1, rotation + step);
     if (laPick.length) {
       for (const p of laPick) used.add(p.slackUserId);
       return { kind: "request", people: laPick, usedIds: [...used] };
@@ -147,19 +195,13 @@ export function nextLegalAssistantAssignees(firm, snapshot, { usedIds = new Set(
   const picked = [];
 
   if (step === 0) {
-    for (const p of byRotation(primary, used, need, rotation)) {
+    // Active primary → active secondary → inactive primary → inactive secondary.
+    for (const p of pickPreferActiveAcrossPools([primary, secondary], used, need, rotation)) {
       picked.push(p);
       used.add(p.slackUserId);
     }
-    need -= picked.length;
-    if (need > 0) {
-      for (const p of byRotation(secondary, used, need, rotation + 1)) {
-        picked.push(p);
-        used.add(p.slackUserId);
-      }
-    }
   } else {
-    for (const p of byRotation(allLas, used, need, rotation + step)) {
+    for (const p of byRotationPreferActive(allLas, used, need, rotation + step)) {
       picked.push(p);
       used.add(p.slackUserId);
     }
@@ -183,13 +225,15 @@ export function nextLegalAssistantAssignees(firm, snapshot, { usedIds = new Set(
 
 export function formatCallbackRequest(people) {
   if (!people?.length) return "";
-  return people.map((p) => `<@${p.slackUserId}> Please call back now`).join("\n");
+  const lines = people.map((p) => `:rotating_light: <@${p.slackUserId}> Please call back now`);
+  lines.push(CALLBACK_STOP_HINT);
+  return lines.join("\n");
 }
 
 export function formatManagerEscalation(people, message) {
   if (!people?.length) return "";
   const tags = people.map((p) => `<@${p.slackUserId}>`).join(" ");
-  return `${tags} ${message || "Please step in on this callback."}`;
+  return `:rotating_light: ${tags} ${message || "Please step in on this callback."}\n${CALLBACK_STOP_HINT}`;
 }
 
 export function replyMeansStop(text) {

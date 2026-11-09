@@ -3985,15 +3985,43 @@ async function runCallbackEscalationStep(firm, key) {
   }, waitMs);
 }
 
-function maybeStartCallbackEscalations(firm, {
+function formatHandledInLeadCallsNote(leadPost) {
+  const link = leadPost?.permalink
+    ? ` <${leadPost.permalink}|#lead-calls>`
+    : " #lead-calls";
+  return `_Same as leads — being handled in${link}. Callback tags are only in that channel._`;
+}
+
+/** LA channel body when the same call is also in #lead-calls: no staff/tags. */
+function legalAssistantTextForDualPost(baseText, leadPost) {
+  const body = String(baseText || "").trimEnd();
+  return `${body}\n\n${formatHandledInLeadCallsNote(leadPost)}`;
+}
+
+async function noteHandledInLeadCalls(firm, laPost, leadPost) {
+  if (!firm?.slackBotToken || !laPost?.parentTs) return null;
+  const channel = laPost.channelId || firm.slackLegalAssistantChannelId;
+  if (!channel) return null;
+  return slackPostMessage(firm, {
+    channel,
+    text: formatHandledInLeadCallsNote(leadPost),
+    threadTs: laPost.parentTs,
+  });
+}
+
+async function maybeStartCallbackEscalations(firm, {
   phone,
   snapshot = [],
   leadPost = null,
   laPost = null,
   eventType = "missed",
+  laNoteAlreadyPosted = false,
 } = {}) {
   if (!["missed", "menu_hangup", "sona"].includes(eventType)) return;
-  if (leadPost?.parentTs && firm.slackLeadCallsChannelId) {
+  const hasLead = !!(leadPost?.parentTs && firm.slackLeadCallsChannelId);
+  const hasLa = !!(laPost?.parentTs && firm.slackLegalAssistantChannelId && !isKnownBusiness(firm, phone));
+
+  if (hasLead) {
     startCallbackEscalation(firm, {
       lane: "lead",
       phone,
@@ -4002,7 +4030,16 @@ function maybeStartCallbackEscalations(firm, {
       snapshot,
     });
   }
-  if (laPost?.parentTs && firm.slackLegalAssistantChannelId && !isKnownBusiness(firm, phone)) {
+
+  // Dual-posted to lead-calls + legalassistant-phone → escalate only in lead-calls.
+  // LA thread gets a short "same as leads" note instead of callback tags.
+  if (hasLead && hasLa) {
+    console.log(`[${firm.id}][callback-esc] Dual post — skipping LA tags, noting handled in lead-calls`);
+    if (!laNoteAlreadyPosted) await noteHandledInLeadCalls(firm, laPost, leadPost);
+    return;
+  }
+
+  if (hasLa) {
     startCallbackEscalation(firm, {
       lane: "legalassistant",
       phone,
@@ -4137,19 +4174,29 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
+    } else if (isLeadIntakeLine(firm, from, to)) {
+      // Missed call on Leads/Intake/RGV — always open/thread in #lead-calls.
+      leadPost = await postLeadToSlack(firm, intakeText, from, to,
+        { mentionUsers: firm.leadThreadTagUsers });
+      console.log(`[${firm.id}][call-check] Lead/intake line — also sent to lead-calls`);
     } else {
       leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
     }
     let laPost = null;
     if (!isActiveClient(firm, externalPhone) && !isKnownBusiness(firm, externalPhone)) {
-      laPost = await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
+      // Dual-posted with lead-calls: skip staff/tags in LA (escalation stays in leads).
+      const laBody = leadPost
+        ? legalAssistantTextForDualPost(closedClient ? CLOSED_CLIENT_PREFIX + text : text, leadPost)
+        : (closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText);
+      laPost = await postToLegalAssistant(firm, laBody, from, to);
     }
-    maybeStartCallbackEscalations(firm, {
+    await maybeStartCallbackEscalations(firm, {
       phone: externalPhone,
       snapshot: staff.snapshot,
       leadPost,
       laPost,
       eventType,
+      laNoteAlreadyPosted: !!leadPost,
     });
     await postToCaseChannel(firm, text, from, to);
   } else if (isAnswered) {
@@ -4179,18 +4226,22 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       await postToSlack(firm.slackWebhooks.humanCalls, text);
     }
     const intakeText = text + staff.text;
+    const leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
     let laPost = null;
     if (shouldRouteToLegalAssistant(firm, from, to) && !isKnownBusiness(firm, firm.phoneLines[from] ? to : from)) {
-      laPost = await postToLegalAssistant(firm, intakeText, from, to);
+      const laBody = leadPost
+        ? legalAssistantTextForDualPost(text, leadPost)
+        : intakeText;
+      laPost = await postToLegalAssistant(firm, laBody, from, to);
     }
-    const leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
     if (isSona) {
-      maybeStartCallbackEscalations(firm, {
+      await maybeStartCallbackEscalations(firm, {
         phone: firm.phoneLines[from] ? to : from,
         snapshot: staff.snapshot,
         leadPost,
         laPost,
         eventType: "sona",
+        laNoteAlreadyPosted: !!leadPost,
       });
     }
     // Sona answered (AI) — LA still needs to follow up. Human-answered was
@@ -4568,7 +4619,7 @@ Respond with ONLY one of these words: "qualified_lead", "non_pi", "return_call",
 }
 
 function looksLikePersonalInjury(text) {
-  return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b/i.test(String(text || ""));
+  return /\bdog bite|bitten by (?:a |the )?(?:\w+ )?dog|attacked by (?:a |the )?(?:\w+ )?dogs?\b|\b(?:car|truck|motorcycle|pedestrian) accident\b|\brear-?ended\b|\bslip(?:ped)? and fall\b|\b(?:workers?'? compensation|work(?:place)? (?:accident|injury))\b|\bassault\b|\batropellad[oa]\b|\baccidente (?:de (?:auto|carro|tráfico|transito|tránsito)|automovilístic[oa])\b|\b(?:choque|camioneta|hit and run|hit by (?:a |the )?(?:car|truck|vehicle))\b|\b(?:pierna quebrada|fractura|quebr[oa]d[oa])\b/i.test(String(text || ""));
 }
 
 const MAJOR_INSURER = /\b(state farm|progressive|geico|g\.e\.i\.c\.o|usaa|allstate|farmers(?: insurance)?|nationwide|liberty mutual|travelers|american family|aaa(?: insurance)?|csaa|american county mutual|farm bureau|the hartford|hartford|safeco|mercury(?: insurance)?|national general|bristol west|dairyland|amica|erie insurance)\b/i;
@@ -4954,6 +5005,11 @@ async function handleCalls(firm, req, res) {
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       slackPermalink = leadPost?.permalink || null;
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
+    } else if (isLeadIntakeLine(firm, from, to)) {
+      leadPost = await postLeadToSlack(firm, intakeText, from, to,
+        { mentionUsers: firm.leadThreadTagUsers });
+      slackPermalink = leadPost?.permalink || null;
+      console.log(`[${firm.id}][calls] Lead/intake line — ALSO sent to lead-calls`);
     } else {
       leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
       slackPermalink = leadPost?.permalink || null;
@@ -4961,18 +5017,22 @@ async function handleCalls(firm, req, res) {
 
     let laPost = null;
     if (!isActiveClient(firm, externalPhone) && !isKnownBusiness(firm, externalPhone)) {
-      laPost = await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
-      console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone`);
+      const laBody = leadPost
+        ? legalAssistantTextForDualPost(closedClient ? CLOSED_CLIENT_PREFIX + text : text, leadPost)
+        : (closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText);
+      laPost = await postToLegalAssistant(firm, laBody, from, to);
+      console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone${leadPost ? " (deferred tags to lead-calls)" : ""}`);
     } else {
       console.log(`[${firm.id}][calls] Skipping legalassistant-phone — existing client or known business`);
     }
 
-    maybeStartCallbackEscalations(firm, {
+    await maybeStartCallbackEscalations(firm, {
       phone: externalPhone,
       snapshot: staff.snapshot,
       leadPost,
       laPost,
       eventType: availabilityEvent,
+      laNoteAlreadyPosted: !!leadPost,
     });
 
     await postToCaseChannel(firm, text, from, to);
@@ -5328,19 +5388,25 @@ async function handleCallSummary(firm, req, res) {
     let laPost = null;
     if (isInbound && shouldRouteToLegalAssistant(firm, from, to) && !isKnownBusiness(firm, clientPhoneForEsc)
         && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
-      laPost = await postToLegalAssistant(firm, intakeText, from, to);
-      console.log(`[${firm.id}][call-summary] ALSO sent to legalassistant-phone`);
+      // Sona lead also lands in lead-calls — keep LA informed, tags stay in leads.
+      const dualWithLead = !!(leadPost || threadedInLeads);
+      const laBody = dualWithLead
+        ? legalAssistantTextForDualPost(text, leadPost)
+        : intakeText;
+      laPost = await postToLegalAssistant(firm, laBody, from, to);
+      console.log(`[${firm.id}][call-summary] ALSO sent to legalassistant-phone${dualWithLead ? " (deferred tags to lead-calls)" : ""}`);
     } else if (!isLead && !threadedInLeads && !isInbound) {
       console.log(`[${firm.id}][call-summary] Skipping legalassistant-phone — outbound (to=${to})`);
     }
 
     if (sona) {
-      maybeStartCallbackEscalations(firm, {
+      await maybeStartCallbackEscalations(firm, {
         phone: clientPhoneForEsc,
         snapshot: staff.snapshot,
         leadPost,
         laPost,
         eventType: "sona",
+        laNoteAlreadyPosted: !!(leadPost || threadedInLeads),
       });
     }
 

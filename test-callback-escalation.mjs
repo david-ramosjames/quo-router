@@ -91,12 +91,34 @@ const laFallback = nextLegalAssistantAssignees(firm, onlySecondary, { step: 0, r
 assert.equal(laFallback.people.length, 2);
 assert.equal(laFallback.people.every((p) => p.tier === "secondary"), true);
 
-assert.match(formatCallbackRequest(la0.people), /Please call back now/);
+assert.match(formatCallbackRequest(la0.people), /:rotating_light: <@.+> Please call back now/);
+assert.match(formatCallbackRequest(la0.people), /handling/);
+assert.match(formatCallbackRequest(la0.people), /calling/);
+assert.match(formatCallbackRequest(la0.people), /white_check_mark/);
 assert.match(formatManagerEscalation(cfg.managers.map((id) => ({ slackUserId: id })), "No response has been received."), /No response/);
 assert.equal(replyMeansStop("handling this one"), true);
 assert.equal(replyMeansStop("not needed"), true);
+assert.equal(replyMeansStop("calling now"), true);
 assert.equal(replyMeansStop("looking into it"), false);
 assert.equal(reactionMeansStop("white_check_mark"), true);
 assert.equal(reactionMeansStop("thumbsup"), false);
+
+// Inactive people are asked only after active options in that role are used.
+const mixedSnap = allFree.map((p) => (
+  p.slackUserId === "USTEPH" || p.slackUserId === "ULIZ" || p.slackUserId === "UJIS"
+    ? { ...p, state: "inactive", tag: false }
+    : p
+));
+const laActiveFirst = nextLegalAssistantAssignees(firm, mixedSnap, { step: 0, rotation: 0 });
+assert.equal(laActiveFirst.people.length, 2);
+assert.equal(laActiveFirst.people.every((p) => p.state !== "inactive"), true);
+assert.equal(laActiveFirst.people.every((p) => p.tier === "secondary"), true);
+
+const afterSecondaries = nextLegalAssistantAssignees(firm, mixedSnap, {
+  usedIds: new Set(laActiveFirst.usedIds),
+  step: 1,
+  rotation: 1,
+});
+assert.ok(afterSecondaries.people.some((p) => p.state === "inactive"));
 
 console.log("test-callback-escalation: ok");
