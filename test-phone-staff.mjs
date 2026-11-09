@@ -35,13 +35,14 @@ const snapshot = [
 ];
 const block = formatAvailabilitySlackBlock(snapshot);
 assert.match(block, /Available to answer \(active, not on a call\)/);
-assert.match(block, /<@U123ABC>/);
+assert.match(block, /✅ Jackie/);
+assert.doesNotMatch(block, /<@U123ABC>/);
 assert.doesNotMatch(block, /U456DEF/);
 assert.doesNotMatch(block, /U789GHI/);
 assert.equal(availableFromSnapshot(snapshot).length, 1);
 
 const roster = parsePhoneStaffText(`timezone=America/Chicago
-Andrea=UAAA111=US111 | Mon-Fri 08:00-17:00
+Andrea=UAAA111=US111 | Mon-Fri 08:00-17:00 intake
 Jackie=UBBB222=US222 | after-hours
 `);
 assert.equal(roster.length, 2);
@@ -50,9 +51,12 @@ assert.equal(roster[0].windows[0].endMin, 17 * 60);
 assert.deepEqual(roster[0].windows[0].days, [1, 2, 3, 4, 5]);
 assert.equal(roster[1].afterHours, true);
 assert.equal(roster[1].windows.length, 0);
+assert.equal(roster[0].role, "intake");
+assert.equal(roster[1].role, "after_hours");
 const again = parsePhoneStaffText(formatPhoneStaffText(roster));
 assert.equal(again[0].windows[0].startMin, 480);
 assert.equal(again[1].afterHours, true);
+assert.equal(again[0].role, "intake");
 
 const bad = parsePhoneStaffText("Andrea=UAAA111=US111 | everyday 8-5");
 assert.match(bad[0].scheduleError, /Could not read hours/);
@@ -100,48 +104,62 @@ const rosterNow = [immediate, delayed, onBreak, jackieDay];
 
 const longRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 20 });
 assert.match(longRing, /Rang for 20s/);
-assert.match(longRing, /✅ <@UIMM111>/);
-assert.match(longRing, /✅ <@UDEL222>/);
+assert.match(longRing, /✅ Stephany/);
+assert.match(longRing, /✅ Valeria/);
 assert.match(longRing, /Andrea Alvarado \(Break\)/);
-assert.doesNotMatch(longRing, /<@UBRK333>/);
+assert.doesNotMatch(longRing, /<@/);
 assert.doesNotMatch(longRing, /Jackie/);
 assert.doesNotMatch(longRing, /Please call back/);
 
 const midRing = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 7 });
 const midLines = midRing.split("\n");
 const availableAt = midLines.findIndex((line) => line.includes("Available to answer"));
-assert.match(midLines[availableAt + 1], /✅ <@UIMM111>/);
-assert.doesNotMatch(midLines[availableAt + 1], /UDEL222/);
+assert.match(midLines[availableAt + 1], /✅ Stephany/);
+assert.doesNotMatch(midLines[availableAt + 1], /Valeria/);
 const callbackAt = midLines.findIndex((line) => line.includes("Please call back"));
-assert.match(midLines[callbackAt + 1], /✅ <@UDEL222>/);
+assert.match(midLines[callbackAt + 1], /✅ Valeria/);
 assert.match(midRing, /Andrea Alvarado \(Break\)/);
-assert.doesNotMatch(midRing, /<@UBRK333>/);
+assert.doesNotMatch(midRing, /<@/);
 
 const hangup = formatAvailabilitySlackBlock(rosterNow, { ringSeconds: 3 });
 assert.match(hangup, /Rang for 3s/);
 assert.match(hangup, /Caller hung up, please call back:/);
-assert.match(hangup, /✅ <@UIMM111>/);
-assert.match(hangup, /✅ <@UDEL222>/);
+assert.match(hangup, /✅ Stephany/);
+assert.match(hangup, /✅ Valeria/);
+assert.doesNotMatch(hangup, /<@/);
 
-// Inactive during shift, no Slack status → still @-mention as available.
+// Inactive during shift, no Slack status → listed as available (name only, no @).
 const roman = { name: "Roman", slackUserId: "UROM555", state: "inactive", ringAfterSeconds: 10, tag: true };
 const inactiveBlock = formatAvailabilitySlackBlock(
   [immediate, roman, onBreak],
   { ringSeconds: 9 },
 );
 assert.match(inactiveBlock, /Available to answer \(active, not on a call\):/);
-assert.match(inactiveBlock, /✅ <@UIMM111>/);
+assert.match(inactiveBlock, /✅ Stephany/);
 assert.match(inactiveBlock, /Please call back:/);
-assert.match(inactiveBlock, /✅ <@UROM555>/);
+assert.match(inactiveBlock, /✅ Roman/);
 assert.match(inactiveBlock, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(inactiveBlock, /Roman \(inactive\)/);
+assert.doesNotMatch(inactiveBlock, /<@/);
 
 const inactiveLong = formatAvailabilitySlackBlock(
   [immediate, roman],
   { ringSeconds: 20 },
 );
-assert.match(inactiveLong, /✅ <@UROM555>/);
+assert.match(inactiveLong, /✅ Roman/);
 assert.doesNotMatch(inactiveLong, /Please call back/);
+
+const roleParsed = parsePhoneStaffText(`timezone=America/Chicago
+Liz=ULIZ111=US111 | Mon-Fri 08:00-17:00 la primary
+Valeria=UVAL222=US222 | Mon-Fri 08:00-17:00 rings after 10s la secondary
+Roman=UROM333=US333 | Mon-Fri 08:00-17:00 rings after 10s intake
+`);
+assert.equal(roleParsed[0].role, "la");
+assert.equal(roleParsed[0].tier, "primary");
+assert.equal(roleParsed[1].role, "la");
+assert.equal(roleParsed[1].tier, "secondary");
+assert.equal(roleParsed[1].ringAfterSeconds, 10);
+assert.equal(roleParsed[2].role, "intake");
 assert.doesNotMatch(hangup, /Available to answer/);
 assert.match(hangup, /Andrea Alvarado \(Break\)/);
 assert.doesNotMatch(hangup, /<@UBRK333>/);

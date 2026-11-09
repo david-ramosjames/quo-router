@@ -19,6 +19,17 @@ import {
   queryAvailabilityMisses,
   phoneStaffStatusSummary,
 } from "./phone-staff.js";
+import {
+  normalizeCallbackEscalation,
+  isBusinessHours,
+  nextLeadCallsAssignees,
+  nextLegalAssistantAssignees,
+  formatCallbackRequest,
+  formatManagerEscalation,
+  replyMeansStop,
+  reactionMeansStop,
+  bumpRotation,
+} from "./callback-escalation.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
 // outbound IPv6 route, and Node 18+ returns DNS results verbatim — so a
@@ -219,6 +230,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     // Slack app/bot to tag when a client asks for a call back. Accepts an App ID
     // (A…, resolved to the bot's member id via users.list) or a member id directly.
     callbackBotId: (config.callbackBotId || "").trim(),
+    callbackEscalation: normalizeCallbackEscalation(config.callbackEscalation || {}),
     // Listed phone lines are the allowlist. Uncheck in admin only if this
     // firm's Quo account should post every number, including other tenants.
     restrictToPhoneLines: config.restrictToPhoneLines !== false,
@@ -240,6 +252,8 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     pendingCallbacks: new Map(), // phoneLast10 -> { callId, expiresAt }
     onCallByCallId: new Map(), // callId -> { slackUserId, previous status, setAt }
     answerWatchTimers: new Map(), // callId -> timeout id
+    callbackEscalations: new Map(), // key -> pending escalation job
+    callbackRotation: 0,
   };
 }
 
@@ -373,6 +387,7 @@ async function initFirmStore() {
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS intake_config JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS callback_bot_id TEXT`);
     await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS phone_staff JSONB NOT NULL DEFAULT '[]'::jsonb`);
+    await pgPool.query(`ALTER TABLE firms ADD COLUMN IF NOT EXISTS callback_escalation JSONB NOT NULL DEFAULT '{}'::jsonb`);
     await ensureAvailabilityTable(pgPool);
     console.log(`[db] Connected to Postgres and ensured firms table exists${SECRET_KEY ? " (secret encryption ON)" : " (secrets stored as plaintext — set SECRET_ENCRYPTION_KEY to encrypt)"}`);
   } catch (err) {
@@ -418,6 +433,7 @@ function rowToConfig(row) {
     phoneStaff: row.phone_staff || [],
     restrictToPhoneLines: row.restrict_to_phone_lines !== false,
     callbackBotId: row.callback_bot_id || "",
+    callbackEscalation: row.callback_escalation || {},
     caseStatusConfig: row.case_status_config || {},
     intakeConfig: row.intake_config || {},
   };
@@ -444,6 +460,7 @@ async function loadFirmsFromDb() {
           phoneStaff: existing.phoneStaff,
           restrictToPhoneLines: existing.restrictToPhoneLines,
           callbackBotId: existing.callbackBotId,
+          callbackEscalation: existing.callbackEscalation,
           caseStatusConfig: existing.caseStatusConfig,
           intakeConfig: existing.intakeConfig,
         };
@@ -461,6 +478,7 @@ async function loadFirmsFromDb() {
         existing.phoneStaff = normalizePhoneStaff(merged);
         existing.restrictToPhoneLines = merged.restrictToPhoneLines;
         existing.callbackBotId = merged.callbackBotId;
+        existing.callbackEscalation = normalizeCallbackEscalation(merged.callbackEscalation || {});
         existing.caseStatusConfig = merged.caseStatusConfig;
         existing.intakeConfig = merged.intakeConfig;
         existing.storedSecrets = { ...(existing.storedSecrets || {}), ...secrets };
@@ -484,8 +502,8 @@ async function loadFirmsFromDb() {
 async function saveFirmToDb(id, config, storedSecrets) {
   if (!pgPool) return false;
   await pgPool.query(
-    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, phone_staff, secrets, restrict_to_phone_lines, case_status_config, intake_config, callback_bot_id, updated_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10::jsonb, $11, now())
+    `INSERT INTO firms (id, name, practice_area, phone_lines, lead_thread_tag_users, phone_staff, secrets, restrict_to_phone_lines, case_status_config, intake_config, callback_bot_id, callback_escalation, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10::jsonb, $11, $12::jsonb, now())
      ON CONFLICT (id) DO UPDATE SET
        name = EXCLUDED.name,
        practice_area = EXCLUDED.practice_area,
@@ -497,6 +515,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
        case_status_config = EXCLUDED.case_status_config,
        intake_config = EXCLUDED.intake_config,
        callback_bot_id = EXCLUDED.callback_bot_id,
+       callback_escalation = EXCLUDED.callback_escalation,
        updated_at = now()`,
     [
       id,
@@ -510,6 +529,7 @@ async function saveFirmToDb(id, config, storedSecrets) {
       JSON.stringify(normalizeCaseStatusConfig(config)),
       JSON.stringify(normalizeIntakeConfig(config)),
       config.callbackBotId || null,
+      JSON.stringify(normalizeCallbackEscalation(config.callbackEscalation || {})),
     ],
   );
   return true;
@@ -549,6 +569,10 @@ function teardownFirm(firm) {
   firm.resolvedCalls.clear();
   for (const tid of firm.answerWatchTimers?.values() || []) clearTimeout(tid);
   firm.answerWatchTimers?.clear();
+  for (const job of firm.callbackEscalations?.values() || []) {
+    if (job?.timer) clearTimeout(job.timer);
+  }
+  firm.callbackEscalations?.clear();
 }
 
 // === Firm-agnostic Utilities ===
@@ -3433,7 +3457,12 @@ async function postLeadToSlack(firm, text, phoneFrom, phoneTo,
         console.log(`[${firm.id}][lead-calls] Permalink: ${permalink || "null"}`);
         // parentTs is what later messages should thread under: the existing
         // thread if we replied into one, otherwise this new top-level post.
-        return { permalink, ts: msgTs, parentTs: threadTs || msgTs };
+        return {
+          permalink,
+          ts: msgTs,
+          parentTs: threadTs || msgTs,
+          channelId: firm.slackLeadCallsChannelId,
+        };
       }
       console.warn(`[${firm.id}][lead-calls] No ts in Slack response — cannot build permalink`);
       return null;
@@ -3544,15 +3573,21 @@ async function postToLegalAssistant(firm, text, phoneFrom, phoneTo) {
       if (!json.ok) {
         console.error(`[${firm.id}][la-thread] Slack API error: ${json.error}`);
         await postToSlack(firm.slackWebhooks.legalAssistant, text);
-      } else {
-        console.log(`[${firm.id}][la-thread] Posted via Slack API (threaded: ${!!threadTs})`);
+        return null;
       }
-      return;
+      console.log(`[${firm.id}][la-thread] Posted via Slack API (threaded: ${!!threadTs})`);
+      const msgTs = json.ts || null;
+      return {
+        ts: msgTs,
+        parentTs: threadTs || msgTs,
+        channelId: firm.slackLegalAssistantChannelId,
+      };
     } catch (err) {
       console.error(`[${firm.id}][la-thread] Error:`, err.message);
     }
   }
   await postToSlack(firm.slackWebhooks.legalAssistant, text);
+  return null;
 }
 
 async function joinChannel(firm, channelId) {
@@ -3820,11 +3855,205 @@ function ringSecondsFromCall(obj, { allowTotalDuration = false } = {}) {
 async function phoneStaffBlock(firm, { callId, eventType, ringSeconds = null } = {}) {
   try {
     const result = await attachAvailabilityToNotice(pgPool, firm, "", { callId, eventType, ringSeconds });
-    return result.text || "";
+    return { text: result.text || "", snapshot: result.snapshot || [] };
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
-    return "";
+    return { text: "", snapshot: [] };
   }
+}
+
+function phoneLast10(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits.length >= 10 ? digits.slice(-10) : digits || null;
+}
+
+function escalationKey(lane, phone) {
+  return `${lane}:${phoneLast10(phone) || "unknown"}`;
+}
+
+async function slackPostMessage(firm, { channel, text, threadTs = null }) {
+  if (!firm.slackBotToken || !channel || !text) return null;
+  const body = { channel, text };
+  if (threadTs) body.thread_ts = threadTs;
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${firm.slackBotToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  if (!json.ok) {
+    console.error(`[${firm.id}][callback-esc] chat.postMessage failed: ${json.error}`);
+    return null;
+  }
+  return { ts: json.ts, channelId: channel, parentTs: threadTs || json.ts };
+}
+
+async function threadHasStopSignal(firm, channelId, parentTs) {
+  if (!firm.slackBotToken || !channelId || !parentTs) return false;
+  try {
+    const url = new URL("https://slack.com/api/conversations.replies");
+    url.searchParams.set("channel", channelId);
+    url.searchParams.set("ts", parentTs);
+    url.searchParams.set("limit", "200");
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${firm.slackBotToken}` },
+    });
+    const json = await res.json();
+    if (!json.ok) {
+      console.warn(`[${firm.id}][callback-esc] conversations.replies failed: ${json.error}`);
+      return false;
+    }
+    for (const msg of json.messages || []) {
+      if (replyMeansStop(msg.text || "")) return true;
+      for (const rx of msg.reactions || []) {
+        if (reactionMeansStop(rx.name) && (rx.count || 0) > 0) return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[${firm.id}][callback-esc] stop-signal check failed:`, err.message);
+    return false;
+  }
+}
+
+function stopCallbackEscalation(firm, { phone = null, lane = null, key = null, reason = "" } = {}) {
+  if (!firm.callbackEscalations?.size) return;
+  const keys = [];
+  if (key) keys.push(key);
+  else if (phone && lane) keys.push(escalationKey(lane, phone));
+  else if (phone) {
+    const last10 = phoneLast10(phone);
+    for (const k of firm.callbackEscalations.keys()) {
+      if (k.endsWith(`:${last10}`)) keys.push(k);
+    }
+  }
+  for (const k of keys) {
+    const job = firm.callbackEscalations.get(k);
+    if (!job) continue;
+    if (job.timer) clearTimeout(job.timer);
+    firm.callbackEscalations.delete(k);
+    console.log(`[${firm.id}][callback-esc] Stopped ${k}${reason ? ` (${reason})` : ""}`);
+  }
+}
+
+async function runCallbackEscalationStep(firm, key) {
+  const job = firm.callbackEscalations?.get(key);
+  if (!job || job.stopped) return;
+  if (await threadHasStopSignal(firm, job.channelId, job.parentTs)) {
+    stopCallbackEscalation(firm, { key, reason: "thread stop signal" });
+    return;
+  }
+
+  const picker = job.lane === "legalassistant" ? nextLegalAssistantAssignees : nextLeadCallsAssignees;
+  const pick = picker(firm, job.snapshot, {
+    usedIds: new Set(job.usedIds || []),
+    step: job.step,
+    rotation: job.rotation,
+  });
+
+  if (pick.kind === "done") {
+    stopCallbackEscalation(firm, { key, reason: "exhausted" });
+    return;
+  }
+
+  const text = pick.kind === "managers"
+    ? formatManagerEscalation(pick.people, pick.message)
+    : formatCallbackRequest(pick.people);
+  const posted = await slackPostMessage(firm, {
+    channel: job.channelId,
+    text,
+    threadTs: job.parentTs,
+  });
+  if (posted?.ts) job.messageTs.push(posted.ts);
+  job.usedIds = pick.usedIds;
+  job.step += 1;
+  bumpRotation(firm, pick.people.length || 1);
+
+  if (pick.kind === "managers") {
+    stopCallbackEscalation(firm, { key, reason: "managers tagged" });
+    return;
+  }
+
+  const waitMs = (firm.callbackEscalation?.intervalSeconds || 50) * 1000;
+  job.timer = setTimeout(() => {
+    runCallbackEscalationStep(firm, key).catch((err) =>
+      console.error(`[${firm.id}][callback-esc] step error:`, err.message),
+    );
+  }, waitMs);
+}
+
+function maybeStartCallbackEscalations(firm, {
+  phone,
+  snapshot = [],
+  leadPost = null,
+  laPost = null,
+  eventType = "missed",
+} = {}) {
+  if (!["missed", "menu_hangup", "sona"].includes(eventType)) return;
+  if (leadPost?.parentTs && firm.slackLeadCallsChannelId) {
+    startCallbackEscalation(firm, {
+      lane: "lead",
+      phone,
+      channelId: leadPost.channelId || firm.slackLeadCallsChannelId,
+      parentTs: leadPost.parentTs,
+      snapshot,
+    });
+  }
+  if (laPost?.parentTs && firm.slackLegalAssistantChannelId && !isKnownBusiness(firm, phone)) {
+    startCallbackEscalation(firm, {
+      lane: "legalassistant",
+      phone,
+      channelId: laPost.channelId || firm.slackLegalAssistantChannelId,
+      parentTs: laPost.parentTs,
+      snapshot,
+    });
+  }
+}
+
+/**
+ * Start the "Please call back now" ladder in a channel thread.
+ * lane: "lead" | "legalassistant"
+ */
+function startCallbackEscalation(firm, {
+  lane,
+  phone,
+  channelId,
+  parentTs,
+  snapshot = [],
+} = {}) {
+  const cfg = firm.callbackEscalation || normalizeCallbackEscalation({});
+  if (!cfg.enabled) return;
+  if (!channelId || !parentTs) return;
+  if (!isBusinessHours(cfg)) {
+    console.log(`[${firm.id}][callback-esc] Skip ${lane} — outside business hours`);
+    return;
+  }
+  if (!firm.slackBotToken) return;
+
+  const key = escalationKey(lane, phone);
+  stopCallbackEscalation(firm, { key, reason: "restart" });
+  if (!firm.callbackEscalations) firm.callbackEscalations = new Map();
+  const job = {
+    lane,
+    phone,
+    channelId,
+    parentTs,
+    snapshot,
+    usedIds: [],
+    step: 0,
+    rotation: firm.callbackRotation || 0,
+    messageTs: [],
+    timer: null,
+    stopped: false,
+  };
+  firm.callbackEscalations.set(key, job);
+  console.log(`[${firm.id}][callback-esc] Starting ${lane} escalation for ${phone || "unknown"}`);
+  runCallbackEscalationStep(firm, key).catch((err) =>
+    console.error(`[${firm.id}][callback-esc] start error:`, err.message),
+  );
 }
 
 async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDirection) {
@@ -3891,27 +4120,37 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     }
     stopAnswerWatch(firm, callId);
     await clearSlackOnCallStatus(firm, callId);
-    const staffNote = await phoneStaffBlock(firm, {
+    const eventType = isMenuHangup ? "menu_hangup" : "missed";
+    const staff = await phoneStaffBlock(firm, {
       callId,
-      eventType: isMenuHangup ? "menu_hangup" : "missed",
+      eventType,
       ringSeconds: ringSecondsFromCall(call, { allowTotalDuration: true }),
     });
-    const intakeText = text + staffNote;
+    const intakeText = text + staff.text;
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
+    let leadPost = null;
     if (closedClient) {
       // Former client — surface in #lead-calls too; may be a new matter.
-      await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
+      leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       console.log(`[${firm.id}][call-check] Closed client — also sent to lead-calls`);
     } else {
-      await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
     }
-    if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
+    let laPost = null;
+    if (!isActiveClient(firm, externalPhone) && !isKnownBusiness(firm, externalPhone)) {
+      laPost = await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
     }
+    maybeStartCallbackEscalations(firm, {
+      phone: externalPhone,
+      snapshot: staff.snapshot,
+      leadPost,
+      laPost,
+      eventType,
+    });
     await postToCaseChannel(firm, text, from, to);
   } else if (isAnswered) {
     const isSona = answeredBy && (String(answeredBy).startsWith("SY") || String(answeredBy).toLowerCase().includes("sona"));
@@ -3925,10 +4164,10 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       await clearSlackOnCallStatus(firm, callId);
     }
     let text;
-    let staffNote = "";
+    let staff = { text: "", snapshot: [] };
     if (isSona) {
       text = `🤖 *Sona Call Completed*\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
-      staffNote = await phoneStaffBlock(firm, {
+      staff = await phoneStaffBlock(firm, {
         callId,
         eventType: "sona",
         ringSeconds: ringSecondsFromCall(call),
@@ -3939,11 +4178,21 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       text = `🧑 *Human Call Completed*${handlerLine}\nFrom: ${fromDisplay}\nTo: ${toDisplay}\n_(No transcript received from Quo)_`;
       await postToSlack(firm.slackWebhooks.humanCalls, text);
     }
-    const intakeText = text + staffNote;
-    if (shouldRouteToLegalAssistant(firm, from, to)) {
-      await postToLegalAssistant(firm, intakeText, from, to);
+    const intakeText = text + staff.text;
+    let laPost = null;
+    if (shouldRouteToLegalAssistant(firm, from, to) && !isKnownBusiness(firm, firm.phoneLines[from] ? to : from)) {
+      laPost = await postToLegalAssistant(firm, intakeText, from, to);
     }
-    await threadInLeadChannelIfMatch(firm, intakeText, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
+    const leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, isSona ? { mentionUsers: firm.leadThreadTagUsers } : {});
+    if (isSona) {
+      maybeStartCallbackEscalations(firm, {
+        phone: firm.phoneLines[from] ? to : from,
+        snapshot: staff.snapshot,
+        leadPost,
+        laPost,
+        eventType: "sona",
+      });
+    }
     // Sona answered (AI) — LA still needs to follow up. Human-answered was
     // already handled by a person, so don't ping the LA.
     await postToCaseChannel(firm, text, from, to, { includeLA: isSona });
@@ -4573,6 +4822,11 @@ async function handleCalls(firm, req, res) {
       console.log(`[${firm.id}][calls] Cached call ${callId}: ${from} → ${to} (status: ${status}, answeredAt: ${answeredAt || "none"}, answeredBy: ${obj.answeredBy || "none"}, forwardedTo: ${forwardedTo || "none"})`);
     }
 
+    if (["outgoing", "outbound"].includes(String(direction).toLowerCase())) {
+      const dialed = firm.phoneLines[from] ? to : from;
+      stopCallbackEscalation(firm, { phone: dialed, reason: "outbound call initiated" });
+    }
+
     if (eventType === "call.ringing" || status === "ringing") {
       if (direction === "incoming") {
         scheduleCallCheck(firm, callId, obj.from, obj.to, direction);
@@ -4679,12 +4933,13 @@ async function handleCalls(firm, req, res) {
     if (ringSeconds == null && priorCall?.ringingAt) {
       ringSeconds = Math.max(0, Math.round((Date.now() - priorCall.ringingAt) / 1000));
     }
-    const staffNote = await phoneStaffBlock(firm, {
+    const availabilityEvent = isMenuHangup ? "menu_hangup" : "missed";
+    const staff = await phoneStaffBlock(firm, {
       callId,
-      eventType: isMenuHangup ? "menu_hangup" : "missed",
+      eventType: availabilityEvent,
       ringSeconds,
     });
-    const intakeText = text + staffNote;
+    const intakeText = text + staff.text;
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
@@ -4692,23 +4947,33 @@ async function handleCalls(firm, req, res) {
     const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
     let slackPermalink = null;
+    let leadPost = null;
     if (closedClient) {
       // Former client — post into #lead-calls too (may be a new matter).
-      const leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
+      leadPost = await postLeadToSlack(firm, CLOSED_CLIENT_PREFIX + intakeText, from, to,
         { threadRetry: false, mentionUsers: firm.leadThreadTagUsers });
       slackPermalink = leadPost?.permalink || null;
       console.log(`[${firm.id}][calls] Closed client — ALSO sent to lead-calls`);
     } else {
-      const threadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
-      slackPermalink = threadPost?.permalink || null;
+      leadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, { mentionUsers: firm.leadThreadTagUsers });
+      slackPermalink = leadPost?.permalink || null;
     }
 
-    if (!isActiveClient(firm, externalPhone)) {
-      await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
+    let laPost = null;
+    if (!isActiveClient(firm, externalPhone) && !isKnownBusiness(firm, externalPhone)) {
+      laPost = await postToLegalAssistant(firm, closedClient ? CLOSED_CLIENT_PREFIX + intakeText : intakeText, from, to);
       console.log(`[${firm.id}][calls] ALSO sent to legalassistant-phone`);
     } else {
-      console.log(`[${firm.id}][calls] Skipping legalassistant-phone — existing client`);
+      console.log(`[${firm.id}][calls] Skipping legalassistant-phone — existing client or known business`);
     }
+
+    maybeStartCallbackEscalations(firm, {
+      phone: externalPhone,
+      snapshot: staff.snapshot,
+      leadPost,
+      laPost,
+      eventType: availabilityEvent,
+    });
 
     await postToCaseChannel(firm, text, from, to);
 
@@ -4991,17 +5256,18 @@ async function handleCallSummary(firm, req, res) {
       });
     }
     await clearSlackOnCallStatus(firm, callId);
-    const staffNote = sona
+    const staff = sona
       ? await phoneStaffBlock(firm, {
           callId,
           eventType: "sona",
           ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
         })
-      : "";
+      : { text: "", snapshot: [] };
 
     let slackMessagePermalink = null;
     let slackThreadPermalink = null;
     let leadParentTs = null;   // thread the intake confirmation under the lead post
+    let leadPost = null;
     // Slack routing is still isLead, and only inbound: qualified and
     // unqualified inbound leads (including outside-practice) open a new
     // #lead-calls post. Outbound staff work — calling a carrier, a vendor, or
@@ -5014,10 +5280,10 @@ async function handleCallSummary(firm, req, res) {
         : (isQualified ? "🔥 *Qualified Lead Call*" : "📋 *Lead Call*");
       
       const durationNote = callDurationSeconds != null ? ` (${callDurationSeconds}s)` : "";
-      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}${staffNote}`;
+      const leadText = `${qualTag}\nHandled By: ${handlerDisplay}\nFrom: ${fromDisplay}\nTo: ${toDisplay}${durationNote}\nSummary:\n${summary}${translation}${linkLine}${staff.text}`;
       
       const leadPostOpts = sona ? { mentionUsersIfThreaded: firm.leadThreadTagUsers } : {};
-      const leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
+      leadPost = await postLeadToSlack(firm, leadText, from, to, leadPostOpts);
       slackMessagePermalink = leadPost?.permalink || null;
       leadParentTs = leadPost?.parentTs || null;
       slackThreadPermalink = await getSlackThreadPermalink(
@@ -5044,11 +5310,12 @@ async function handleCallSummary(firm, req, res) {
       console.log(`[${firm.id}][call-summary] Sent to human-calls`);
     }
 
-    const intakeText = text + staffNote;
+    const intakeText = text + staff.text;
     let threadedInLeads = !!(isLead && isInbound);
     if (!threadedInLeads) {
       const threadOpts = sona ? { mentionUsers: firm.leadThreadTagUsers } : {};
       const threadPost = await threadInLeadChannelIfMatch(firm, intakeText, from, to, threadOpts);
+      if (threadPost) leadPost = threadPost;
       threadedInLeads = !!threadPost;
       slackMessagePermalink = threadPost?.permalink || null;
       leadParentTs = threadPost?.parentTs || null;
@@ -5057,11 +5324,24 @@ async function handleCallSummary(firm, req, res) {
     }
 
     const sonaLeadOverride = sona && isLead && isInbound;
-    if (isInbound && shouldRouteToLegalAssistant(firm, from, to) && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
-      await postToLegalAssistant(firm, intakeText, from, to);
+    const clientPhoneForEsc = firm.phoneLines[from] ? to : from;
+    let laPost = null;
+    if (isInbound && shouldRouteToLegalAssistant(firm, from, to) && !isKnownBusiness(firm, clientPhoneForEsc)
+        && (sonaLeadOverride || (!isLead && !threadedInLeads))) {
+      laPost = await postToLegalAssistant(firm, intakeText, from, to);
       console.log(`[${firm.id}][call-summary] ALSO sent to legalassistant-phone`);
     } else if (!isLead && !threadedInLeads && !isInbound) {
       console.log(`[${firm.id}][call-summary] Skipping legalassistant-phone — outbound (to=${to})`);
+    }
+
+    if (sona) {
+      maybeStartCallbackEscalations(firm, {
+        phone: clientPhoneForEsc,
+        snapshot: staff.snapshot,
+        leadPost,
+        laPost,
+        eventType: "sona",
+      });
     }
 
     // Callback request: a client (case open OR closed) spoke to someone and is
@@ -5510,6 +5790,7 @@ app.get("/admin/api/firms", requireAuth, (_req, res) => {
     phoneStaffText: formatPhoneStaffText(f.phoneStaff || []),
     callbackBotId: f.callbackBotId || "",
     callbackBotResolved: !!resolveCallbackBotMention(f),
+    callbackEscalation: f.callbackEscalation || normalizeCallbackEscalation({}),
     restrictToPhoneLines: !!f.restrictToPhoneLines,
     caseStatusConfig: {
       query: f.caseStatusConfig?.query || "",
@@ -5619,6 +5900,11 @@ function validateFirmBody(body) {
       leadThreadTagUsers: leadThreadTagUsers || [],
       phoneStaff,
       callbackBotId: typeof body?.callbackBotId === "string" ? body.callbackBotId.trim() : "",
+      callbackEscalation: normalizeCallbackEscalation(body?.callbackEscalation || {
+        enabled: body?.callbackEscalationEnabled,
+        managersText: body?.callbackManagers,
+        intervalSeconds: body?.callbackEscalationInterval,
+      }),
       restrictToPhoneLines: body && Object.prototype.hasOwnProperty.call(body, "restrictToPhoneLines")
         ? !!body.restrictToPhoneLines
         : true,
@@ -5740,6 +6026,7 @@ app.put("/admin/api/firms/:id", requireAuth, async (req, res) => {
   firm.leadThreadTagUsers = config.leadThreadTagUsers;
   firm.phoneStaff = normalizePhoneStaff(config);
   firm.callbackBotId = config.callbackBotId || "";
+  firm.callbackEscalation = normalizeCallbackEscalation(config.callbackEscalation || {});
   firm.restrictToPhoneLines = config.restrictToPhoneLines;
   firm.caseStatusConfig = normalizeCaseStatusConfig(config);
   firm.intakeConfig = normalizeIntakeConfig(config);

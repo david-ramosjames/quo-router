@@ -245,14 +245,29 @@
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
       <label for="firm-phone-staff">Phone Staff (answer-responsible)</label>
-      <textarea id="firm-phone-staff" name="phoneStaffText" rows="8" placeholder="timezone=America/Chicago
-Stephany=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00
-Valeria=U0CCCCCC=USDDDDDD | Mon-Fri 08:00-17:00 rings after 10s
+      <textarea id="firm-phone-staff" name="phoneStaffText" rows="10" placeholder="timezone=America/Chicago
+Liz=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00 la primary
+Valeria=U0CCCCCC=USDDDDDD | Mon-Fri 08:00-17:00 rings after 10s la secondary
+Roman=U0EEEEEE=USFFFFFF | Mon-Fri 08:00-17:00 rings after 10s intake
 Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <div class="hint">
         One per line: <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
-        Add <code>rings after 10s</code> for people the phone does not ring until the caller has waited 10 seconds. A missed call under 5 seconds says “Caller hung up, please call back” and does not say anyone should have answered. From 5 to 10 seconds, only the immediate group is “Available to answer (active, not on a call)”; the delayed group is “Please call back.”
-        Someone on a break or on a call is shown by name and status, with no @. The after-hours person is left off during the day and mentioned only when nobody’s shift covers the call.
+        Roles for callback escalation: <code>la primary</code> / <code>la secondary</code> (legal assistants) or <code>intake</code> (Roman / Andrea). Add <code>rings after 10s</code> when Quo does not ring them until 10 seconds.
+        The status list on missed/Sona posts uses names and checkmarks only (Jackie is still @-tagged after hours). Separate “Please call back now” posts tag people during business hours.
+      </div>
+
+      <h3 style="margin-top:24px">Callback escalation</h3>
+      <label class="checkbox-row">
+        <input type="checkbox" id="firm-esc-enabled" name="callbackEscalationEnabled" checked>
+        <span>Ask available staff to call back (business hours)</span>
+      </label>
+      <label for="firm-esc-managers">Managers (Jon / Jaymie Slack IDs)</label>
+      <input id="firm-esc-managers" name="callbackManagers" placeholder="U026P9FUKHC, U0ANAJK56LD">
+      <div class="hint">Tagged when phone staff are exhausted. Comma-separated Slack member IDs.</div>
+      <label for="firm-esc-interval">Escalation interval (seconds)</label>
+      <input id="firm-esc-interval" name="callbackEscalationInterval" type="number" min="10" step="1" value="50">
+      <div class="hint">
+        Mon–Fri 7am–6pm (America/Chicago). #lead-calls asks 1 LA + 1 Intake, then widens every interval. #legalassistant-phone asks 2 primary LAs first (then secondary), and skips known non-client contacts. Stops when someone outbound-calls, green-checks, or replies “handling” / “not needed”.
       </div>
 
       <h3 style="margin-top:24px">Credentials</h3>
@@ -681,6 +696,9 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
     form.leadThreadTagUsers.value = (f.leadThreadTagUsers || []).join(", ");
     form.phoneStaffText.value = f.phoneStaffText || "";
     form.callbackBotId.value = f.callbackBotId || "";
+    form.callbackEscalationEnabled.checked = f.callbackEscalation?.enabled !== false;
+    form.callbackManagers.value = (f.callbackEscalation?.managers || []).join(", ");
+    form.callbackEscalationInterval.value = f.callbackEscalation?.intervalSeconds || 50;
     form.restrictToPhoneLines.checked = !!f.restrictToPhoneLines;
     form.caseStatusQuery.value = f.caseStatusConfig?.query || "";
     form.caseClosedValues.value = (f.caseStatusConfig?.closedValues || []).join(", ");
@@ -871,6 +889,13 @@ DATABASE_SSL=                 # leave unset for managed DBs (SSL on by default)
       leadThreadTagUsers: parseTagUsers(form.leadThreadTagUsers.value),
       phoneStaffText: form.phoneStaffText.value,
       callbackBotId: form.callbackBotId.value.trim(),
+      callbackEscalation: {
+        enabled: form.callbackEscalationEnabled.checked,
+        managersText: form.callbackManagers.value,
+        intervalSeconds: form.callbackEscalationInterval.value
+          ? parseInt(form.callbackEscalationInterval.value, 10)
+          : 50,
+      },
       restrictToPhoneLines: form.restrictToPhoneLines.checked,
       caseStatusConfig: {
         query: form.caseStatusQuery.value.trim(),

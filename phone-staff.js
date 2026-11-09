@@ -96,27 +96,48 @@ export function normalizePhoneStaff(config) {
         afterHours: false,
         windows: [],
         timezone: null,
+        role: null,
+        tier: null,
         scheduleError: schedule.error,
       });
       continue;
     }
-      out.push({
-        name,
-        slackUserId,
-        quoUserId,
-        afterHours: !!schedule.afterHours,
-        windows: schedule.windows,
-        ringAfterSeconds: Math.max(0, Number(entry.ringAfterSeconds) || Number(schedule.ringAfterSeconds) || 0),
-        timezone: entry.timezone || tzDefault || (schedule.windows.length || schedule.afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
-      });
+    const afterHours = !!schedule.afterHours;
+    const role = entry.role || schedule.role || (afterHours ? "after_hours" : null);
+    const tier = entry.tier || schedule.tier || null;
+    out.push({
+      name,
+      slackUserId,
+      quoUserId,
+      afterHours,
+      windows: schedule.windows,
+      ringAfterSeconds: Math.max(0, Number(entry.ringAfterSeconds) || Number(schedule.ringAfterSeconds) || 0),
+      role: normalizeStaffRole(role, afterHours),
+      tier: normalizeStaffTier(tier),
+      timezone: entry.timezone || tzDefault || (schedule.windows.length || afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
+    });
   }
   return out;
+}
+
+function normalizeStaffRole(role, afterHours) {
+  const r = String(role || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (afterHours || r === "after_hours") return "after_hours";
+  if (r === "la" || r === "legal_assistant") return "la";
+  if (r === "intake") return "intake";
+  return null;
+}
+
+function normalizeStaffTier(tier) {
+  const t = String(tier || "").trim().toLowerCase();
+  if (t === "primary" || t === "secondary") return t;
+  return null;
 }
 
 function normalizeSchedule(entry) {
   const ringAfterSeconds = Math.max(0, Number(entry.ringAfterSeconds) || 0);
   if (entry.scheduleError) return { error: entry.scheduleError };
-  if (Array.isArray(entry.windows) || entry.afterHours || ringAfterSeconds > 0) {
+  if (Array.isArray(entry.windows) || entry.afterHours || ringAfterSeconds > 0 || entry.role || entry.tier) {
     const windows = [];
     for (const w of entry.windows || []) {
       const days = [...new Set((w.days || []).map((d) => Number(d)).filter((d) => d >= 0 && d <= 6))].sort((a, b) => a - b);
@@ -127,10 +148,16 @@ function normalizeSchedule(entry) {
       }
       windows.push({ days, startMin, endMin });
     }
-    return { afterHours: !!entry.afterHours, windows, ringAfterSeconds };
+    return {
+      afterHours: !!entry.afterHours,
+      windows,
+      ringAfterSeconds,
+      role: entry.role || null,
+      tier: entry.tier || null,
+    };
   }
   if (typeof entry.schedule === "string") return parseStaffSchedule(entry.schedule);
-  return { afterHours: false, windows: [], ringAfterSeconds: 0 };
+  return { afterHours: false, windows: [], ringAfterSeconds: 0, role: null, tier: null };
 }
 
 export function parsePhoneStaffText(text) {
@@ -180,6 +207,8 @@ export function parsePhoneStaffText(text) {
       afterHours: schedule.afterHours,
       windows: schedule.windows,
       ringAfterSeconds: schedule.ringAfterSeconds || 0,
+      role: schedule.role || null,
+      tier: schedule.tier || null,
       scheduleError: schedule.error || null,
     });
   }
@@ -201,19 +230,41 @@ export function formatPhoneStaffText(staff) {
 
 const RING_DELAY_PATTERN = /\brings?\s+after\s+(\d+)\s*(?:s|sec|secs|seconds)?\b/i;
 
+function extractRoleAndTier(text) {
+  let role = null;
+  let tier = null;
+  const rest = String(text || "")
+    .replace(/\b(?:role\s*=\s*)?(?:legal[\s-]?assistant|la)\b/ig, () => { role = "la"; return " "; })
+    .replace(/\b(?:role\s*=\s*)?intake\b/ig, () => { role = "intake"; return " "; })
+    .replace(/\b(?:tier\s*=\s*)?primary\b/ig, () => { tier = "primary"; return " "; })
+    .replace(/\b(?:tier\s*=\s*)?secondary\b/ig, () => { tier = "secondary"; return " "; });
+  return { role, tier, rest };
+}
+
 export function parseStaffSchedule(text) {
   const raw = String(text || "").trim();
-  if (!raw) return { afterHours: false, windows: [], ringAfterSeconds: 0 };
+  if (!raw) return { afterHours: false, windows: [], ringAfterSeconds: 0, role: null, tier: null };
   const delay = raw.match(RING_DELAY_PATTERN);
   const ringAfterSeconds = delay ? Number(delay[1]) : 0;
   let afterHours = false;
-  const rest = raw
-    .replace(new RegExp(RING_DELAY_PATTERN.source, "ig"), " ")
-    .replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; })
+  const roleTier = extractRoleAndTier(
+    raw
+      .replace(new RegExp(RING_DELAY_PATTERN.source, "ig"), " ")
+      .replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; }),
+  );
+  const rest = roleTier.rest
     .replace(/\s+/g, " ")
     .trim()
     .replace(/^[|;\s]+|[|;\s]+$/g, "");
-  if (!rest) return { afterHours, windows: [], ringAfterSeconds };
+  if (!rest) {
+    return {
+      afterHours,
+      windows: [],
+      ringAfterSeconds,
+      role: afterHours ? "after_hours" : roleTier.role,
+      tier: roleTier.tier,
+    };
+  }
   const windows = [];
   for (const chunk of rest.split(/\s*;\s*/).filter(Boolean)) {
     const m = chunk.match(/^([a-z][a-z,\-\s]*?)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|–|—|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)$/i);
@@ -226,7 +277,13 @@ export function parseStaffSchedule(text) {
     }
     windows.push({ days, startMin, endMin });
   }
-  return { afterHours, windows, ringAfterSeconds };
+  return {
+    afterHours,
+    windows,
+    ringAfterSeconds,
+    role: afterHours ? "after_hours" : roleTier.role,
+    tier: roleTier.tier,
+  };
 }
 
 function parseDays(spec) {
@@ -270,6 +327,8 @@ export function formatStaffSchedule(person) {
   const parts = (person?.windows || []).map((w) => `${formatDays(w.days)} ${formatClock(w.startMin)}-${formatClock(w.endMin)}`);
   if (person?.afterHours) parts.push("after-hours");
   if (person?.ringAfterSeconds > 0) parts.push(`rings after ${person.ringAfterSeconds}s`);
+  if (person?.role === "la") parts.push(person.tier === "secondary" ? "la secondary" : person.tier === "primary" ? "la primary" : "la");
+  else if (person?.role === "intake") parts.push("intake");
   return parts.join("; ");
 }
 
@@ -697,8 +756,11 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
 
 const FAST_HANGUP_SECONDS = 5;
 
-function checkedMentions(rows) {
-  return rows.map((r) => `✅ <@${r.slackUserId}>`).join("\n");
+function checkedNames(rows, { mention = false } = {}) {
+  return rows.map((r) => {
+    const who = mention ? `<@${r.slackUserId}>` : (r.name || r.slackUserId);
+    return `✅ ${who}`;
+  }).join("\n");
 }
 
 function plainStatus(row) {
@@ -713,9 +775,9 @@ function plainStatus(row) {
  * Under 5s nobody "should have answered". People with ringAfterSeconds only
  * count as available once the call rang at least that long.
  */
-function isFreeToAnswer(row) {
-  // Active, or inactive during shift with no Slack status set. Both should be
-  // @-mentioned. Break / lunch / on-call stay in the plain context list.
+export function isFreeToAnswer(row) {
+  // Active, or inactive during shift with no Slack status set.
+  // Break / lunch / on-call stay in the plain context list.
   return row.state === "available" || row.state === "after_hours" || row.state === "inactive";
 }
 
@@ -742,14 +804,21 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = 
   const lines = [];
   const ringLabel = formatRingDuration(ringSeconds);
   if (ringLabel) lines.push(`_Rang for ${ringLabel}_`);
+  // Status list uses names + checkmarks. Only the after-hours person is @-tagged.
+  const afterHoursOnly = [...couldAnswer, ...callbackOnly].length > 0
+    && [...couldAnswer, ...callbackOnly].every((r) => r.afterHoursDuty || r.state === "after_hours");
   if (fast) {
     const who = [...couldAnswer, ...callbackOnly];
-    if (who.length) lines.push(`*Caller hung up, please call back:*\n${checkedMentions(who)}`);
+    if (who.length) {
+      lines.push(`*Caller hung up, please call back:*\n${checkedNames(who, { mention: afterHoursOnly })}`);
+    }
   } else {
     if (couldAnswer.length) {
-      lines.push(`*Available to answer (active, not on a call):*\n${checkedMentions(couldAnswer)}`);
+      lines.push(`*Available to answer (active, not on a call):*\n${checkedNames(couldAnswer, { mention: afterHoursOnly })}`);
     }
-    if (callbackOnly.length) lines.push(`*Please call back:*\n${checkedMentions(callbackOnly)}`);
+    if (callbackOnly.length) {
+      lines.push(`*Please call back:*\n${checkedNames(callbackOnly, { mention: false })}`);
+    }
   }
   for (const row of context) {
     lines.push(`${row.name || row.slackUserId} (${plainStatus(row)})`);

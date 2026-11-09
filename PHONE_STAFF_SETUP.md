@@ -127,7 +127,7 @@ The Daily Call Report will then include **Available but did not answer** totals 
 1. Redeploy quo-router.
 2. Have a listed phone-staff member answer a test call → their Slack status should show **On a call** within a few seconds.
 3. End the call → status should clear / restore.
-4. Miss a test call during a listed person's scheduled hours. The staff list is added only on **#lead-calls** and **#legalassistant-phone**. Each person who should be tagged is on their own line with a check mark. #missed-calls and #sona-calls stay as the plain call notice. A call under 5 seconds says **Caller hung up, please call back**. People marked `rings after 10s` stay on **Please call back** until the call has rung that long. Someone on a break or on a call is shown by name and status, with no @. The after-hours person is left off during the day.
+4. Miss a test call during a listed person's scheduled hours. The staff list is added only on **#lead-calls** and **#legalassistant-phone**, with names and check marks (no @ except Jackie after hours). During business hours the router also posts **@person Please call back now** in that thread and escalates every 50s. Mark people `la primary`, `la secondary`, or `intake` in Phone Staff, and set Managers (Jon / Jaymie) under Callback escalation. #missed-calls and #sona-calls stay as the plain call notice.
 5. Check router logs for `[phone-staff]` lines.
 
 ---
