@@ -93,12 +93,14 @@ assert.equal(laFallback.people.every((p) => p.tier === "secondary"), true);
 
 assert.match(formatCallbackRequest(la0.people), /:rotating_light: <@.+> Please call back now/);
 assert.match(formatCallbackRequest(la0.people), /handling/);
-assert.match(formatCallbackRequest(la0.people), /calling/);
+assert.match(formatCallbackRequest(la0.people), /on it/);
 assert.match(formatCallbackRequest(la0.people), /white_check_mark/);
+assert.equal(replyMeansStop(formatCallbackRequest(la0.people)), false);
 assert.match(formatManagerEscalation(cfg.managers.map((id) => ({ slackUserId: id })), "No response has been received."), /No response/);
 assert.equal(replyMeansStop("handling this one"), true);
 assert.equal(replyMeansStop("not needed"), true);
 assert.equal(replyMeansStop("calling now"), true);
+assert.equal(replyMeansStop("on it"), false); // phrase in hint only — humans still use handling/calling
 assert.equal(replyMeansStop("looking into it"), false);
 assert.equal(reactionMeansStop("white_check_mark"), true);
 assert.equal(reactionMeansStop("thumbsup"), false);

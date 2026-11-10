@@ -805,7 +805,7 @@ function normalizePersonNameKey(name) {
 /**
  * Resolve topic mention tokens to Slack user IDs via firm.slackUsers and
  * configured phoneStaff names. Returns { inbound, outbound, attorney, las,
- * answerIds } where answerIds is Inbound ∪ LAs (who should take inbound misses).
+ * answerIds } where answerIds is Inbound ∪ Outbound ∪ LAs (Attorney excluded).
  */
 export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const map = slackUsers instanceof Map ? slackUsers : new Map(Object.entries(slackUsers || {}));
@@ -829,7 +829,8 @@ export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const outbound = resolveList(parsed?.outbound);
   const attorney = resolveList(parsed?.attorney);
   const las = resolveList(parsed?.las);
-  const answerIds = new Set([...inbound, ...las]);
+  // Outbound staff (e.g. Roman) still answer/tag on inbound misses when free.
+  const answerIds = new Set([...inbound, ...outbound, ...las]);
   return {
     inbound,
     outbound,
@@ -880,9 +881,6 @@ export async function fetchPhoneDutyTopic(firm) {
 function dutyTopicExclusionReason(roster, slackUserId) {
   const id = String(slackUserId || "").toUpperCase();
   if (!id) return "not on today's topic";
-  if ((roster?.outbound || []).some((x) => String(x).toUpperCase() === id)) {
-    return "outbound today";
-  }
   if ((roster?.attorney || []).some((x) => String(x).toUpperCase() === id)) {
     return "attorney today";
   }
@@ -890,23 +888,35 @@ function dutyTopicExclusionReason(roster, slackUserId) {
 }
 
 /**
- * During business hours, only people listed under Inbound or LAs in today's
- * channel topic are eligible to be Available / escalated. Outbound + Attorney
- * stay listed on the topic but are not asked to answer inbound misses.
+ * During business hours, people listed under Inbound, Outbound, or LAs on today's
+ * channel topic are eligible to be Available / escalated. Attorney is excluded.
  * After-hours coverage is unchanged. If the topic is missing or empty, keep
  * the existing phoneStaff schedule.
  */
+function dutySectionForId(roster, slackUserId) {
+  const id = String(slackUserId || "").toUpperCase();
+  if ((roster?.inbound || []).some((x) => String(x).toUpperCase() === id)) return "inbound";
+  if ((roster?.outbound || []).some((x) => String(x).toUpperCase() === id)) return "outbound";
+  if ((roster?.las || []).some((x) => String(x).toUpperCase() === id)) return "las";
+  if ((roster?.attorney || []).some((x) => String(x).toUpperCase() === id)) return "attorney";
+  return null;
+}
+
 export function applyDutyTopicFilter(rows, roster, { enforce = true } = {}) {
   if (!enforce || !roster?.hasRoster) return rows || [];
   return (rows || []).map((row) => {
     if (row.afterHoursDuty || row.state === "after_hours") return row;
     if (row.state === "off_shift" || row.state === "unknown") return row;
     const id = String(row.slackUserId || "").toUpperCase();
-    if (roster.answerIds.has(id)) return row;
+    const dutySection = dutySectionForId(roster, id);
+    if (roster.answerIds.has(id)) {
+      return { ...row, dutySection: dutySection || row.dutySection || null };
+    }
     return {
       ...row,
       state: "off_topic",
       tag: false,
+      dutySection,
       statusText: dutyTopicExclusionReason(roster, id),
     };
   });
@@ -982,7 +992,10 @@ const FAST_HANGUP_SECONDS = 5;
 
 function warningName(row, { mention = false } = {}) {
   const base = mention ? `<@${row.slackUserId}>` : (row.name || row.slackUserId);
-  const who = row.state === "inactive" ? `${base} (inactive)` : base;
+  const notes = [];
+  if (row.state === "inactive") notes.push("inactive");
+  if (row.dutySection === "outbound") notes.push("outbound");
+  const who = notes.length ? `${base} (${notes.join(", ")})` : base;
   // :warning: (not a green check) — these people should have answered.
   return `:warning: ${who}`;
 }

@@ -20,7 +20,16 @@ const CHECK_REACTIONS = new Set([
 ]);
 
 export const CALLBACK_STOP_HINT =
-  `_React :white_check_mark: or reply *handling* / *calling* if you're taking this — that stops further tags._`;
+  `_React :white_check_mark: or reply *handling* / *on it* if you're taking this — that stops further tags._`;
+
+/** True when a human reply means stop escalating (ignore our own hint text). */
+export function replyMeansStop(text) {
+  const raw = String(text || "");
+  // Our own instruction line contains words like "handling" — never treat it as a stop.
+  if (/stops further tags/i.test(raw)) return false;
+  if (/please call back now/i.test(raw)) return false;
+  return STOP_REPLY.test(raw);
+}
 
 export function normalizeCallbackEscalation(raw = {}) {
   const src = raw && typeof raw === "object" ? raw : {};
@@ -238,10 +247,6 @@ export function formatManagerEscalation(people, message) {
   if (!people?.length) return "";
   const tags = people.map((p) => `<@${p.slackUserId}>`).join(" ");
   return `:rotating_light: ${tags} ${message || "Please step in on this callback."}\n${CALLBACK_STOP_HINT}`;
-}
-
-export function replyMeansStop(text) {
-  return STOP_REPLY.test(String(text || ""));
 }
 
 export function reactionMeansStop(reaction) {

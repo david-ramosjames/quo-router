@@ -3891,6 +3891,20 @@ async function slackPostMessage(firm, { channel, text, threadTs = null }) {
   return { ts: json.ts, channelId: channel, parentTs: threadTs || json.ts };
 }
 
+async function ensureSlackBotUserId(firm) {
+  if (firm.slackBotUserId || !firm.slackBotToken) return firm.slackBotUserId || null;
+  try {
+    const res = await fetch("https://slack.com/api/auth.test", {
+      headers: { Authorization: `Bearer ${firm.slackBotToken}` },
+    });
+    const json = await res.json();
+    if (json.ok && json.user_id) firm.slackBotUserId = json.user_id;
+  } catch (err) {
+    console.warn(`[${firm.id}][callback-esc] auth.test failed:`, err.message);
+  }
+  return firm.slackBotUserId || null;
+}
+
 async function threadHasStopSignal(firm, channelId, parentTs) {
   if (!firm.slackBotToken || !channelId || !parentTs) return false;
   try {
@@ -3906,7 +3920,19 @@ async function threadHasStopSignal(firm, channelId, parentTs) {
       console.warn(`[${firm.id}][callback-esc] conversations.replies failed: ${json.error}`);
       return false;
     }
+    const botId = await ensureSlackBotUserId(firm);
     for (const msg of json.messages || []) {
+      // Parent message is included as messages[0]; only thread replies count.
+      if (msg.ts && parentTs && String(msg.ts) === String(parentTs)) continue;
+      const fromBot = botId && msg.user && String(msg.user) === String(botId);
+      // Ignore text on our own escalation posts (the hint used to match "calling").
+      // Still honor a green-check reaction on our ask (someone claiming it).
+      if (fromBot) {
+        for (const rx of msg.reactions || []) {
+          if (reactionMeansStop(rx.name) && (rx.count || 0) > 0) return true;
+        }
+        continue;
+      }
       if (replyMeansStop(msg.text || "")) return true;
       for (const rx of msg.reactions || []) {
         if (reactionMeansStop(rx.name) && (rx.count || 0) > 0) return true;
