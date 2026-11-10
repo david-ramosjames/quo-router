@@ -4,10 +4,12 @@ import {
   isBusinessHours,
   nextLeadCallsAssignees,
   nextLegalAssistantAssignees,
+  nextWebformAssignees,
   formatCallbackRequest,
   formatManagerEscalation,
   replyMeansStop,
   reactionMeansStop,
+  WEBFORM_ESCALATION_INTERVAL_SECONDS,
 } from "./callback-escalation.js";
 
 const cfg = normalizeCallbackEscalation({
@@ -104,6 +106,33 @@ assert.equal(replyMeansStop("on it"), false); // phrase in hint only — humans 
 assert.equal(replyMeansStop("looking into it"), false);
 assert.equal(reactionMeansStop("white_check_mark"), true);
 assert.equal(reactionMeansStop("thumbsup"), false);
+assert.equal(WEBFORM_ESCALATION_INTERVAL_SECONDS, 120);
+
+// Webform / chat: outbound → inbound → LAs, one at a time.
+const webSnap = [
+  { name: "Roman", slackUserId: "UROM", state: "available", dutySection: "outbound", tag: true },
+  { name: "Andrea", slackUserId: "UAND", state: "available", dutySection: "inbound", tag: true },
+  { name: "Stephany", slackUserId: "USTEPH", state: "available", dutySection: "las", tag: true },
+  { name: "Liz", slackUserId: "ULIZ", state: "available", dutySection: "las", tag: true },
+];
+const web0 = nextWebformAssignees(firm, webSnap, { step: 0, rotation: 0 });
+assert.equal(web0.kind, "request");
+assert.equal(web0.people.length, 1);
+assert.equal(web0.people[0].slackUserId, "UROM");
+const web1 = nextWebformAssignees(firm, webSnap, { usedIds: new Set(web0.usedIds), step: 1, rotation: 1 });
+assert.equal(web1.people[0].slackUserId, "UAND");
+const web2 = nextWebformAssignees(firm, webSnap, { usedIds: new Set(web1.usedIds), step: 2, rotation: 2 });
+assert.equal(web2.people[0].dutySection, "las");
+let webUsed = new Set(web2.usedIds);
+while (true) {
+  const next = nextWebformAssignees(firm, webSnap, { usedIds: webUsed, step: 10, rotation: 0 });
+  if (next.kind !== "request") {
+    assert.equal(next.kind, "managers");
+    assert.ok(next.people.some((p) => p.slackUserId === "UJON1"));
+    break;
+  }
+  webUsed = new Set(next.usedIds);
+}
 
 // Inactive people are asked only after active options in that role are used.
 const mixedSnap = allFree.map((p) => (

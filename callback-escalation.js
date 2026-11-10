@@ -10,6 +10,8 @@ import {
 } from "./phone-staff.js";
 
 export const DEFAULT_ESCALATION_INTERVAL_SECONDS = 50;
+/** Web form / chat callback ladder: one person at a time, slower than missed-call tags. */
+export const WEBFORM_ESCALATION_INTERVAL_SECONDS = 120;
 
 const STOP_REPLY = /\b(handling|not needed|calling)\b/i;
 const CHECK_REACTIONS = new Set([
@@ -188,6 +190,58 @@ export function nextLeadCallsAssignees(firm, snapshot, { usedIds = new Set(), st
     people: managers,
     usedIds: [...used, ...managers.map((m) => m.slackUserId)],
     message: "No phone staff left to ask — please manually tag a paralegal or attorney.",
+  };
+}
+
+/**
+ * Web form / chat callback ladder (one person per step):
+ *   outbound topic → inbound topic → LAs → managers
+ * Interval is typically 120s (set on the job by the caller).
+ */
+export function nextWebformAssignees(firm, snapshot, { usedIds = new Set(), step = 0, rotation = 0 } = {}) {
+  const used = new Set(usedIds);
+  const free = freeFromSnapshot(snapshot);
+  const staffById = new Map(
+    (firm.phoneStaff || []).map((p) => [String(p.slackUserId || "").toUpperCase(), p]),
+  );
+  const asPeople = (rows) => rows.map((r) => {
+    const configured = staffById.get(String(r.slackUserId || "").toUpperCase());
+    return {
+      name: r.name || configured?.name || r.slackUserId,
+      slackUserId: r.slackUserId,
+      state: r.state || "available",
+      role: r.dutySection || configured?.role || "la",
+      tier: configured?.tier || null,
+      dutySection: r.dutySection || null,
+    };
+  });
+
+  const outbound = asPeople(free.filter((r) => r.dutySection === "outbound"));
+  const inbound = asPeople(free.filter((r) => r.dutySection === "inbound"));
+  const las = asPeople(free.filter((r) => {
+    if (r.dutySection === "las") return true;
+    const configured = staffById.get(String(r.slackUserId || "").toUpperCase());
+    return configured?.role === "la" && r.dutySection !== "outbound" && r.dutySection !== "inbound";
+  }));
+
+  // Walk sections in order; within a section prefer Slack-active, then inactive.
+  for (const pool of [outbound, inbound, las]) {
+    const pick = byRotationPreferActive(pool, used, 1, rotation + step);
+    if (pick.length) {
+      for (const p of pick) used.add(p.slackUserId);
+      return { kind: "request", people: pick, usedIds: [...used] };
+    }
+  }
+
+  const managers = (firm.callbackEscalation?.managers || [])
+    .filter((id) => !used.has(id))
+    .map((slackUserId) => ({ name: slackUserId, slackUserId, role: "manager" }));
+  if (!managers.length) return { kind: "done", people: [], usedIds: [...used] };
+  return {
+    kind: "managers",
+    people: managers,
+    usedIds: [...used, ...managers.map((m) => m.slackUserId)],
+    message: "No phone staff left to ask on this web lead — please manually tag someone.",
   };
 }
 

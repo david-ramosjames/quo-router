@@ -130,8 +130,10 @@ The Daily Call Report will then include **Available but did not answer** totals 
 4. Miss a test call during a listed person's scheduled hours. The staff list is added only on **#lead-calls** and **#legalassistant-phone**, with names and check marks (no @ except Jackie after hours). During business hours the router also posts **@person Please call back now** in that thread and escalates every 50s. Mark people `la primary`, `la secondary`, or `intake` in Phone Staff, and set Managers (Jon / Jaymie) under Callback escalation. #missed-calls and #sona-calls stay as the plain call notice.
 5. Set the **#legalassistant-phone** (or #lead-calls) channel topic each day to the duty roster, e.g.  
    `Inbound @Andrea Alvarado | Outbound @Roman | Attorney @Michael Tucker | LAs @Liz Abad-Cruz @Stephany Guerra @Valeria @Claudia`  
-   Only **Inbound** and **LAs** are asked to answer inbound missed/Sona calls.
-6. Check router logs for `[phone-staff]` lines.
+   Missed/Sona ask Inbound + Outbound + LAs; web forms ask **Outbound → Inbound → LAs** (then managers).
+6. **Web form / chat callbacks** — follow-up-text detects the form post and calls  
+   `POST /api/firms/:firmId/callback-escalation/start` with `lane=webform`. Quo-router then tags one person every **2 minutes**, then Managers. On follow-up-text set `QUO_ROUTER_URL`, `QUO_ROUTER_FIRM_ID`, and `QUO_ROUTER_REPORT_TOKEN` (same token as the report API).
+7. Check router logs for `[phone-staff]` / `[callback-esc]` lines.
 
 ---
 

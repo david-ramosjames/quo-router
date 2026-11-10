@@ -269,7 +269,7 @@ Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <label for="firm-esc-interval">Escalation interval (seconds)</label>
       <input id="firm-esc-interval" name="callbackEscalationInterval" type="number" min="10" step="1" value="50">
       <div class="hint">
-        Mon–Fri 7am–6pm (America/Chicago). #lead-calls asks 1 LA + 1 Intake, then widens every interval. #legalassistant-phone asks 2 primary LAs first (then secondary), and skips known non-client contacts. When the same call is also in #lead-calls, LA gets a “same as leads” note and no callback tags. Stops when someone outbound-calls, green-checks, or replies “handling” / “calling” / “not needed”.
+        Mon–Fri 7am–6pm (America/Chicago). #lead-calls asks 1 LA + 1 Intake, then widens every interval. #legalassistant-phone asks 2 primary LAs first (then secondary), and skips known non-client contacts. When the same call is also in #lead-calls, LA gets a “same as leads” note and no callback tags. Web form/chat leads (via follow-up-text) ask Outbound → Inbound → LAs one at a time every 2 minutes, then Managers. Stops when someone outbound-calls, green-checks, or replies “handling” / “calling” / “not needed”.
       </div>
 
       <h3 style="margin-top:24px">Credentials</h3>

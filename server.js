@@ -18,17 +18,20 @@ import {
   ensureAvailabilityTable,
   queryAvailabilityMisses,
   phoneStaffStatusSummary,
+  snapshotPhoneStaffAvailability,
 } from "./phone-staff.js";
 import {
   normalizeCallbackEscalation,
   isBusinessHours,
   nextLeadCallsAssignees,
   nextLegalAssistantAssignees,
+  nextWebformAssignees,
   formatCallbackRequest,
   formatManagerEscalation,
   replyMeansStop,
   reactionMeansStop,
   bumpRotation,
+  WEBFORM_ESCALATION_INTERVAL_SECONDS,
 } from "./callback-escalation.js";
 
 // Prefer IPv4 when resolving hostnames. Some hosts (e.g. Railway) have no
@@ -3965,6 +3968,12 @@ function stopCallbackEscalation(firm, { phone = null, lane = null, key = null, r
   }
 }
 
+function escalationPicker(lane) {
+  if (lane === "legalassistant") return nextLegalAssistantAssignees;
+  if (lane === "webform") return nextWebformAssignees;
+  return nextLeadCallsAssignees;
+}
+
 async function runCallbackEscalationStep(firm, key) {
   const job = firm.callbackEscalations?.get(key);
   if (!job || job.stopped) return;
@@ -3973,7 +3982,7 @@ async function runCallbackEscalationStep(firm, key) {
     return;
   }
 
-  const picker = job.lane === "legalassistant" ? nextLegalAssistantAssignees : nextLeadCallsAssignees;
+  const picker = escalationPicker(job.lane);
   const pick = picker(firm, job.snapshot, {
     usedIds: new Set(job.usedIds || []),
     step: job.step,
@@ -4003,7 +4012,7 @@ async function runCallbackEscalationStep(firm, key) {
     return;
   }
 
-  const waitMs = (firm.callbackEscalation?.intervalSeconds || 50) * 1000;
+  const waitMs = (Number(job.intervalSeconds) || firm.callbackEscalation?.intervalSeconds || 50) * 1000;
   job.timer = setTimeout(() => {
     runCallbackEscalationStep(firm, key).catch((err) =>
       console.error(`[${firm.id}][callback-esc] step error:`, err.message),
@@ -4078,7 +4087,7 @@ async function maybeStartCallbackEscalations(firm, {
 
 /**
  * Start the "Please call back now" ladder in a channel thread.
- * lane: "lead" | "legalassistant"
+ * lane: "lead" | "legalassistant" | "webform"
  */
 function startCallbackEscalation(firm, {
   lane,
@@ -4086,25 +4095,30 @@ function startCallbackEscalation(firm, {
   channelId,
   parentTs,
   snapshot = [],
+  intervalSeconds = null,
 } = {}) {
   const cfg = firm.callbackEscalation || normalizeCallbackEscalation({});
-  if (!cfg.enabled) return;
-  if (!channelId || !parentTs) return;
+  if (!cfg.enabled) return false;
+  if (!channelId || !parentTs) return false;
   if (!isBusinessHours(cfg)) {
     console.log(`[${firm.id}][callback-esc] Skip ${lane} — outside business hours`);
-    return;
+    return false;
   }
-  if (!firm.slackBotToken) return;
+  if (!firm.slackBotToken) return false;
 
   const key = escalationKey(lane, phone);
   stopCallbackEscalation(firm, { key, reason: "restart" });
   if (!firm.callbackEscalations) firm.callbackEscalations = new Map();
+  const defaultInterval = lane === "webform"
+    ? WEBFORM_ESCALATION_INTERVAL_SECONDS
+    : (cfg.intervalSeconds || 50);
   const job = {
     lane,
     phone,
     channelId,
     parentTs,
     snapshot,
+    intervalSeconds: Number(intervalSeconds) > 0 ? Number(intervalSeconds) : defaultInterval,
     usedIds: [],
     step: 0,
     rotation: firm.callbackRotation || 0,
@@ -4113,10 +4127,14 @@ function startCallbackEscalation(firm, {
     stopped: false,
   };
   firm.callbackEscalations.set(key, job);
-  console.log(`[${firm.id}][callback-esc] Starting ${lane} escalation for ${phone || "unknown"}`);
+  console.log(
+    `[${firm.id}][callback-esc] Starting ${lane} escalation for ${phone || "unknown"} `
+    + `(every ${job.intervalSeconds}s)`,
+  );
   runCallbackEscalationStep(firm, key).catch((err) =>
     console.error(`[${firm.id}][callback-esc] start error:`, err.message),
   );
+  return true;
 }
 
 async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDirection) {
@@ -5600,6 +5618,71 @@ app.get("/api/reports/:firmId/availability-misses", async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error(`[${firm.id}][reports] availability-misses error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// follow-up-text (and similar) starts callback tagging for web form / chat leads.
+// Body: { lane, channelId, parentTs, phone?, intervalSeconds? }
+// lane "webform" = outbound → inbound → LAs (one at a time) → managers, default 120s.
+app.post("/api/firms/:firmId/callback-escalation/start", async (req, res) => {
+  const firm = getFirm(req.params.firmId);
+  if (!firm) return res.status(404).json({ error: `Unknown firm: ${req.params.firmId}` });
+  if (!requireReportToken(firm, req, res)) return;
+
+  const lane = String(req.body?.lane || "webform").trim() || "webform";
+  const channelId = String(req.body?.channelId || req.body?.channel || "").trim();
+  const parentTs = String(req.body?.parentTs || req.body?.threadTs || "").trim();
+  const phone = String(req.body?.phone || "").trim() || null;
+  const intervalSeconds = req.body?.intervalSeconds != null
+    ? Number(req.body.intervalSeconds)
+    : null;
+
+  if (!channelId || !parentTs) {
+    return res.status(400).json({ error: "channelId and parentTs are required" });
+  }
+  if (!["webform", "lead", "legalassistant"].includes(lane)) {
+    return res.status(400).json({ error: `Unsupported lane: ${lane}` });
+  }
+
+  try {
+    const { rows } = await snapshotPhoneStaffAvailability(firm);
+    const started = startCallbackEscalation(firm, {
+      lane,
+      phone,
+      channelId,
+      parentTs,
+      snapshot: rows,
+      intervalSeconds: lane === "webform"
+        ? (Number.isFinite(intervalSeconds) && intervalSeconds >= 10
+          ? intervalSeconds
+          : WEBFORM_ESCALATION_INTERVAL_SECONDS)
+        : intervalSeconds,
+    });
+    if (!started) {
+      return res.status(409).json({
+        ok: false,
+        started: false,
+        reason: "not_started",
+        detail: "Escalation disabled, outside business hours, or Slack not configured",
+      });
+    }
+    res.json({
+      ok: true,
+      started: true,
+      lane,
+      channelId,
+      parentTs,
+      phone,
+      intervalSeconds: lane === "webform"
+        ? (Number.isFinite(intervalSeconds) && intervalSeconds >= 10
+          ? intervalSeconds
+          : WEBFORM_ESCALATION_INTERVAL_SECONDS)
+        : (firm.callbackEscalation?.intervalSeconds || 50),
+      availableCount: rows.filter((r) => r.state === "available" || r.state === "inactive").length,
+    });
+  } catch (err) {
+    console.error(`[${firm.id}][callback-esc] start API error:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
