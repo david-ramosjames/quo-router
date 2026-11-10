@@ -141,10 +141,11 @@ For each configured phone-staff member at the moment of a missed or Sona call:
 
 | State | Tagged? |
 |-------|---------|
-| ✅ Slack-active, on shift, on today's topic (Inbound/LAs), no blocking status, not on a call | Yes (tagged first) |
+| ✅ Slack-active, on shift, on today's topic (Inbound/LAs/Outbound), no blocking status, not on a call | Yes (tagged first) |
 | 💤 inactive/offline during their shift, on today's topic | Counts as Available Missed; shown with :warning: (inactive); callback-tagged last |
 | 🌙 after-hours person, and nobody's shift covers this moment | Yes |
-| 📋 on phone staff but not on today's Inbound/LAs topic | No (shown :no_entry_sign:; not tagged; not counted) |
+| 📋 on phone staff but not on today's Inbound/LAs/Outbound topic | No (shown :no_entry_sign:; not tagged; not counted) |
+| 👔 listed under Attorney on today's topic | No for inbound misses (shown as attorney today) |
 | 📞 on a call | No |
 | 🚫 Slack status such as lunch, break, translating, huddle, meeting, PTO | No |
 | ⏸️ outside their scheduled hours | No |
