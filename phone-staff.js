@@ -805,7 +805,7 @@ function normalizePersonNameKey(name) {
 /**
  * Resolve topic mention tokens to Slack user IDs via firm.slackUsers and
  * configured phoneStaff names. Returns { inbound, outbound, attorney, las,
- * answerIds } where answerIds is Inbound ∪ LAs (who should take inbound misses).
+ * answerIds } where answerIds is Inbound ∪ LAs ∪ Outbound (who should take inbound misses).
  */
 export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const map = slackUsers instanceof Map ? slackUsers : new Map(Object.entries(slackUsers || {}));
@@ -829,7 +829,7 @@ export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const outbound = resolveList(parsed?.outbound);
   const attorney = resolveList(parsed?.attorney);
   const las = resolveList(parsed?.las);
-  const answerIds = new Set([...inbound, ...las]);
+  const answerIds = new Set([...inbound, ...las, ...outbound]);
   return {
     inbound,
     outbound,
@@ -890,11 +890,10 @@ function dutyTopicExclusionReason(roster, slackUserId) {
 }
 
 /**
- * During business hours, only people listed under Inbound or LAs in today's
- * channel topic are eligible to be Available / escalated. Outbound + Attorney
- * stay listed on the topic but are not asked to answer inbound misses.
- * After-hours coverage is unchanged. If the topic is missing or empty, keep
- * the existing phoneStaff schedule.
+ * During business hours, only people listed under Inbound, LAs, or Outbound in
+ * today's channel topic are eligible to be Available / escalated. Attorney
+ * section is ignored for inbound missed calls. After-hours coverage is unchanged.
+ * If the topic is missing or empty, keep the existing phoneStaff schedule.
  */
 export function applyDutyTopicFilter(rows, roster, { enforce = true } = {}) {
   if (!enforce || !roster?.hasRoster) return rows || [];

@@ -213,7 +213,7 @@ assert.deepEqual(aliasTopic.las, ["ULIZ444", "USTE555"]);
 const aliasRoster = resolvePhoneDutyRoster(aliasTopic, new Map());
 assert.ok(aliasRoster.answerIds.has("UAND111"));
 assert.ok(aliasRoster.answerIds.has("ULIZ444"));
-assert.equal(aliasRoster.answerIds.has("UROM222"), false);
+assert.ok(aliasRoster.answerIds.has("UROM222")); // outbound included
 
 const users = new Map([
   ["andrea alvarado", "UAND111"],
@@ -230,7 +230,7 @@ assert.equal(dutyRoster.hasRoster, true);
 assert.ok(dutyRoster.answerIds.has("UAND111"));
 assert.ok(dutyRoster.answerIds.has("ULIZ444"));
 assert.ok(dutyRoster.answerIds.has("UVAL666"));
-assert.equal(dutyRoster.answerIds.has("UROM222"), false); // outbound only
+assert.ok(dutyRoster.answerIds.has("UROM222")); // outbound included
 assert.equal(dutyRoster.answerIds.has("UJIS888"), false); // not on topic
 
 const jisselaActive = { name: "Jissela", slackUserId: "UJIS888", state: "available", tag: true };
@@ -240,18 +240,18 @@ const filtered = applyDutyTopicFilter([jisselaActive, lizActive, romanActive], d
 assert.equal(filtered.find((r) => r.slackUserId === "UJIS888").state, "off_topic");
 assert.equal(filtered.find((r) => r.slackUserId === "UJIS888").statusText, "not on today's topic");
 assert.equal(filtered.find((r) => r.slackUserId === "UJIS888").tag, false);
-assert.equal(filtered.find((r) => r.slackUserId === "UROM222").state, "off_topic");
-assert.equal(filtered.find((r) => r.slackUserId === "UROM222").statusText, "outbound today");
+assert.equal(filtered.find((r) => r.slackUserId === "UROM222").state, "available"); // outbound included
+assert.equal(filtered.find((r) => r.slackUserId === "UROM222").tag, true); // outbound tagged
 assert.equal(filtered.find((r) => r.slackUserId === "ULIZ444").state, "available");
 assert.equal(filtered.find((r) => r.slackUserId === "ULIZ444").tag, true);
 
 const topicBlock = formatAvailabilitySlackBlock(filtered, { ringSeconds: 20 });
 assert.match(topicBlock, /:warning: Liz/);
+assert.match(topicBlock, /:warning: Roman/); // outbound included in available list
 assert.match(topicBlock, /:no_entry_sign: Jissela \(not on today's topic\)/);
-assert.match(topicBlock, /:no_entry_sign: Roman \(outbound today\)/);
 const offTopicMiss = noticeGroups(filtered, 20);
 assert.equal(offTopicMiss.accountable.some((r) => r.slackUserId === "UJIS888"), false);
-assert.equal(offTopicMiss.accountable.some((r) => r.slackUserId === "UROM222"), false);
+assert.ok(offTopicMiss.accountable.some((r) => r.slackUserId === "UROM222")); // outbound accountable
 
 assert.deepEqual(
   dutySlackUserIdsFromSnapshot(filtered, dutyRoster, { enforce: true }).sort(),
