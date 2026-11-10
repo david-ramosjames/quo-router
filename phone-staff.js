@@ -877,11 +877,24 @@ export async function fetchPhoneDutyTopic(firm) {
   return fallback;
 }
 
+function dutyTopicExclusionReason(roster, slackUserId) {
+  const id = String(slackUserId || "").toUpperCase();
+  if (!id) return "not on today's topic";
+  if ((roster?.outbound || []).some((x) => String(x).toUpperCase() === id)) {
+    return "outbound today";
+  }
+  if ((roster?.attorney || []).some((x) => String(x).toUpperCase() === id)) {
+    return "attorney today";
+  }
+  return "not on today's topic";
+}
+
 /**
  * During business hours, only people listed under Inbound or LAs in today's
  * channel topic are eligible to be Available / escalated. Outbound + Attorney
- * are ignored for inbound missed calls. After-hours coverage is unchanged.
- * If the topic is missing or empty, keep the existing phoneStaff schedule.
+ * stay listed on the topic but are not asked to answer inbound misses.
+ * After-hours coverage is unchanged. If the topic is missing or empty, keep
+ * the existing phoneStaff schedule.
  */
 export function applyDutyTopicFilter(rows, roster, { enforce = true } = {}) {
   if (!enforce || !roster?.hasRoster) return rows || [];
@@ -894,7 +907,7 @@ export function applyDutyTopicFilter(rows, roster, { enforce = true } = {}) {
       ...row,
       state: "off_topic",
       tag: false,
-      statusText: "not on today's topic",
+      statusText: dutyTopicExclusionReason(roster, id),
     };
   });
 }
