@@ -676,6 +676,22 @@ function blockedByPhoneLineFilter(firm, from, to) {
   return !isOwnLine(firm, from) && !isOwnLine(firm, to);
 }
 
+/** Firm line → firm line (e.g. Main → RJL Transfers). Not a client miss. */
+function isInternalFirmLineCall(firm, from, to) {
+  return isOwnLine(firm, from) && isOwnLine(firm, to);
+}
+
+function firmLineLabelFor(firm, number) {
+  if (!number) return null;
+  if (firm.phoneLines?.[number]) return firm.phoneLines[number];
+  const target = lastTenDigits(number);
+  if (!target) return null;
+  for (const [line, label] of Object.entries(firm.phoneLines || {})) {
+    if (lastTenDigits(line) === target) return label;
+  }
+  return null;
+}
+
 function insertMentionsAfterTitle(text, userIds) {
   if (!userIds || userIds.length === 0) return text;
   const mentions = userIds.map((id) => `<@${id}>`).join(" ");
@@ -4177,6 +4193,13 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     console.log(`[${firm.id}][call-check] Skipped ${callId} — neither ${from} nor ${to} is a configured phone line`);
     return;
   }
+  if (isInternalFirmLineCall(firm, from, to)) {
+    console.log(
+      `[${firm.id}][call-check] Skipped ${callId} — internal firm-line call `
+      + `(${firmLineLabelFor(firm, from) || from} → ${firmLineLabelFor(firm, to) || to})`,
+    );
+    return;
+  }
 
   cacheCall(firm, callId, { from: call.from || cachedFrom, to: call.to || cachedTo, direction, answeredBy, userId: call.userId });
   console.log(`[${firm.id}][call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}, forwardedTo=${forwardedTo || "none"}`);
@@ -4923,6 +4946,36 @@ async function handleCalls(firm, req, res) {
       console.log(`[${firm.id}][calls] Skipped — neither ${from} nor ${to} is a configured phone line`);
       return;
     }
+    if (isInternalFirmLineCall(firm, from, to)) {
+      console.log(
+        `[${firm.id}][calls] Skipped — internal firm-line call `
+        + `(${firmLineLabelFor(firm, from) || from} → ${firmLineLabelFor(firm, to) || to})`,
+      );
+      // Still cache so a late summary can clear on-call status, but do not Slack.
+      if (callId) {
+        cacheCall(firm, callId, {
+          from: obj.from,
+          to: obj.to,
+          direction,
+          answeredBy: obj.answeredBy,
+          userId: obj.userId,
+          createdAt: obj.createdAt || null,
+          internalFirmLine: true,
+        });
+      }
+      if (obj.answeredBy || obj.userId) {
+        await markPhoneStaffOnCall(firm, {
+          callId,
+          answeredBy: obj.answeredBy,
+          userId: obj.userId,
+        }).catch(() => {});
+      }
+      if (["completed", "busy", "no-answer", "canceled", "failed"].includes(status)) {
+        stopAnswerWatch(firm, callId);
+        await clearSlackOnCallStatus(firm, callId);
+      }
+      return;
+    }
 
     const forwardedTo = obj.forwardedTo || null;
 
@@ -5346,6 +5399,22 @@ async function handleCallSummary(firm, req, res) {
 
     if (blockedByPhoneLineFilter(firm, from, to)) {
       console.log(`[${firm.id}][call-summary] Skipped — neither ${from} nor ${to} is a configured phone line`);
+      return;
+    }
+    if (isInternalFirmLineCall(firm, from, to) || cached?.internalFirmLine) {
+      console.log(
+        `[${firm.id}][call-summary] Skipped — internal firm-line call `
+        + `(${firmLineLabelFor(firm, from) || from} → ${firmLineLabelFor(firm, to) || to})`,
+      );
+      stopAnswerWatch(firm, callId);
+      if (!isSonaCall(payload, cached) && (cached?.answeredBy || cached?.userId)) {
+        await markPhoneStaffOnCall(firm, {
+          callId,
+          answeredBy: cached?.answeredBy,
+          userId: cached?.userId,
+        }).catch(() => {});
+      }
+      await clearSlackOnCallStatus(firm, callId);
       return;
     }
 
