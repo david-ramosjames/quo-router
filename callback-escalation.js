@@ -159,7 +159,9 @@ export function nextLeadCallsAssignees(firm, snapshot, { usedIds = new Set(), st
       picked.push(p);
       used.add(p.slackUserId);
     }
-    const intakePick = byRotationPreferActive(intake, used, 1, rotation + step);
+    // Intake (Andrea / Roman) rotates independently of LA so outbound-on-topic
+    // intake staff still share missed-call tags fairly with inbound intake.
+    const intakePick = byRotationPreferActive(intake, used, 1, rotation);
     if (intakePick.length) {
       picked.push(intakePick[0]);
       used.add(intakePick[0].slackUserId);

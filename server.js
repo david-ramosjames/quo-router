@@ -4041,7 +4041,6 @@ async function runCallbackEscalationStep(firm, key) {
   if (posted?.ts) job.messageTs.push(posted.ts);
   job.usedIds = pick.usedIds;
   job.step += 1;
-  bumpRotation(firm, pick.people.length || 1);
 
   if (pick.kind === "managers") {
     stopCallbackEscalation(firm, { key, reason: "managers tagged" });
@@ -4148,6 +4147,10 @@ function startCallbackEscalation(firm, {
   const defaultInterval = lane === "webform"
     ? WEBFORM_ESCALATION_INTERVAL_SECONDS
     : (cfg.intervalSeconds || 50);
+  // One tick per new miss — bumping by people tagged (often 2) kept an even
+  // counter, so a 2-person intake pool (Andrea/Roman) always picked the same one.
+  const rotation = Number(firm.callbackRotation) || 0;
+  bumpRotation(firm, 1);
   const job = {
     lane,
     phone,
@@ -4157,7 +4160,7 @@ function startCallbackEscalation(firm, {
     intervalSeconds: Number(intervalSeconds) > 0 ? Number(intervalSeconds) : defaultInterval,
     usedIds: [],
     step: 0,
-    rotation: firm.callbackRotation || 0,
+    rotation,
     messageTs: [],
     timer: null,
     stopped: false,

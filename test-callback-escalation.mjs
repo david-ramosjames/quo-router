@@ -51,6 +51,25 @@ assert.equal(lead0.people.length, 2);
 assert.equal(lead0.people.filter((p) => p.role === "la").length, 1);
 assert.equal(lead0.people.filter((p) => p.role === "intake").length, 1);
 
+// Andrea / Roman (both intake) must alternate across misses — including when
+// Roman is on the outbound topic for the day.
+const intakeOutSnap = allFree.map((p) => (
+  p.slackUserId === "UROM" ? { ...p, dutySection: "outbound" } : p
+));
+const intakeA = nextLeadCallsAssignees(firm, intakeOutSnap, { step: 0, rotation: 0 })
+  .people.find((p) => p.role === "intake");
+const intakeB = nextLeadCallsAssignees(firm, intakeOutSnap, { step: 0, rotation: 1 })
+  .people.find((p) => p.role === "intake");
+assert.ok(intakeA && intakeB);
+assert.notEqual(intakeA.slackUserId, intakeB.slackUserId);
+assert.deepEqual(
+  [intakeA.slackUserId, intakeB.slackUserId].sort(),
+  ["UAND", "UROM"].sort(),
+);
+const intakeC = nextLeadCallsAssignees(firm, intakeOutSnap, { step: 0, rotation: 2 })
+  .people.find((p) => p.role === "intake");
+assert.equal(intakeC.slackUserId, intakeA.slackUserId);
+
 const noIntakeSnap = allFree.filter((p) => p.role !== "intake");
 const leadNoIntake = nextLeadCallsAssignees(firm, noIntakeSnap, { step: 0, rotation: 0 });
 assert.equal(leadNoIntake.people.length, 2);
