@@ -3854,10 +3854,30 @@ function ringSecondsFromCall(obj, { allowTotalDuration = false } = {}) {
   return null;
 }
 
+/** Firm phone-line label that received/placed this call (Leads, RGV Number, …). */
+function calledFirmLineLabel(firm, phoneFrom, phoneTo) {
+  if (firm?.phoneLines?.[phoneTo]) return firm.phoneLines[phoneTo];
+  if (firm?.phoneLines?.[phoneFrom]) return firm.phoneLines[phoneFrom];
+  return null;
+}
+
 /** Staff block for #lead-calls and #legalassistant-phone. Other channels stay plain. */
-async function phoneStaffBlock(firm, { callId, eventType, ringSeconds = null } = {}) {
+async function phoneStaffBlock(firm, {
+  callId,
+  eventType,
+  ringSeconds = null,
+  phoneFrom = null,
+  phoneTo = null,
+  phoneLineLabel = null,
+} = {}) {
   try {
-    const result = await attachAvailabilityToNotice(pgPool, firm, "", { callId, eventType, ringSeconds });
+    const lineLabel = phoneLineLabel || calledFirmLineLabel(firm, phoneFrom, phoneTo);
+    const result = await attachAvailabilityToNotice(pgPool, firm, "", {
+      callId,
+      eventType,
+      ringSeconds,
+      phoneLineLabel: lineLabel,
+    });
     return { text: result.text || "", snapshot: result.snapshot || [] };
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
@@ -4206,6 +4226,8 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       callId,
       eventType,
       ringSeconds: ringSecondsFromCall(call, { allowTotalDuration: true }),
+      phoneFrom: from,
+      phoneTo: to,
     });
     const intakeText = text + staff.text;
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
@@ -4262,6 +4284,8 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
         callId,
         eventType: "sona",
         ringSeconds: ringSecondsFromCall(call),
+        phoneFrom: from,
+        phoneTo: to,
       });
       await postToSlack(firm.slackWebhooks.sonaCalls, text);
     } else {
@@ -5033,6 +5057,8 @@ async function handleCalls(firm, req, res) {
       callId,
       eventType: availabilityEvent,
       ringSeconds,
+      phoneFrom: from,
+      phoneTo: to,
     });
     const intakeText = text + staff.text;
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
@@ -5365,6 +5391,8 @@ async function handleCallSummary(firm, req, res) {
           callId,
           eventType: "sona",
           ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
+          phoneFrom: from,
+          phoneTo: to,
         })
       : { text: "", snapshot: [] };
 

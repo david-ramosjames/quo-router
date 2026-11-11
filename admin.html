@@ -245,17 +245,21 @@
       <div class="hint">Slack user IDs to @-mention on missed/Sona calls threaded into #lead-calls. Comma-separated.</div>
 
       <label for="firm-phone-staff">Phone Staff (answer-responsible)</label>
-      <textarea id="firm-phone-staff" name="phoneStaffText" rows="10" placeholder="timezone=America/Chicago
+      <textarea id="firm-phone-staff" name="phoneStaffText" rows="12" placeholder="timezone=America/Chicago
 Liz=U0AAAAAA=USBBBBBB | Mon-Fri 08:00-17:00 la primary
-Valeria=U0CCCCCC=USDDDDDD | Mon-Fri 08:00-17:00 rings after 10s la secondary
-Roman=U0EEEEEE=USFFFFFF | Mon-Fri 08:00-17:00 rings after 10s intake
+Claudia Chang=U08PUFTF7HA=USDDDDDD | Mon-Fri 08:00-17:00 rings after 10s la secondary aliases=Claudia,Valeria Chang
+Valeria Flores=U0FFFFFF=USFFFFFF | Mon-Fri 08:00-17:00 la secondary
+Roman=U0EEEEEE=USFFFFFF | Mon-Fri 08:00-17:00 rings after 10s intake lines=Leads,RGV,Intake
+Andrea Alvarado=U0AAAAAA=USAAAAAA | Mon-Fri 08:00-17:00 rings after 10s intake lines=Leads,RGV,Intake
 Jackie=U0XXXXXX=USYYYYYY | after-hours"></textarea>
       <div class="hint">
-        One per line: <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
-        Roles for callback escalation: <code>la primary</code> / <code>la secondary</code> (legal assistants) or <code>intake</code> (Roman / Andrea). Add <code>rings after 10s</code> when Quo does not ring them until 10 seconds.
-        Slack-<strong>active</strong> people are tagged first; inactive still counts as Available Missed and is tagged only after other options. Daily duty comes from the #legalassistant-phone topic:
-        <code>Inbound @Name | Outbound @Name | Attorney @Name | LAs @Name @Name …</code> — Inbound + LAs only for inbound misses.
-        Status list uses names and checkmarks (Jackie is still @-tagged after hours). Separate “Please call back now” posts tag people during business hours.
+        One person per line (one Slack ID) — Quo/Slack nicknames go in <code>aliases=</code>, not as a second row.
+        Example: Claudia Chang goes by Claudia; Quo is Valeria Chang → one line with <code>aliases=Claudia,Valeria Chang</code>. Valeria Flores stays a separate line.
+        Format: <code>Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00</code>.
+        Roles: <code>la primary</code> / <code>la secondary</code> / <code>intake</code>.
+        <code>rings after 10s</code> — Available Missed only after that delay (≤5s never counts for anyone; still posts callback).
+        <code>lines=Leads,RGV,Intake</code> — only those firm inboxes count (Roman / Andrea). Leave off if they ring on every line.
+        Topic: prefer <code>@Claudia Chang</code> / <code>@Valeria Flores</code> (not bare <code>@Valeria</code>).
       </div>
 
       <h3 style="margin-top:24px">Callback escalation</h3>

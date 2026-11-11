@@ -119,12 +119,24 @@ export function normalizePhoneStaff(config) {
       afterHours,
       windows: schedule.windows,
       ringAfterSeconds: Math.max(0, Number(entry.ringAfterSeconds) || Number(schedule.ringAfterSeconds) || 0),
+      ringLineLabels: normalizeLabelList(entry.ringLineLabels || entry.lines || schedule.ringLineLabels),
+      aliases: normalizeLabelList(entry.aliases || schedule.aliases),
       role: normalizeStaffRole(role, afterHours),
       tier: normalizeStaffTier(tier),
       timezone: entry.timezone || tzDefault || (schedule.windows.length || afterHours ? DEFAULT_PHONE_STAFF_TZ : null),
     });
   }
   return out;
+}
+
+function normalizeLabelList(raw) {
+  if (Array.isArray(raw)) {
+    return [...new Set(raw.map((x) => String(x || "").trim()).filter(Boolean))];
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    return [...new Set(raw.split(/[,/|]/).map((x) => x.trim()).filter(Boolean))];
+  }
+  return [];
 }
 
 function normalizeStaffRole(role, afterHours) {
@@ -143,8 +155,18 @@ function normalizeStaffTier(tier) {
 
 function normalizeSchedule(entry) {
   const ringAfterSeconds = Math.max(0, Number(entry.ringAfterSeconds) || 0);
+  const ringLineLabels = normalizeLabelList(entry.ringLineLabels || entry.lines);
+  const aliases = normalizeLabelList(entry.aliases);
   if (entry.scheduleError) return { error: entry.scheduleError };
-  if (Array.isArray(entry.windows) || entry.afterHours || ringAfterSeconds > 0 || entry.role || entry.tier) {
+  if (
+    Array.isArray(entry.windows)
+    || entry.afterHours
+    || ringAfterSeconds > 0
+    || ringLineLabels.length
+    || aliases.length
+    || entry.role
+    || entry.tier
+  ) {
     const windows = [];
     for (const w of entry.windows || []) {
       const days = [...new Set((w.days || []).map((d) => Number(d)).filter((d) => d >= 0 && d <= 6))].sort((a, b) => a - b);
@@ -159,12 +181,22 @@ function normalizeSchedule(entry) {
       afterHours: !!entry.afterHours,
       windows,
       ringAfterSeconds,
+      ringLineLabels,
+      aliases,
       role: entry.role || null,
       tier: entry.tier || null,
     };
   }
   if (typeof entry.schedule === "string") return parseStaffSchedule(entry.schedule);
-  return { afterHours: false, windows: [], ringAfterSeconds: 0, role: null, tier: null };
+  return {
+    afterHours: false,
+    windows: [],
+    ringAfterSeconds: 0,
+    ringLineLabels: [],
+    aliases: [],
+    role: null,
+    tier: null,
+  };
 }
 
 export function parsePhoneStaffText(text) {
@@ -214,6 +246,8 @@ export function parsePhoneStaffText(text) {
       afterHours: schedule.afterHours,
       windows: schedule.windows,
       ringAfterSeconds: schedule.ringAfterSeconds || 0,
+      ringLineLabels: schedule.ringLineLabels || [],
+      aliases: schedule.aliases || [],
       role: schedule.role || null,
       tier: schedule.tier || null,
       scheduleError: schedule.error || null,
@@ -236,6 +270,19 @@ export function formatPhoneStaffText(staff) {
 }
 
 const RING_DELAY_PATTERN = /\brings?\s+after\s+(\d+)\s*(?:s|sec|secs|seconds)?\b/i;
+const LIST_OPTION_PATTERN = /\b(lines?|inboxes?|aliases?)\s*=\s*([^|;]+)/ig;
+
+function extractListOptions(text) {
+  let ringLineLabels = [];
+  let aliases = [];
+  const rest = String(text || "").replace(LIST_OPTION_PATTERN, (_m, key, value) => {
+    const values = normalizeLabelList(value);
+    if (/^alias/i.test(key)) aliases = values;
+    else ringLineLabels = values;
+    return " ";
+  });
+  return { ringLineLabels, aliases, rest };
+}
 
 function extractRoleAndTier(text) {
   let role = null;
@@ -250,14 +297,23 @@ function extractRoleAndTier(text) {
 
 export function parseStaffSchedule(text) {
   const raw = String(text || "").trim();
-  if (!raw) return { afterHours: false, windows: [], ringAfterSeconds: 0, role: null, tier: null };
+  if (!raw) {
+    return {
+      afterHours: false,
+      windows: [],
+      ringAfterSeconds: 0,
+      ringLineLabels: [],
+      aliases: [],
+      role: null,
+      tier: null,
+    };
+  }
   const delay = raw.match(RING_DELAY_PATTERN);
   const ringAfterSeconds = delay ? Number(delay[1]) : 0;
+  const listOpts = extractListOptions(raw.replace(new RegExp(RING_DELAY_PATTERN.source, "ig"), " "));
   let afterHours = false;
   const roleTier = extractRoleAndTier(
-    raw
-      .replace(new RegExp(RING_DELAY_PATTERN.source, "ig"), " ")
-      .replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; }),
+    listOpts.rest.replace(/\bafter[-\s]?hours\b/ig, () => { afterHours = true; return " "; }),
   );
   const rest = roleTier.rest
     .replace(/\s+/g, " ")
@@ -268,6 +324,8 @@ export function parseStaffSchedule(text) {
       afterHours,
       windows: [],
       ringAfterSeconds,
+      ringLineLabels: listOpts.ringLineLabels,
+      aliases: listOpts.aliases,
       role: afterHours ? "after_hours" : roleTier.role,
       tier: roleTier.tier,
     };
@@ -288,6 +346,8 @@ export function parseStaffSchedule(text) {
     afterHours,
     windows,
     ringAfterSeconds,
+    ringLineLabels: listOpts.ringLineLabels,
+    aliases: listOpts.aliases,
     role: afterHours ? "after_hours" : roleTier.role,
     tier: roleTier.tier,
   };
@@ -334,9 +394,28 @@ export function formatStaffSchedule(person) {
   const parts = (person?.windows || []).map((w) => `${formatDays(w.days)} ${formatClock(w.startMin)}-${formatClock(w.endMin)}`);
   if (person?.afterHours) parts.push("after-hours");
   if (person?.ringAfterSeconds > 0) parts.push(`rings after ${person.ringAfterSeconds}s`);
+  if (person?.ringLineLabels?.length) parts.push(`lines=${person.ringLineLabels.join(",")}`);
+  if (person?.aliases?.length) parts.push(`aliases=${person.aliases.join(",")}`);
   if (person?.role === "la") parts.push(person.tier === "secondary" ? "la secondary" : person.tier === "primary" ? "la primary" : "la");
   else if (person?.role === "intake") parts.push("intake");
   return parts.join("; ");
+}
+
+/**
+ * Whether this person's phone rings for the firm line that took the call.
+ * Empty lines= means every inbox. Restricted people (Andrea/Roman) only count
+ * for Leads / RGV / Intake (etc.) when those labels are listed.
+ */
+export function personRingsOnLine(person, phoneLineLabel) {
+  const labels = normalizeLabelList(person?.ringLineLabels || person?.lines);
+  if (!labels.length) return true;
+  // No firm-line label on the event → do not filter (ring delay still applies).
+  if (!phoneLineLabel) return true;
+  const hay = String(phoneLineLabel).toLowerCase();
+  return labels.some((label) => {
+    const needle = String(label).toLowerCase();
+    return hay.includes(needle) || needle.includes(hay);
+  });
 }
 
 function formatDays(days) {
@@ -429,6 +508,8 @@ export function classifyPhoneStaffMember(person, {
     statusText: String(statusText || "").trim(),
     afterHoursDuty: false,
     ringAfterSeconds: Math.max(0, Number(person.ringAfterSeconds) || 0),
+    ringLineLabels: normalizeLabelList(person.ringLineLabels || person.lines),
+    aliases: normalizeLabelList(person.aliases),
     tag: false,
   };
   const onCallStatus = base.statusText.toLowerCase() === ON_CALL_STATUS_TEXT.toLowerCase()
@@ -807,6 +888,17 @@ function normalizePersonNameKey(name) {
  * configured phoneStaff names. Returns { inbound, outbound, attorney, las,
  * answerIds } where answerIds is Inbound ∪ Outbound ∪ LAs (Attorney excluded).
  */
+function staffNameKeys(person) {
+  const keys = new Set();
+  const add = (value) => {
+    const key = normalizePersonNameKey(value);
+    if (key) keys.add(key);
+  };
+  add(person?.name);
+  for (const alias of person?.aliases || []) add(alias);
+  return keys;
+}
+
 export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
   const map = slackUsers instanceof Map ? slackUsers : new Map(Object.entries(slackUsers || {}));
   const staff = Array.isArray(phoneStaff) ? phoneStaff : [];
@@ -816,13 +908,25 @@ export function resolvePhoneDutyRoster(parsed, slackUsers, phoneStaff = []) {
     if (/^U[A-Z0-9]+$/i.test(raw)) return raw.toUpperCase();
     const key = normalizePersonNameKey(raw);
     const first = key.split(/\s+/)[0];
-    const fromMap = map.get(key) || (first ? map.get(first) : null) || map.get(raw.toLowerCase());
+    const fromMap = map.get(key) || map.get(raw.toLowerCase());
     if (fromMap) return String(fromMap).toUpperCase();
-    const hit = staff.find((p) => {
-      const n = normalizePersonNameKey(p.name);
-      return n === key || (first && n.split(/\s+/)[0] === first);
-    });
-    return hit?.slackUserId ? String(hit.slackUserId).toUpperCase() : null;
+    // Prefer exact name / alias matches so "@Valeria" with two Valerias does
+    // not silently pick the wrong seat, and "@Claudia" can map to Valeria Chang.
+    const exact = staff.filter((p) => staffNameKeys(p).has(key));
+    if (exact.length === 1) {
+      return exact[0].slackUserId ? String(exact[0].slackUserId).toUpperCase() : null;
+    }
+    if (exact.length > 1) return null;
+    const firstHits = first
+      ? staff.filter((p) => [...staffNameKeys(p)].some((n) => n.split(/\s+/)[0] === first))
+      : [];
+    if (firstHits.length === 1) {
+      return firstHits[0].slackUserId ? String(firstHits[0].slackUserId).toUpperCase() : null;
+    }
+    // Ambiguous first name (two Valerias) — require a fuller topic mention.
+    if (firstHits.length > 1) return null;
+    const firstFromMap = first ? map.get(first) : null;
+    return firstFromMap ? String(firstFromMap).toUpperCase() : null;
   };
   const resolveList = (list) => [...new Set((list || []).map(resolveOne).filter(Boolean))];
   const inbound = resolveList(parsed?.inbound);
@@ -988,7 +1092,8 @@ export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } 
   return { rows: filtered, dutyRoster: roster, dutySlackUserIds };
 }
 
-const FAST_HANGUP_SECONDS = 5;
+/** Caller hung up this fast: still a team missed + callback ask; no Available Missed. */
+export const FAST_HANGUP_SECONDS = 5;
 
 function warningName(row, { mention = false } = {}) {
   const base = mention ? `<@${row.slackUserId}>` : (row.name || row.slackUserId);
@@ -1007,15 +1112,17 @@ function checkedNames(rows, { mention = false } = {}) {
 function plainStatus(row) {
   if (row.state === "on_call") return "on a call";
   if (row.state === "off_topic") return row.statusText || "not on today's topic";
+  if (row.state === "off_line") return row.statusText || "does not ring on this line";
   if (row.state === "inactive" || row.state === "away") return "inactive";
   return row.statusText || "unavailable";
 }
 
 /**
- * Split a snapshot by how long the caller waited.
+ * Split a snapshot by how long the caller waited and which firm line rang.
  * ringSeconds null means the ring time is unknown, so everyone on duty counts.
- * Under 5s nobody "should have answered". People with ringAfterSeconds only
- * count as available once the call rang at least that long.
+ * ≤5s: team missed + callback ask only — nobody counts as Available Missed.
+ * People with ringAfterSeconds only count once the call rang at least that long.
+ * People with lines= only count when that firm inbox is one of theirs.
  */
 export function isFreeToAnswer(row) {
   // Slack-active (or after-hours coverage) — preferred for first-round tags.
@@ -1025,21 +1132,32 @@ export function isFreeToAnswer(row) {
 
 /**
  * Counts for Available Missed metrics: on-topic active + on-topic inactive.
- * Off-topic / status / on-call never count.
+ * Off-topic / wrong inbox / status / on-call never count.
  */
 export function countsTowardAvailableMissed(row) {
   return row.state === "available" || row.state === "after_hours" || row.state === "inactive";
 }
 
-export function noticeGroups(snapshot, ringSeconds = null) {
-  const fast = ringSeconds != null && ringSeconds < FAST_HANGUP_SECONDS;
-  // Show off-topic as unavailable; hide only true off-shift / unknown.
+export function noticeGroups(snapshot, ringSeconds = null, phoneLineLabel = null) {
+  const fast = ringSeconds != null && ringSeconds <= FAST_HANGUP_SECONDS;
+  // Show off-topic / wrong-line as unavailable; hide only true off-shift / unknown.
   const visible = (snapshot || []).filter(
     (r) => r.state !== "off_shift" && r.state !== "unknown",
   );
-  const free = visible.filter(isFreeToAnswer);
-  const inactiveDuty = visible.filter((r) => r.state === "inactive");
-  const context = visible.filter((r) => !isFreeToAnswer(r) && r.state !== "inactive");
+  const ringsHere = (r) => personRingsOnLine(r, phoneLineLabel);
+  const free = visible.filter((r) => isFreeToAnswer(r) && ringsHere(r));
+  const inactiveDuty = visible.filter((r) => r.state === "inactive" && ringsHere(r));
+  const wrongLine = visible.filter((r) => !ringsHere(r) && (isFreeToAnswer(r) || r.state === "inactive"));
+  const context = [
+    ...visible.filter((r) => !isFreeToAnswer(r) && r.state !== "inactive" && ringsHere(r)),
+    ...wrongLine.map((r) => ({
+      ...r,
+      state: "off_line",
+      statusText: phoneLineLabel
+        ? `does not ring on ${phoneLineLabel}`
+        : "does not ring on this line",
+    })),
+  ];
   const rang = (r) => ringSeconds == null || ringSeconds >= (Number(r.ringAfterSeconds) || 0);
   const couldAnswer = free.filter(rang);
   const callbackOnly = free.filter((r) => !rang(r));
@@ -1064,7 +1182,7 @@ function formatRingDuration(ringSeconds) {
   return secs === 1 ? "1s" : `${secs}s`;
 }
 
-export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = {}) {
+export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null, phoneLineLabel = null } = {}) {
   const {
     fast,
     couldAnswer,
@@ -1072,7 +1190,7 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null } = 
     inactiveAccountable,
     inactiveCallback,
     context,
-  } = noticeGroups(snapshot, ringSeconds);
+  } = noticeGroups(snapshot, ringSeconds, phoneLineLabel);
   const lines = [];
   const ringLabel = formatRingDuration(ringSeconds);
   if (ringLabel) lines.push(`_Rang for ${ringLabel}_`);
@@ -1400,13 +1518,18 @@ export async function attachAvailabilityToNotice(pgPool, firm, text, {
   callId,
   eventType,
   ringSeconds = null,
+  phoneLineLabel = null,
 } = {}) {
   if (!firm.phoneStaff?.length) return { text, snapshot: [] };
   const { rows: raw, dutySlackUserIds } = await snapshotPhoneStaffAvailability(firm);
-  const { accountable } = noticeGroups(raw, ringSeconds);
+  const { accountable } = noticeGroups(raw, ringSeconds, phoneLineLabel);
   const accountableIds = new Set(accountable.map((r) => r.slackUserId));
-  const snapshot = raw.map((r) => ({ ...r, accountable: accountableIds.has(r.slackUserId) }));
-  const block = formatAvailabilitySlackBlock(snapshot, { ringSeconds });
+  const snapshot = raw.map((r) => ({
+    ...r,
+    accountable: accountableIds.has(r.slackUserId),
+    phoneLineLabel: phoneLineLabel || null,
+  }));
+  const block = formatAvailabilitySlackBlock(snapshot, { ringSeconds, phoneLineLabel });
   await recordAvailabilityEvent(pgPool, firm, {
     callId,
     eventType,

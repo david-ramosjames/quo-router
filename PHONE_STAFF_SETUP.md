@@ -75,11 +75,26 @@ In the router admin UI → firm → **Phone Staff**:
 
 ```
 timezone=America/Chicago
-Andrea=U0AAAAAA=USyyyyyyyyy | Mon-Fri 08:00-17:00
+Claudia Chang=U08PUFTF7HA=UScccccccc | Mon-Fri 08:00-17:00 rings after 10s la secondary aliases=Claudia,Valeria Chang
+Valeria Flores=U0FFFFFF=USffffffff | Mon-Fri 08:00-17:00 la secondary
+Roman=U0EEEEEE=USeeeeeeeee | Mon-Fri 08:00-17:00 rings after 10s intake lines=Leads,RGV,Intake
+Andrea Alvarado=U0AAAAAA=USyyyyyyyyy | Mon-Fri 08:00-17:00 rings after 10s intake lines=Leads,RGV,Intake
 Jackie=U026P9FUKHC=USxxxxxxxxx | after-hours
 ```
 
-Format: `Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00` (one per line).
+Format: `Name=SLACK_USER_ID=QUO_USER_ID | Mon-Fri 08:00-17:00` (one person per line — one Slack ID).
+
+Claudia Chang goes by Claudia; her Quo seat is Valeria Chang (`valeria@ramosjames.com`). Keep **one** Phone Staff row with Slack `U08PUFTF7HA` and `aliases=Claudia,Valeria Chang`. Do **not** also list a separate Valeria Chang row. Valeria Flores is a different person.
+
+Optional schedule tokens:
+- `rings after 10s` — Quo does not ring them until 10 seconds; Available Missed only after that.
+- `lines=Leads,RGV,Intake` — only those firm inboxes count for their Available Missed (Roman / Andrea). Leave blank for people who ring on every line.
+- `aliases=Claudia,Valeria Chang` — topic / Quo nicknames for this person (not a second staff row; avoid bare `Valeria` when Valeria Flores is also on staff).
+
+Available Missed rules:
+- ≤5s hangup → team missed + callback ask; **no** individual Available Missed
+- >5s and ≤ that person's `rings after` → callback ask for them; Available Missed only for people whose phones already rang
+- >10s (or past their delay) on an inbox that rings to them → Available Missed if on-topic and free
 
 Hours are per person, in the timezone on the first line (default `America/Chicago`). Someone is not tagged outside their own hours. The person marked `after-hours` is tagged only when no scheduled shift covers the call.
 
@@ -129,7 +144,8 @@ The Daily Call Report will then include **Available but did not answer** totals 
 3. End the call → status should clear / restore.
 4. Miss a test call during a listed person's scheduled hours. The staff list is added only on **#lead-calls** and **#legalassistant-phone**, with names and check marks (no @ except Jackie after hours). During business hours the router also posts **@person Please call back now** in that thread and escalates every 50s. Mark people `la primary`, `la secondary`, or `intake` in Phone Staff, and set Managers (Jon / Jaymie) under Callback escalation. #missed-calls and #sona-calls stay as the plain call notice.
 5. Set the **#legalassistant-phone** (or #lead-calls) channel topic each day to the duty roster, e.g.  
-   `Inbound @Andrea Alvarado | Outbound @Roman | Attorney @Michael Tucker | LAs @Liz Abad-Cruz @Stephany Guerra @Valeria @Claudia`  
+   `Inbound @Andrea Alvarado | Outbound @Roman | Attorney @Michael Tucker | LAs @Liz Abad-Cruz @Stephany Guerra @Claudia Chang @Valeria Flores`  
+   Prefer `@Claudia Chang` (or `@Claudia`) and `@Valeria Flores` — not bare `@Valeria`.  
    Missed/Sona ask Inbound + Outbound + LAs; web forms ask **Outbound → Inbound → LAs** (then managers).
 6. **Web form / chat callbacks** — follow-up-text detects the form post and calls  
    `POST /api/firms/:firmId/callback-escalation/start` with `lane=webform`. Quo-router then tags one person every **2 minutes**, then Managers. On follow-up-text set `QUO_ROUTER_URL`, `QUO_ROUTER_FIRM_ID`, and `QUO_ROUTER_REPORT_TOKEN` (same token as the report API).
