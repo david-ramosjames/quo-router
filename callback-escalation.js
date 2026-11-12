@@ -299,6 +299,53 @@ export function formatCallbackRequest(people) {
   return lines.join("\n");
 }
 
+/**
+ * After-hours coverage (Jackie): one tag, no ladder. Used for webform/chat
+ * leads that arrive outside Mon–Fri 7am–6pm when the daytime ladder is off.
+ */
+export function nextAfterHoursAssignees(firm, snapshot = []) {
+  const fromSnap = (snapshot || []).filter(
+    (r) => r.state === "after_hours" || r.afterHoursDuty,
+  );
+  if (fromSnap.length) {
+    const people = fromSnap.map((r) => ({
+      name: r.name || r.slackUserId,
+      slackUserId: r.slackUserId,
+      role: "after_hours",
+      state: "after_hours",
+    }));
+    return {
+      kind: "after_hours",
+      people,
+      usedIds: people.map((p) => p.slackUserId),
+    };
+  }
+  const configured = (firm.phoneStaff || []).filter(
+    (p) => p.afterHours || p.role === "after_hours",
+  );
+  if (!configured.length) return { kind: "done", people: [], usedIds: [] };
+  const people = configured.map((p) => ({
+    name: p.name || p.slackUserId,
+    slackUserId: p.slackUserId,
+    role: "after_hours",
+    state: "after_hours",
+  }));
+  return {
+    kind: "after_hours",
+    people,
+    usedIds: people.map((p) => p.slackUserId),
+  };
+}
+
+export function formatAfterHoursCallbackRequest(people) {
+  if (!people?.length) return "";
+  const lines = people.map(
+    (p) => `:moon: <@${p.slackUserId}> After-hours — please call this lead back`,
+  );
+  lines.push(CALLBACK_STOP_HINT);
+  return lines.join("\n");
+}
+
 export function formatManagerEscalation(people, message) {
   if (!people?.length) return "";
   const tags = people.map((p) => `<@${p.slackUserId}>`).join(" ");

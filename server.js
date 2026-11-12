@@ -26,7 +26,9 @@ import {
   nextLeadCallsAssignees,
   nextLegalAssistantAssignees,
   nextWebformAssignees,
+  nextAfterHoursAssignees,
   formatCallbackRequest,
+  formatAfterHoursCallbackRequest,
   formatManagerEscalation,
   replyMeansStop,
   reactionMeansStop,
@@ -4135,11 +4137,30 @@ function startCallbackEscalation(firm, {
   const cfg = firm.callbackEscalation || normalizeCallbackEscalation({});
   if (!cfg.enabled) return false;
   if (!channelId || !parentTs) return false;
-  if (!isBusinessHours(cfg)) {
-    console.log(`[${firm.id}][callback-esc] Skip ${lane} — outside business hours`);
-    return false;
-  }
   if (!firm.slackBotToken) return false;
+
+  // Daytime ladder is Mon–Fri 7am–6pm. Outside that, webform/chat still need
+  // Jackie (after-hours) tagged — do not silent-skip those leads.
+  if (!isBusinessHours(cfg)) {
+    if (lane !== "webform") {
+      console.log(`[${firm.id}][callback-esc] Skip ${lane} — outside business hours`);
+      return false;
+    }
+    const pick = nextAfterHoursAssignees(firm, snapshot);
+    if (pick.kind !== "after_hours" || !pick.people?.length) {
+      console.log(`[${firm.id}][callback-esc] Skip webform — outside hours, no after-hours staff`);
+      return false;
+    }
+    const text = formatAfterHoursCallbackRequest(pick.people);
+    console.log(
+      `[${firm.id}][callback-esc] After-hours webform tag for ${phone || "unknown"} `
+      + `→ ${pick.people.map((p) => p.name || p.slackUserId).join(", ")}`,
+    );
+    slackPostMessage(firm, { channel: channelId, text, threadTs: parentTs }).catch((err) =>
+      console.error(`[${firm.id}][callback-esc] after-hours post error:`, err.message),
+    );
+    return true;
+  }
 
   const key = escalationKey(lane, phone);
   stopCallbackEscalation(firm, { key, reason: "restart" });

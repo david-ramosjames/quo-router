@@ -5,7 +5,9 @@ import {
   nextLeadCallsAssignees,
   nextLegalAssistantAssignees,
   nextWebformAssignees,
+  nextAfterHoursAssignees,
   formatCallbackRequest,
+  formatAfterHoursCallbackRequest,
   formatManagerEscalation,
   replyMeansStop,
   reactionMeansStop,
@@ -170,5 +172,21 @@ const afterSecondaries = nextLegalAssistantAssignees(firm, mixedSnap, {
   rotation: 1,
 });
 assert.ok(afterSecondaries.people.some((p) => p.state === "inactive"));
+
+const afterHoursFirm = {
+  phoneStaff: [
+    ...firm.phoneStaff,
+    { name: "Jackie", slackUserId: "UJAC", role: "after_hours", afterHours: true },
+  ],
+  callbackEscalation: cfg,
+};
+const afterHoursPick = nextAfterHoursAssignees(afterHoursFirm, [
+  { name: "Jackie", slackUserId: "UJAC", state: "after_hours", afterHoursDuty: true },
+]);
+assert.equal(afterHoursPick.kind, "after_hours");
+assert.equal(afterHoursPick.people[0].slackUserId, "UJAC");
+assert.match(formatAfterHoursCallbackRequest(afterHoursPick.people), /After-hours/);
+assert.match(formatAfterHoursCallbackRequest(afterHoursPick.people), /<@UJAC>/);
+assert.equal(isBusinessHours(cfg, new Date("2026-11-12T00:56:00Z")), false); // Wed 6:56pm CT
 
 console.log("test-callback-escalation: ok");
