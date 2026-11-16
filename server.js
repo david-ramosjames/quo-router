@@ -19,6 +19,7 @@ import {
   queryAvailabilityMisses,
   phoneStaffStatusSummary,
   snapshotPhoneStaffAvailability,
+  resolveLiveOnCallIds,
 } from "./phone-staff.js";
 import {
   normalizeCallbackEscalation,
@@ -3819,7 +3820,7 @@ function markCallResolved(firm, callId) {
 }
 
 /** Poll Quo after ringing so we know who is on a call before the call ends. */
-function watchCallForPhoneStaffStatus(firm, callId) {
+function watchCallForPhoneStaffStatus(firm, callId, { direction = null } = {}) {
   if (!callId) return;
   if (!firm.phoneStaff?.length) {
     console.log(`[${firm.id}][phone-staff] Skip answer watch for ${callId} — phoneStaff list empty`);
@@ -3827,14 +3828,15 @@ function watchCallForPhoneStaffStatus(firm, callId) {
   }
   startAnswerWatch(firm, {
     callId,
+    direction,
     fetchCall: fetchCallFromQuo,
-    onAnswered: async ({ callId: id, answeredBy }) => {
-      cacheCall(firm, id, { answeredBy });
-      await markPhoneStaffOnCall(firm, { callId: id, answeredBy });
+    onAnswered: async ({ callId: id, answeredBy, userId }) => {
+      cacheCall(firm, id, { answeredBy, userId });
+      await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId });
     },
-    onEnded: async ({ callId: id, answeredBy }) => {
-      if (answeredBy) {
-        await markPhoneStaffOnCall(firm, { callId: id, answeredBy });
+    onEnded: async ({ callId: id, answeredBy, userId }) => {
+      if (answeredBy || userId) {
+        await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId });
       }
       await clearSlackOnCallStatus(firm, id);
     },
@@ -4219,6 +4221,16 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   console.log(`[${firm.id}][call-check] Call ${callId}: status=${status}, answeredBy=${answeredBy || "none"}, direction=${direction}, forwardedTo=${forwardedTo || "none"}`);
 
   if (status === "in-progress" || status === "ringing" || status === "queued" || status === "initiated") {
+    const live = resolveLiveOnCallIds(call, { direction });
+    if (live.answeredBy || live.userId) {
+      await markPhoneStaffOnCall(firm, {
+        callId,
+        answeredBy: live.answeredBy,
+        userId: live.userId,
+      }).catch((err) =>
+        console.warn(`[${firm.id}][phone-staff] on-call mark failed during ${status}:`, err.message),
+      );
+    }
     console.log(`[${firm.id}][call-check] Call ${callId} still ${status} — rescheduling`);
     scheduleCallCheck(firm, callId, cachedFrom, cachedTo, cachedDirection);
     return;
@@ -4977,12 +4989,15 @@ async function handleCalls(firm, req, res) {
           internalFirmLine: true,
         });
       }
-      if (obj.answeredBy || obj.userId) {
-        await markPhoneStaffOnCall(firm, {
-          callId,
-          answeredBy: obj.answeredBy,
-          userId: obj.userId,
-        }).catch(() => {});
+      {
+        const live = resolveLiveOnCallIds(obj, { direction });
+        if (live.answeredBy || live.userId) {
+          await markPhoneStaffOnCall(firm, {
+            callId,
+            answeredBy: live.answeredBy,
+            userId: live.userId,
+          }).catch(() => {});
+        }
       }
       if (["completed", "busy", "no-answer", "canceled", "failed"].includes(status)) {
         stopAnswerWatch(firm, callId);
@@ -5016,27 +5031,41 @@ async function handleCalls(firm, req, res) {
     if (eventType === "call.ringing" || status === "ringing") {
       if (direction === "incoming") {
         scheduleCallCheck(firm, callId, obj.from, obj.to, direction);
-        watchCallForPhoneStaffStatus(firm, callId);
+        watchCallForPhoneStaffStatus(firm, callId, { direction });
         console.log(`[${firm.id}][calls] Ringing — scheduled API check in ${CALL_CHECK_DELAY_MS / 1000}s for ${callId}`);
       } else {
-        // Outbound: the firm dialed — if a configured phone-staff member owns
-        // the call (userId), mark them on-call as soon as Quo reports answeredBy.
-        watchCallForPhoneStaffStatus(firm, callId);
-        console.log(`[${firm.id}][calls] Ringing — waiting for completion`);
+        // Outbound: Quo rarely fills answeredBy live. userId/initiatedBy is the
+        // dialer — mark them busy as soon as the outbound leg starts ringing.
+        const live = resolveLiveOnCallIds(obj, { direction });
+        if (live.userId || live.answeredBy) {
+          await markPhoneStaffOnCall(firm, {
+            callId,
+            answeredBy: live.answeredBy,
+            userId: live.userId,
+          }).catch((err) =>
+            console.warn(`[${firm.id}][phone-staff] outbound on-call mark failed:`, err.message),
+          );
+        }
+        watchCallForPhoneStaffStatus(firm, callId, { direction });
+        console.log(`[${firm.id}][calls] Ringing — outbound dialer marked on-call when known; watching ${callId}`);
       }
       return;
     }
 
-    // Mid-call / completion updates: keep Slack "On a call" in sync whenever
-    // Quo tells us who answered, and clear it when the call ends.
-    if (obj.answeredBy || obj.userId) {
-      await markPhoneStaffOnCall(firm, {
-        callId,
-        answeredBy: obj.answeredBy,
-        userId: obj.userId,
-      }).catch((err) =>
-        console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
-      );
+    // Mid-call / completion updates: keep Slack "On a call" in sync.
+    // Inbound: only answeredBy (userId is usually the inbox owner).
+    // Outbound: userId/initiatedBy is the dialer even when answeredBy is empty.
+    {
+      const live = resolveLiveOnCallIds(obj, { direction });
+      if (live.answeredBy || live.userId) {
+        await markPhoneStaffOnCall(firm, {
+          callId,
+          answeredBy: live.answeredBy,
+          userId: live.userId,
+        }).catch((err) =>
+          console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
+        );
+      }
     }
     const isTerminalStatus = ["completed", "no-answer", "busy", "canceled", "cancelled", "failed"].includes(status);
     if (isTerminalStatus) {
@@ -5421,12 +5450,17 @@ async function handleCallSummary(firm, req, res) {
         + `(${firmLineLabelFor(firm, from) || from} → ${firmLineLabelFor(firm, to) || to})`,
       );
       stopAnswerWatch(firm, callId);
-      if (!isSonaCall(payload, cached) && (cached?.answeredBy || cached?.userId)) {
-        await markPhoneStaffOnCall(firm, {
-          callId,
-          answeredBy: cached?.answeredBy,
-          userId: cached?.userId,
-        }).catch(() => {});
+      if (!isSonaCall(payload, cached)) {
+        const live = resolveLiveOnCallIds(cached || {}, {
+          direction: outbound ? "outbound" : (cached?.direction || "incoming"),
+        });
+        if (live.answeredBy || live.userId) {
+          await markPhoneStaffOnCall(firm, {
+            callId,
+            answeredBy: live.answeredBy,
+            userId: live.userId,
+          }).catch(() => {});
+        }
       }
       await clearSlackOnCallStatus(firm, callId);
       return;
@@ -5461,12 +5495,17 @@ async function handleCallSummary(firm, req, res) {
 
     // Clear on-call before the staff snapshot so this call is not still "on a call".
     stopAnswerWatch(firm, callId);
-    if (!sona && (cached?.answeredBy || cached?.userId)) {
-      await markPhoneStaffOnCall(firm, {
-        callId,
-        answeredBy: cached?.answeredBy,
-        userId: cached?.userId,
+    if (!sona) {
+      const live = resolveLiveOnCallIds(cached || {}, {
+        direction: outbound ? "outbound" : (cached?.direction || "incoming"),
       });
+      if (live.answeredBy || live.userId) {
+        await markPhoneStaffOnCall(firm, {
+          callId,
+          answeredBy: live.answeredBy,
+          userId: live.userId,
+        });
+      }
     }
     await clearSlackOnCallStatus(firm, callId);
     const staff = sona

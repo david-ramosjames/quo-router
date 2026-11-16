@@ -19,7 +19,10 @@
 const ON_CALL_STATUS_TEXT = "On a call";
 const ON_CALL_STATUS_EMOJI = ":phone:";
 const ANSWER_POLL_MS = 5_000;
-const ANSWER_POLL_MAX_MS = 3 * 60_000; // stop watching after 3 minutes of ringing
+/** Stop polling while still ringing with nobody identified. */
+const ANSWER_POLL_RING_MAX_MS = 3 * 60_000;
+/** Keep polling in-progress calls so we clear on-call when they end. */
+const ANSWER_POLL_IN_PROGRESS_MAX_MS = 4 * 60 * 60_000;
 export const DEFAULT_PHONE_STAFF_TZ = "America/Chicago";
 
 const DAY_INDEX = {
@@ -552,6 +555,37 @@ function isSonaAnsweredBy(answeredBy) {
   if (!answeredBy) return false;
   const s = String(answeredBy);
   return s.startsWith("SY") || /sona/i.test(s);
+}
+
+export function isOutboundDirection(direction) {
+  const d = String(direction || "").toLowerCase();
+  return d === "outbound" || d === "outgoing";
+}
+
+/**
+ * Who should count as "on a call" right now from a Quo call payload.
+ *
+ * Quo often leaves `answeredBy` empty until call-summary (or forever on
+ * outbound). For outbound, `userId` / `initiatedBy` is the dialer — mark them
+ * busy immediately. For inbound, `userId` is usually the inbox/line owner, not
+ * the person who picked up — only trust `answeredBy` there.
+ */
+export function resolveLiveOnCallIds(call, { direction } = {}) {
+  if (!call || typeof call !== "object") {
+    return { answeredBy: null, userId: null };
+  }
+  const answeredBy = call.answeredBy || null;
+  const dialerId = call.userId || call.initiatedBy || null;
+  const outbound = isOutboundDirection(direction ?? call.direction);
+
+  if (answeredBy && !isSonaAnsweredBy(answeredBy)) {
+    // Prefer the real answerer; still pass outbound dialer as backup.
+    return { answeredBy, userId: outbound ? dialerId : null };
+  }
+  if (outbound && dialerId && !isSonaAnsweredBy(dialerId)) {
+    return { answeredBy: null, userId: dialerId };
+  }
+  return { answeredBy: null, userId: null };
 }
 
 export function findPhoneStaffByQuoUser(firm, quoUserId) {
@@ -1386,15 +1420,23 @@ export async function queryAvailabilityMisses(pgPool, firmId, { createdAfter, cr
 }
 
 /**
- * After an inbound call starts ringing, poll Quo until someone answers (or the
- * call ends / we time out). When a configured phone-staff member answers, set
- * their Slack status to "On a call".
+ * After a call starts ringing, poll Quo until someone is identified as on the
+ * call (or the call ends / we time out). When a configured phone-staff member
+ * is live on it, set their Slack status to "On a call".
+ *
+ * Outbound uses userId/initiatedBy immediately; inbound waits for answeredBy
+ * (userId on inbound is usually the inbox owner, not the answerer).
  */
 export function startAnswerWatch(firm, {
   callId,
   fetchCall,
   onAnswered,
   onEnded,
+  direction = null,
+  pollMs = ANSWER_POLL_MS,
+  firstDelayMs = 2_000,
+  ringMaxMs = ANSWER_POLL_RING_MAX_MS,
+  inProgressMaxMs = ANSWER_POLL_IN_PROGRESS_MAX_MS,
 } = {}) {
   if (!firm || !callId || !fetchCall) return;
   if (!firm.answerWatchTimers) firm.answerWatchTimers = new Map();
@@ -1403,6 +1445,7 @@ export function startAnswerWatch(firm, {
   const started = Date.now();
   let stopped = false;
   let permanentFailLogged = false;
+  let sawLiveActor = false;
 
   const stop = () => {
     if (stopped) return;
@@ -1414,11 +1457,6 @@ export function startAnswerWatch(firm, {
 
   const tick = async () => {
     if (stopped) return;
-    if (Date.now() - started > ANSWER_POLL_MAX_MS) {
-      console.log(`[${firm.id}][phone-staff] Answer watch timed out for ${callId}`);
-      stop();
-      return;
-    }
     try {
       const call = await fetchCall(firm, callId);
       // Quo returns null on 400 "too many participants" and similar — polling
@@ -1427,27 +1465,49 @@ export function startAnswerWatch(firm, {
         if (!permanentFailLogged) {
           permanentFailLogged = true;
           console.log(
-            `[${firm.id}][phone-staff] Answer watch stopped for ${callId} — Quo API cannot fetch this call (${call.reason || "unsupported"}). Will rely on webhook answeredBy.`,
+            `[${firm.id}][phone-staff] Answer watch stopped for ${callId} — Quo API cannot fetch this call (${call.reason || "unsupported"}). Will rely on webhook answeredBy/userId.`,
           );
         }
         stop();
         return;
       }
       if (!call) {
+        if (Date.now() - started > ringMaxMs) {
+          console.log(`[${firm.id}][phone-staff] Answer watch timed out for ${callId} (no call payload)`);
+          stop();
+          return;
+        }
         schedule();
         return;
       }
       const status = String(call.status || "").toLowerCase();
-      const answeredBy = call.answeredBy || null;
+      const dir = direction || call.direction || null;
+      const { answeredBy, userId } = resolveLiveOnCallIds(call, { direction: dir });
+      const live = Boolean(answeredBy || userId);
+      const inProgress = ["in-progress", "answered"].includes(status);
 
-      if (answeredBy && !isSonaAnsweredBy(answeredBy)) {
-        if (onAnswered) await onAnswered({ callId, answeredBy, call });
+      if (live) {
+        sawLiveActor = true;
+        if (onAnswered) await onAnswered({ callId, answeredBy, userId, call });
         // Keep watching until the call leaves in-progress so we clear status.
       }
 
       const terminal = ["completed", "no-answer", "busy", "canceled", "failed", "cancelled"].includes(status);
       if (terminal) {
-        if (onEnded) await onEnded({ callId, answeredBy, call, status });
+        if (onEnded) await onEnded({ callId, answeredBy, userId, call, status });
+        stop();
+        return;
+      }
+
+      const elapsed = Date.now() - started;
+      if (inProgress || sawLiveActor) {
+        if (elapsed > inProgressMaxMs) {
+          console.log(`[${firm.id}][phone-staff] Answer watch gave up on in-progress ${callId} after ${Math.round(elapsed / 60000)}m`);
+          stop();
+          return;
+        }
+      } else if (elapsed > ringMaxMs) {
+        console.log(`[${firm.id}][phone-staff] Answer watch timed out for ${callId} (still ringing, no answeredBy)`);
         stop();
         return;
       }
@@ -1459,13 +1519,13 @@ export function startAnswerWatch(firm, {
 
   const schedule = () => {
     if (stopped) return;
-    const tid = setTimeout(tick, ANSWER_POLL_MS);
+    const tid = setTimeout(tick, pollMs);
     firm.answerWatchTimers.set(callId, tid);
   };
 
   console.log(`[${firm.id}][phone-staff] Watching ${callId} for answer → Slack on-call status`);
   // First poll soon after ringing — people often answer within a few seconds.
-  const tid = setTimeout(tick, 2_000);
+  const tid = setTimeout(tick, firstDelayMs);
   firm.answerWatchTimers.set(callId, tid);
 }
 

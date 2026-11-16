@@ -16,6 +16,10 @@ import {
   noticeGroups,
   personRingsOnLine,
   FAST_HANGUP_SECONDS,
+  resolveLiveOnCallIds,
+  isOutboundDirection,
+  startAnswerWatch,
+  stopAnswerWatch,
 } from "./phone-staff.js";
 
 const staff = normalizePhoneStaff({
@@ -335,5 +339,83 @@ assert.equal(missSummary.byUser.find((u) => u.slackUserId === "ULIZ444").count, 
 assert.equal(missSummary.byUser.find((u) => u.slackUserId === "USTE555").count, 0);
 assert.equal(missSummary.byUser.find((u) => u.slackUserId === "USTE555").onDuty, true);
 assert.equal(missSummary.byUser.some((u) => u.slackUserId === "UJIS888"), false);
+
+assert.equal(isOutboundDirection("outgoing"), true);
+assert.equal(isOutboundDirection("inbound"), false);
+
+// Outbound: dialer userId counts even when Quo leaves answeredBy empty.
+assert.deepEqual(
+  resolveLiveOnCallIds({ userId: "USROM", direction: "outgoing" }, { direction: "outgoing" }),
+  { answeredBy: null, userId: "USROM" },
+);
+assert.deepEqual(
+  resolveLiveOnCallIds({ initiatedBy: "USROM", answeredBy: null }, { direction: "outbound" }),
+  { answeredBy: null, userId: "USROM" },
+);
+// Inbound: inbox userId alone must NOT mark on-call (line owner ≠ answerer).
+assert.deepEqual(
+  resolveLiveOnCallIds({ userId: "USLINE", answeredBy: null }, { direction: "incoming" }),
+  { answeredBy: null, userId: null },
+);
+// Inbound: answeredBy is the live signal.
+assert.deepEqual(
+  resolveLiveOnCallIds({ userId: "USLINE", answeredBy: "USJIS" }, { direction: "incoming" }),
+  { answeredBy: "USJIS", userId: null },
+);
+// Sona must not mark phone staff on-call.
+assert.deepEqual(
+  resolveLiveOnCallIds({ answeredBy: "SYUQLo5fqa7" }, { direction: "incoming" }),
+  { answeredBy: null, userId: null },
+);
+
+// Answer watch: outbound poll with only userId should fire onAnswered.
+{
+  let answered = null;
+  let ended = null;
+  const firm = { id: "test", answerWatchTimers: new Map() };
+  const polls = [
+    { status: "ringing", direction: "outgoing", userId: "USROM", answeredBy: null },
+    { status: "in-progress", direction: "outgoing", userId: "USROM", answeredBy: null },
+    { status: "completed", direction: "outgoing", userId: "USROM", answeredBy: null },
+  ];
+  let i = 0;
+  startAnswerWatch(firm, {
+    callId: "ACout1",
+    direction: "outgoing",
+    pollMs: 30,
+    firstDelayMs: 10,
+    fetchCall: async () => polls[Math.min(i++, polls.length - 1)],
+    onAnswered: async (payload) => { answered = payload; },
+    onEnded: async (payload) => { ended = payload; },
+  });
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(answered?.userId, "USROM");
+  assert.equal(answered?.answeredBy, null);
+  assert.equal(ended?.status, "completed");
+  assert.equal(ended?.userId, "USROM");
+  stopAnswerWatch(firm, "ACout1");
+}
+
+// Answer watch: inbound with only line-owner userId must not fire onAnswered.
+{
+  let answered = null;
+  const firm = { id: "test", answerWatchTimers: new Map() };
+  startAnswerWatch(firm, {
+    callId: "ACin1",
+    direction: "incoming",
+    pollMs: 30,
+    firstDelayMs: 10,
+    fetchCall: async () => ({
+      status: "in-progress",
+      direction: "incoming",
+      userId: "USLINE",
+      answeredBy: null,
+    }),
+    onAnswered: async (payload) => { answered = payload; },
+  });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(answered, null);
+  stopAnswerWatch(firm, "ACin1");
+}
 
 console.log("test-phone-staff: ok");
