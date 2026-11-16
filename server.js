@@ -1713,7 +1713,9 @@ const BUCKET_LABEL = {
 };
 
 // A return call is merged onto the lead that phone already has.
-// A classification never closes a lead. It leaves a suggestion a person confirms.
+// A classification never closes a lead and never sets caller_class.
+// That column is what moves a row into Non-leads, and only a person does that.
+// The classification leaves a suggestion a person confirms.
 /** These classes are never new work-queue leads. Update an open lead if one exists; do not open a new row. */
 const NEVER_OPEN_LEAD_BUCKETS = new Set([
   "spam",
@@ -1855,17 +1857,12 @@ async function recordClassifiedCall(firm, {
       if (row && !["Lost", "Referred"].includes(row.lead_status)) {
         await client.query(
           `update public.leads set
-             caller_class = 'non_pi',
              close_suggestion = 'decline',
              grade = coalesce(grade, 'C'),
              grade_reason = $2,
              grade_source = 'quo-router',
              summary = coalesce(summary, $3),
-             slack_permalink = coalesce(slack_permalink, $4),
-             case_type = case
-               when case_type is null or btrim(case_type) = '' then 'Non-PI Legal Matter'
-               else case_type
-             end
+             slack_permalink = coalesce(slack_permalink, $4)
            where id = $1`,
           [row.id, reason, summaryText, slackPermalink || null],
         );
@@ -1886,11 +1883,11 @@ async function recordClassifiedCall(firm, {
           `insert into public.leads (
              lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
              summary, quo_link, intake_call_id, owner_name, slack_permalink,
-             grade, grade_reason, grade_source, follow_up, caller_class, close_suggestion, case_type
+             grade, grade_reason, grade_source, follow_up, close_suggestion
            ) values (
              current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
              $4, $5, $6, $7, $8,
-             'C', $9, 'quo-router', true, 'non_pi', 'decline', 'Non-PI Legal Matter'
+             'C', $9, 'quo-router', true, 'decline'
            )
            on conflict (intake_call_id) do nothing
            returning id`,
@@ -1934,9 +1931,9 @@ async function recordClassifiedCall(firm, {
         );
         return;
       }
+      // Already on the queue: suggestion only. Do not set caller class, status, or follow-up.
       await client.query(
         `update public.leads set
-           caller_class = coalesce(caller_class, $6),
            close_suggestion = 'not_a_lead',
            grade_reason = coalesce(grade_reason, $2),
            summary = coalesce(summary, $3),
@@ -1949,7 +1946,7 @@ async function recordClassifiedCall(firm, {
            end
          where id = $1
            and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
-        [row.id, reason, summaryText, slackPermalink || null, detail, bucket],
+        [row.id, reason, summaryText, slackPermalink || null, detail],
       );
       await client.query(
         `insert into public.lead_events (lead_id, event_type, actor, payload)
@@ -1983,17 +1980,17 @@ async function recordClassifiedCall(firm, {
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, quo_link, intake_call_id, owner_name, slack_permalink,
-         grade_reason, follow_up, close_suggestion, caller_class
+         grade_reason, follow_up, close_suggestion
        ) values (
          current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
          $4, $5, $6, $7, $8,
-         $9, true, 'not_a_lead', $10
+         $9, true, 'not_a_lead'
        )
        on conflict (intake_call_id) do nothing
        returning id`,
       [
         phone || null, phoneE164, arrival || null, summaryText, quoLink || null, callId || null,
-        handledBy || null, slackPermalink || null, reason, bucket,
+        handledBy || null, slackPermalink || null, reason,
       ],
     );
     const id = inserted.rows[0]?.id;
@@ -2089,7 +2086,7 @@ Reasons are one short sentence each. Do not invent facts.`,
     const established = contractOut || qualifiedYes || caseTypeIsLead(existing?.case_type);
     const flagged = !holdExclusion && callIsNotALead(sourceText, score) && !established;
     const suggestion = flagged ? "not_a_lead" : (!holdExclusion && score?.not_interested ? "not_interested" : null);
-    // Decline, rejection, and not-a-lead stay open until a person confirms them.
+    // A lead already on the queue stays open. A later call may suggest a close, and a person confirms it.
     const closeNow = false;
     const grade = flagged ? "C" : (score && ["A", "B", "C"].includes(score.grade) ? score.grade : null);
     const gradeReason = flagged
@@ -2160,13 +2157,6 @@ Reasons are one short sentence each. Do not invent facts.`,
            sentiment_reason = case when $10::text is null then sentiment_reason else $11 end,
            sentiment_source = case when $10::text is null then sentiment_source else 'quo-router' end,
            sequence = $12,
-           lead_status = case when $14 then 'Lost' else lead_status end,
-           follow_up = case when $14 then false else follow_up end,
-           close_reason = case when $14 then 'not_a_lead' else close_reason end,
-           text_sequence_status = case
-             when $14 and text_sequence_status = 'active' then 'stopped'
-             else text_sequence_status
-           end,
            case_detail = case
              when $13::text is null then case_detail
              when case_detail is null or case_detail = '' then $13
