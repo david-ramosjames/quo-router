@@ -98,6 +98,7 @@ Available Missed rules:
 - ≤5s hangup → team missed + callback ask; **no** individual Available Missed
 - >5s and ≤ that person's `rings after` → callback ask for them; Available Missed only for people whose phones already rang
 - >10s (or past their delay) on an inbox that rings to them → Available Missed if on-topic and free
+- **Transfers are excluded:** RJL Transfers inbox, Quo `forwarded` legs, and rings for a client that staff already answered in the last 3 minutes (warm/cold transfer / consult) do **not** count as Available Missed — so ignoring a transfer to an attorney does not inflate the score
 
 Hours are per person, in the timezone on the first line (default `America/Chicago`). Someone is not tagged outside their own hours. The person marked `after-hours` is tagged only when no scheduled shift covers the call.
 

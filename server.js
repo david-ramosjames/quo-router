@@ -20,6 +20,7 @@ import {
   phoneStaffStatusSummary,
   snapshotPhoneStaffAvailability,
   resolveLiveOnCallIds,
+  shouldSkipAvailableMissed,
 } from "./phone-staff.js";
 import {
   normalizeCallbackEscalation,
@@ -257,10 +258,41 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     followUpWindows: new Map(), // phoneLast10 -> { intakeCallId, expiresAt }
     pendingCallbacks: new Map(), // phoneLast10 -> { callId, expiresAt }
     onCallByCallId: new Map(), // callId -> Map(slackUserId -> entry) (multi-party safe)
+    // External phone last-10 → { at, callId } when staff answered — transfer
+    // rings for the same client shortly after should not count Available Missed.
+    recentStaffAnswers: new Map(),
     answerWatchTimers: new Map(), // callId -> timeout id
     callbackEscalations: new Map(), // key -> pending escalation job
     callbackRotation: 0,
   };
+}
+
+const RECENT_STAFF_ANSWER_MS = 3 * 60_000;
+
+function rememberStaffAnsweredPhone(firm, phone, callId = null) {
+  const key = phoneLast10(phone);
+  if (!firm || !key) return;
+  if (!firm.recentStaffAnswers) firm.recentStaffAnswers = new Map();
+  firm.recentStaffAnswers.set(key, { at: Date.now(), callId: callId || null });
+  // Opportunistic prune so the map cannot grow without bound.
+  if (firm.recentStaffAnswers.size > 200) {
+    const cutoff = Date.now() - RECENT_STAFF_ANSWER_MS;
+    for (const [k, v] of firm.recentStaffAnswers) {
+      if (!v?.at || v.at < cutoff) firm.recentStaffAnswers.delete(k);
+    }
+  }
+}
+
+function recentStaffAnswerForPhone(firm, phone) {
+  const key = phoneLast10(phone);
+  if (!firm?.recentStaffAnswers || !key) return false;
+  const entry = firm.recentStaffAnswers.get(key);
+  if (!entry?.at) return false;
+  if (Date.now() - entry.at > RECENT_STAFF_ANSWER_MS) {
+    firm.recentStaffAnswers.delete(key);
+    return false;
+  }
+  return true;
 }
 
 // Recompute a firm's derived credential fields in place (after its stored
@@ -3881,9 +3913,16 @@ function watchCallForPhoneStaffStatus(firm, callId, { direction = null } = {}) {
     callId,
     direction,
     fetchCall: fetchCallFromQuo,
-    onAnswered: async ({ callId: id, answeredBy, userId, actorIds }) => {
+    onAnswered: async ({ callId: id, answeredBy, userId, actorIds, call }) => {
       cacheCall(firm, id, { answeredBy, userId });
       await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId, actorIds });
+      const cached = getCachedCall(firm, id) || call || {};
+      const from = cached.from || call?.from;
+      const to = cached.to || call?.to;
+      const external = firm.phoneLines?.[from] ? to : from;
+      if (answeredBy || (actorIds && actorIds.length)) {
+        rememberStaffAnsweredPhone(firm, external, id);
+      }
     },
     onEnded: async ({ callId: id, answeredBy, userId, actorIds }) => {
       if (answeredBy || userId || (actorIds && actorIds.length)) {
@@ -3930,17 +3969,35 @@ async function phoneStaffBlock(firm, {
   phoneFrom = null,
   phoneTo = null,
   phoneLineLabel = null,
+  status = null,
+  forwardedTo = null,
+  forwardedFrom = null,
+  externalPhone = null,
 } = {}) {
   try {
     const lineLabel = phoneLineLabel || calledFirmLineLabel(firm, phoneFrom, phoneTo);
+    const clientPhone = externalPhone
+      || (firm.phoneLines?.[phoneFrom] ? phoneTo : phoneFrom);
+    const skipReason = shouldSkipAvailableMissed({
+      status,
+      forwardedTo,
+      forwardedFrom,
+      phoneLineLabel: lineLabel,
+      recentStaffAnswer: recentStaffAnswerForPhone(firm, clientPhone),
+    });
+    if (skipReason) {
+      console.log(`[${firm.id}][phone-staff] Skipping Available Missed (${skipReason}) for ${callId || "n/a"} on ${lineLabel || "unknown line"}`);
+    }
     const result = await attachAvailabilityToNotice(pgPool, firm, "", {
       callId,
       eventType,
       ringSeconds,
       phoneLineLabel: lineLabel,
       fetchActiveCallsForActor,
+      skipAvailableMissed: Boolean(skipReason),
+      skipReason,
     });
-    return { text: result.text || "", snapshot: result.snapshot || [] };
+    return { text: result.text || "", snapshot: result.snapshot || [], skipAvailableMissed: Boolean(skipReason), skipReason };
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] availability attach failed:`, err.message);
     return { text: "", snapshot: [] };
@@ -4290,8 +4347,8 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   }
 
   // Forwarded leg — routed to another number/line that reports it separately.
-  if (forwardedTo && !answeredAt && !hasVoicemail) {
-    console.log(`[${firm.id}][call-check] Call ${callId} forwarded to ${forwardedTo} — not a missed call, skipping`);
+  if (status === "forwarded" || (forwardedTo && !answeredAt && !hasVoicemail)) {
+    console.log(`[${firm.id}][call-check] Call ${callId} forwarded${forwardedTo ? ` to ${forwardedTo}` : ""} — not a missed call, skipping`);
     return;
   }
 
@@ -4305,9 +4362,12 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
   const externalNumber = firm.phoneLines[from] ? to : from;
   const isSavedContact = !!getContactName(firm, externalNumber);
 
-  const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
+  const isMissedStatus = ["no-answer", "busy", "canceled", "failed", "missed"].includes(status);
   const isMenuHangup = status === "completed" && !!answeredAt && !answeredBy && !hasVoicemail;
   const isAnswered = status === "completed" && !!answeredBy;
+  if (isAnswered && answeredBy) {
+    rememberStaffAnsweredPhone(firm, externalNumber, callId);
+  }
 
   if (isMissedStatus || isMenuHangup || (status === "completed" && !answeredAt && !hasVoicemail)) {
     let header;
@@ -4324,17 +4384,21 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
     stopAnswerWatch(firm, callId);
     await clearSlackOnCallStatus(firm, callId);
     const eventType = isMenuHangup ? "menu_hangup" : "missed";
+    const externalPhone = firm.phoneLines[from] ? to : from;
     const staff = await phoneStaffBlock(firm, {
       callId,
       eventType,
       ringSeconds: ringSecondsFromCall(call, { allowTotalDuration: true }),
       phoneFrom: from,
       phoneTo: to,
+      status,
+      forwardedTo,
+      forwardedFrom: call.forwardedFrom || null,
+      externalPhone,
     });
     const intakeText = text + staff.text;
     console.log(`[${firm.id}][call-check] Fallback: ${isMenuHangup ? "menu hangup" : "missed"} for ${callId}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
-    const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
     let leadPost = null;
     if (closedClient) {
@@ -5121,6 +5185,12 @@ async function handleCalls(firm, req, res) {
         }).catch((err) =>
           console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
         );
+        // Staff answered this client — later transfer/consult rings for the same
+        // number should not count as Available Missed.
+        if (direction === "incoming" && (live.answeredBy || live.actorIds?.length)) {
+          const external = firm.phoneLines[from] ? to : from;
+          rememberStaffAnsweredPhone(firm, external, callId);
+        }
       }
     }
     const isTerminalStatus = ["completed", "no-answer", "busy", "canceled", "cancelled", "failed"].includes(status);
@@ -5136,13 +5206,13 @@ async function handleCalls(firm, req, res) {
     // A forwarded leg completes on this line without being answered here — the
     // call was routed to another number/line, which handles and reports it
     // separately. Don't flag it as missed.
-    if (forwardedTo && !answeredAt && !hasVoicemail) {
-      console.log(`[${firm.id}][calls] Call ${callId} forwarded to ${forwardedTo} — not a missed call, skipping`);
+    if (status === "forwarded" || (forwardedTo && !answeredAt && !hasVoicemail)) {
+      console.log(`[${firm.id}][calls] Call ${callId} forwarded${forwardedTo ? ` to ${forwardedTo}` : ""} — not a missed call, skipping`);
       markCallResolved(firm, callId);
       return;
     }
 
-    const isMissedStatus = ["no-answer", "busy", "canceled", "failed"].includes(status);
+    const isMissedStatus = ["no-answer", "busy", "canceled", "failed", "missed"].includes(status);
     const isUnanswered = status === "completed" && !answeredAt && direction === "incoming";
     const isMenuHangup =
       status === "completed" &&
@@ -5204,6 +5274,7 @@ async function handleCalls(firm, req, res) {
     if (ringSeconds == null && priorCall?.ringingAt) {
       ringSeconds = Math.max(0, Math.round((Date.now() - priorCall.ringingAt) / 1000));
     }
+    const externalPhone = firm.phoneLines[from] ? to : from;
     const availabilityEvent = isMenuHangup ? "menu_hangup" : "missed";
     const staff = await phoneStaffBlock(firm, {
       callId,
@@ -5211,13 +5282,15 @@ async function handleCalls(firm, req, res) {
       ringSeconds,
       phoneFrom: from,
       phoneTo: to,
+      status,
+      forwardedTo,
+      forwardedFrom: obj.forwardedFrom || null,
+      externalPhone,
     });
     const intakeText = text + staff.text;
     console.log(`[${firm.id}][calls] ${isMenuHangup ? "Menu hangup" : "Missed call"} from: ${fromDisplay}`);
     await postToSlack(firm.slackWebhooks.missedCalls, text);
     console.log(`[${firm.id}][calls] Sent to missed-calls-voicemail`);
-
-    const externalPhone = firm.phoneLines[from] ? to : from;
     const closedClient = shouldAlertClosedClient(firm, externalPhone);
     let slackPermalink = null;
     let leadPost = null;
@@ -5573,6 +5646,10 @@ async function handleCallSummary(firm, req, res) {
           ringSeconds: ringSecondsFromCall(obj) ?? ringSecondsFromCall(cached),
           phoneFrom: from,
           phoneTo: to,
+          status: cached?.status || obj.status || null,
+          forwardedTo: cached?.forwardedTo || obj.forwardedTo || null,
+          forwardedFrom: cached?.forwardedFrom || obj.forwardedFrom || null,
+          externalPhone: firm.phoneLines[from] ? to : from,
         })
       : { text: "", snapshot: [] };
 

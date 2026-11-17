@@ -25,6 +25,8 @@ import {
   clearSlackOnCallStatus,
   onCallSlackUserIds,
   syncPhoneStaffOnCallFromQuo,
+  shouldSkipAvailableMissed,
+  isTransferInboxLabel,
 } from "./phone-staff.js";
 
 const staff = normalizePhoneStaff({
@@ -219,6 +221,23 @@ assert.equal(personRingsOnLine(roleParsed[2], "Leads"), true);
 assert.equal(personRingsOnLine(roleParsed[2], "RGV Number"), true);
 assert.equal(personRingsOnLine(roleParsed[2], "RJL Main Line"), false);
 assert.equal(personRingsOnLine(roleParsed[0], "RJL Main Line"), true);
+
+assert.equal(isTransferInboxLabel("RJL Transfers"), true);
+assert.equal(isTransferInboxLabel("Leads"), false);
+assert.equal(shouldSkipAvailableMissed({ phoneLineLabel: "RJL Transfers" }), "transfer_inbox");
+assert.equal(shouldSkipAvailableMissed({ status: "forwarded" }), "forwarded_status");
+assert.equal(shouldSkipAvailableMissed({ forwardedTo: "+15551212" }), "forwarded_leg");
+assert.equal(shouldSkipAvailableMissed({ recentStaffAnswer: true }), "transfer_after_answer");
+assert.equal(shouldSkipAvailableMissed({ phoneLineLabel: "Leads", status: "no-answer" }), null);
+{
+  const transferBlock = formatAvailabilitySlackBlock(
+    [{ name: "Valeria", slackUserId: "UVAL", state: "available", tag: true }],
+    { ringSeconds: 20, omitAvailableMissed: true, omitReason: "transfer_after_answer" },
+  );
+  assert.match(transferBlock, /not counted as Available Missed/i);
+  assert.doesNotMatch(transferBlock, /Available to answer/);
+  assert.doesNotMatch(transferBlock, /:warning: Valeria/);
+}
 
 const mainLineMiss = noticeGroups(
   [

@@ -421,6 +421,32 @@ export function personRingsOnLine(person, phoneLineLabel) {
   });
 }
 
+/** Transfer inboxes (e.g. RJL Transfers) — not a client Available-Missed target. */
+export function isTransferInboxLabel(phoneLineLabel) {
+  return /\btransfers?\b/i.test(String(phoneLineLabel || ""));
+}
+
+/**
+ * Legs that should not inflate Available Missed:
+ * - RJL Transfers (and similar) inboxes
+ * - Quo forwarded status / forwardedTo auto-route
+ * - Warm/cold transfer rings after staff already answered the same client
+ */
+export function shouldSkipAvailableMissed({
+  status = null,
+  forwardedTo = null,
+  forwardedFrom = null,
+  phoneLineLabel = null,
+  recentStaffAnswer = false,
+} = {}) {
+  if (isTransferInboxLabel(phoneLineLabel)) return "transfer_inbox";
+  const st = String(status || "").toLowerCase();
+  if (st === "forwarded" || st.includes("forward")) return "forwarded_status";
+  if (forwardedTo || forwardedFrom) return "forwarded_leg";
+  if (recentStaffAnswer) return "transfer_after_answer";
+  return null;
+}
+
 function formatDays(days) {
   const set = [...new Set(days)].sort((a, b) => a - b);
   const ranges = [];
@@ -1347,7 +1373,12 @@ function formatRingDuration(ringSeconds) {
   return secs === 1 ? "1s" : `${secs}s`;
 }
 
-export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null, phoneLineLabel = null } = {}) {
+export function formatAvailabilitySlackBlock(snapshot, {
+  ringSeconds = null,
+  phoneLineLabel = null,
+  omitAvailableMissed = false,
+  omitReason = null,
+} = {}) {
   const {
     fast,
     couldAnswer,
@@ -1359,22 +1390,31 @@ export function formatAvailabilitySlackBlock(snapshot, { ringSeconds = null, pho
   const lines = [];
   const ringLabel = formatRingDuration(ringSeconds);
   if (ringLabel) lines.push(`_Rang for ${ringLabel}_`);
-  const warnActive = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
-  const afterHoursOnly = warnActive.length > 0
-    && warnActive.every((r) => r.afterHoursDuty || r.state === "after_hours");
-  if (fast) {
-    const who = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
-    if (who.length) {
-      lines.push(`*Caller hung up, please call back:*\n${checkedNames(who, { mention: afterHoursOnly })}`);
-    }
+  if (omitAvailableMissed) {
+    const reason = omitReason === "transfer_after_answer"
+      ? "Transfer/consult ring after a staff answer — not counted as Available Missed."
+      : omitReason === "transfer_inbox"
+        ? "Transfer inbox — not counted as Available Missed."
+        : "Forwarded/transfer leg — not counted as Available Missed.";
+    lines.push(`_${reason}_`);
   } else {
-    const availableLines = [...couldAnswer, ...inactiveAccountable];
-    if (availableLines.length) {
-      lines.push(`*Available to answer (active, not on a call):*\n${checkedNames(availableLines, { mention: afterHoursOnly })}`);
-    }
-    const callbackLines = [...callbackOnly, ...inactiveCallback];
-    if (callbackLines.length) {
-      lines.push(`*Please call back:*\n${checkedNames(callbackLines, { mention: false })}`);
+    const warnActive = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
+    const afterHoursOnly = warnActive.length > 0
+      && warnActive.every((r) => r.afterHoursDuty || r.state === "after_hours");
+    if (fast) {
+      const who = [...couldAnswer, ...callbackOnly, ...inactiveAccountable, ...inactiveCallback];
+      if (who.length) {
+        lines.push(`*Caller hung up, please call back:*\n${checkedNames(who, { mention: afterHoursOnly })}`);
+      }
+    } else {
+      const availableLines = [...couldAnswer, ...inactiveAccountable];
+      if (availableLines.length) {
+        lines.push(`*Available to answer (active, not on a call):*\n${checkedNames(availableLines, { mention: afterHoursOnly })}`);
+      }
+      const callbackLines = [...callbackOnly, ...inactiveCallback];
+      if (callbackLines.length) {
+        lines.push(`*Please call back:*\n${checkedNames(callbackLines, { mention: false })}`);
+      }
     }
   }
   for (const row of context) {
@@ -1711,24 +1751,36 @@ export async function attachAvailabilityToNotice(pgPool, firm, text, {
   ringSeconds = null,
   phoneLineLabel = null,
   fetchActiveCallsForActor = null,
+  skipAvailableMissed = false,
+  skipReason = null,
 } = {}) {
   if (!firm.phoneStaff?.length) return { text, snapshot: [] };
   const { rows: raw, dutySlackUserIds } = await snapshotPhoneStaffAvailability(firm, {
     fetchActiveCallsForActor,
   });
-  const { accountable } = noticeGroups(raw, ringSeconds, phoneLineLabel);
+  const groups = noticeGroups(raw, ringSeconds, phoneLineLabel);
+  // Transfer / forward legs still show context, but nobody is accountable and
+  // we do not persist Available Missed counts for them.
+  const accountable = skipAvailableMissed ? [] : groups.accountable;
   const accountableIds = new Set(accountable.map((r) => r.slackUserId));
   const snapshot = raw.map((r) => ({
     ...r,
     accountable: accountableIds.has(r.slackUserId),
     phoneLineLabel: phoneLineLabel || null,
   }));
-  const block = formatAvailabilitySlackBlock(snapshot, { ringSeconds, phoneLineLabel });
-  await recordAvailabilityEvent(pgPool, firm, {
-    callId,
-    eventType,
-    snapshot,
-    dutySlackUserIds,
+  const block = formatAvailabilitySlackBlock(snapshot, {
+    ringSeconds,
+    phoneLineLabel,
+    omitAvailableMissed: Boolean(skipAvailableMissed),
+    omitReason: skipReason,
   });
+  if (!skipAvailableMissed) {
+    await recordAvailabilityEvent(pgPool, firm, {
+      callId,
+      eventType,
+      snapshot,
+      dutySlackUserIds,
+    });
+  }
   return { text: text + block, snapshot };
 }
