@@ -256,7 +256,7 @@ function makeFirm(firmId, config, storedSecrets = {}) {
     caseStatusCache: new Map(), // caseNumber(string) -> status(string, lowercased)
     followUpWindows: new Map(), // phoneLast10 -> { intakeCallId, expiresAt }
     pendingCallbacks: new Map(), // phoneLast10 -> { callId, expiresAt }
-    onCallByCallId: new Map(), // callId -> { slackUserId, previous status, setAt }
+    onCallByCallId: new Map(), // callId -> Map(slackUserId -> entry) (multi-party safe)
     answerWatchTimers: new Map(), // callId -> timeout id
     callbackEscalations: new Map(), // key -> pending escalation job
     callbackRotation: 0,
@@ -3124,6 +3124,7 @@ async function fetchCallFromQuo(firm, callId) {
       if (tooManyParticipants) {
         // Quo cannot return group/transfer legs via GET /calls/{id}. Webhooks
         // still carry from/to/answeredBy — treat as a soft, permanent miss.
+        // Miss snapshots still discover conference joiners via actorId list-calls.
         console.warn(`[${firm.id}][call-check] Quo API cannot fetch ${callId} (too many participants) — using webhook payload only`);
         return { __unsupported: true, reason: "too_many_participants" };
       }
@@ -3135,6 +3136,56 @@ async function fetchCallFromQuo(firm, callId) {
   } catch (err) {
     console.error(`[${firm.id}][call-check] Error fetching call:`, err.message);
     return null;
+  }
+}
+
+/**
+ * Live calls for one Quo user (including conference joins where they aren't
+ * answeredBy). Uses the 2026-03-30 list-calls actorId + status filters.
+ */
+async function fetchActiveCallsForActor(firm, actorId) {
+  if (!firm.quoApiKey || !actorId) return [];
+  try {
+    const url = new URL("https://api.openphone.com/v1/calls");
+    url.searchParams.set("actorId", String(actorId));
+    // Live legs only — conference joiners show up under their own actorId.
+    url.searchParams.set("status[in]", "in-progress,ringing,answered");
+    url.searchParams.set("maxResults", "10");
+    let res = await fetchWithRetry(url.toString(), {
+      headers: {
+        Authorization: firm.quoApiKey,
+        "Quo-Api-Version": "2026-03-30",
+      },
+    }, { label: `${firm.id}][active-calls`, attempts: 2 });
+    if (!res.ok && (res.status === 400 || res.status === 404 || res.status === 422)) {
+      // Older gateways want a single status= or omit the versioned filter shape.
+      const fallback = new URL("https://api.openphone.com/v1/calls");
+      fallback.searchParams.set("actorId", String(actorId));
+      fallback.searchParams.set("status", "in-progress");
+      fallback.searchParams.set("maxResults", "10");
+      res = await fetchWithRetry(fallback.toString(), {
+        headers: {
+          Authorization: firm.quoApiKey,
+          "Quo-Api-Version": "2026-03-30",
+        },
+      }, { label: `${firm.id}][active-calls`, attempts: 2 });
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(
+        `[${firm.id}][active-calls] List calls for ${actorId} → ${res.status}: ${body.slice(0, 200)}`,
+      );
+      return [];
+    }
+    const json = await res.json();
+    const rows = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+    return rows.filter((c) => {
+      const st = String(c?.status || "").toLowerCase();
+      return ["in-progress", "ringing", "answered", "initiated", "queued"].includes(st);
+    });
+  } catch (err) {
+    console.warn(`[${firm.id}][active-calls] Error for ${actorId}:`, err.message);
+    return [];
   }
 }
 
@@ -3830,13 +3881,13 @@ function watchCallForPhoneStaffStatus(firm, callId, { direction = null } = {}) {
     callId,
     direction,
     fetchCall: fetchCallFromQuo,
-    onAnswered: async ({ callId: id, answeredBy, userId }) => {
+    onAnswered: async ({ callId: id, answeredBy, userId, actorIds }) => {
       cacheCall(firm, id, { answeredBy, userId });
-      await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId });
+      await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId, actorIds });
     },
-    onEnded: async ({ callId: id, answeredBy, userId }) => {
-      if (answeredBy || userId) {
-        await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId });
+    onEnded: async ({ callId: id, answeredBy, userId, actorIds }) => {
+      if (answeredBy || userId || (actorIds && actorIds.length)) {
+        await markPhoneStaffOnCall(firm, { callId: id, answeredBy, userId, actorIds });
       }
       await clearSlackOnCallStatus(firm, id);
     },
@@ -3887,6 +3938,7 @@ async function phoneStaffBlock(firm, {
       eventType,
       ringSeconds,
       phoneLineLabel: lineLabel,
+      fetchActiveCallsForActor,
     });
     return { text: result.text || "", snapshot: result.snapshot || [] };
   } catch (err) {
@@ -4222,11 +4274,12 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
 
   if (status === "in-progress" || status === "ringing" || status === "queued" || status === "initiated") {
     const live = resolveLiveOnCallIds(call, { direction });
-    if (live.answeredBy || live.userId) {
+    if (live.answeredBy || live.userId || live.actorIds?.length) {
       await markPhoneStaffOnCall(firm, {
         callId,
         answeredBy: live.answeredBy,
         userId: live.userId,
+        actorIds: live.actorIds,
       }).catch((err) =>
         console.warn(`[${firm.id}][phone-staff] on-call mark failed during ${status}:`, err.message),
       );
@@ -4991,11 +5044,12 @@ async function handleCalls(firm, req, res) {
       }
       {
         const live = resolveLiveOnCallIds(obj, { direction });
-        if (live.answeredBy || live.userId) {
+        if (live.answeredBy || live.userId || live.actorIds?.length) {
           await markPhoneStaffOnCall(firm, {
             callId,
             answeredBy: live.answeredBy,
             userId: live.userId,
+            actorIds: live.actorIds,
           }).catch(() => {});
         }
       }
@@ -5037,11 +5091,12 @@ async function handleCalls(firm, req, res) {
         // Outbound: Quo rarely fills answeredBy live. userId/initiatedBy is the
         // dialer — mark them busy as soon as the outbound leg starts ringing.
         const live = resolveLiveOnCallIds(obj, { direction });
-        if (live.userId || live.answeredBy) {
+        if (live.userId || live.answeredBy || live.actorIds?.length) {
           await markPhoneStaffOnCall(firm, {
             callId,
             answeredBy: live.answeredBy,
             userId: live.userId,
+            actorIds: live.actorIds,
           }).catch((err) =>
             console.warn(`[${firm.id}][phone-staff] outbound on-call mark failed:`, err.message),
           );
@@ -5053,15 +5108,16 @@ async function handleCalls(firm, req, res) {
     }
 
     // Mid-call / completion updates: keep Slack "On a call" in sync.
-    // Inbound: only answeredBy (userId is usually the inbox owner).
+    // Inbound: answeredBy + any conference participant actorIds.
     // Outbound: userId/initiatedBy is the dialer even when answeredBy is empty.
     {
       const live = resolveLiveOnCallIds(obj, { direction });
-      if (live.answeredBy || live.userId) {
+      if (live.answeredBy || live.userId || live.actorIds?.length) {
         await markPhoneStaffOnCall(firm, {
           callId,
           answeredBy: live.answeredBy,
           userId: live.userId,
+          actorIds: live.actorIds,
         }).catch((err) =>
           console.warn(`[${firm.id}][phone-staff] on-call mark failed:`, err.message),
         );
@@ -5454,11 +5510,12 @@ async function handleCallSummary(firm, req, res) {
         const live = resolveLiveOnCallIds(cached || {}, {
           direction: outbound ? "outbound" : (cached?.direction || "incoming"),
         });
-        if (live.answeredBy || live.userId) {
+        if (live.answeredBy || live.userId || live.actorIds?.length) {
           await markPhoneStaffOnCall(firm, {
             callId,
             answeredBy: live.answeredBy,
             userId: live.userId,
+            actorIds: live.actorIds,
           }).catch(() => {});
         }
       }
@@ -5499,11 +5556,12 @@ async function handleCallSummary(firm, req, res) {
       const live = resolveLiveOnCallIds(cached || {}, {
         direction: outbound ? "outbound" : (cached?.direction || "incoming"),
       });
-      if (live.answeredBy || live.userId) {
+      if (live.answeredBy || live.userId || live.actorIds?.length) {
         await markPhoneStaffOnCall(firm, {
           callId,
           answeredBy: live.answeredBy,
           userId: live.userId,
+          actorIds: live.actorIds,
         });
       }
     }

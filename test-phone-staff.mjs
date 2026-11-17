@@ -17,9 +17,14 @@ import {
   personRingsOnLine,
   FAST_HANGUP_SECONDS,
   resolveLiveOnCallIds,
+  extractLiveActorIdsFromCall,
   isOutboundDirection,
   startAnswerWatch,
   stopAnswerWatch,
+  markPhoneStaffOnCall,
+  clearSlackOnCallStatus,
+  onCallSlackUserIds,
+  syncPhoneStaffOnCallFromQuo,
 } from "./phone-staff.js";
 
 const staff = normalizePhoneStaff({
@@ -346,26 +351,39 @@ assert.equal(isOutboundDirection("inbound"), false);
 // Outbound: dialer userId counts even when Quo leaves answeredBy empty.
 assert.deepEqual(
   resolveLiveOnCallIds({ userId: "USROM", direction: "outgoing" }, { direction: "outgoing" }),
-  { answeredBy: null, userId: "USROM" },
+  { answeredBy: null, userId: "USROM", actorIds: ["USROM"] },
 );
 assert.deepEqual(
   resolveLiveOnCallIds({ initiatedBy: "USROM", answeredBy: null }, { direction: "outbound" }),
-  { answeredBy: null, userId: "USROM" },
+  { answeredBy: null, userId: "USROM", actorIds: ["USROM"] },
 );
 // Inbound: inbox userId alone must NOT mark on-call (line owner ≠ answerer).
 assert.deepEqual(
   resolveLiveOnCallIds({ userId: "USLINE", answeredBy: null }, { direction: "incoming" }),
-  { answeredBy: null, userId: null },
+  { answeredBy: null, userId: null, actorIds: [] },
 );
 // Inbound: answeredBy is the live signal.
 assert.deepEqual(
   resolveLiveOnCallIds({ userId: "USLINE", answeredBy: "USJIS" }, { direction: "incoming" }),
-  { answeredBy: "USJIS", userId: null },
+  { answeredBy: "USJIS", userId: null, actorIds: ["USJIS"] },
 );
 // Sona must not mark phone staff on-call.
 assert.deepEqual(
   resolveLiveOnCallIds({ answeredBy: "SYUQLo5fqa7" }, { direction: "incoming" }),
-  { answeredBy: null, userId: null },
+  { answeredBy: null, userId: null, actorIds: [] },
+);
+// Conference: 3rd person actorId on participants is live even if not answeredBy.
+assert.deepEqual(
+  extractLiveActorIdsFromCall({
+    direction: "incoming",
+    answeredBy: "USJIS",
+    participants: [
+      { phoneNumber: "+15125550101", actorId: "USJIS" },
+      { phoneNumber: "+15125550101", actorId: "USSTE" },
+      { phoneNumber: "+17635550123", actorId: null },
+    ],
+  }).sort(),
+  ["USJIS", "USSTE"].sort(),
 );
 
 // Answer watch: outbound poll with only userId should fire onAnswered.
@@ -416,6 +434,57 @@ assert.deepEqual(
   await new Promise((r) => setTimeout(r, 120));
   assert.equal(answered, null);
   stopAnswerWatch(firm, "ACin1");
+}
+
+// Multi-party: answerer + 3rd person both stay on_call for the same callId.
+{
+  const firm = {
+    id: "test",
+    phoneStaff: [
+      { name: "Jissela", slackUserId: "UJIS", quoUserId: "USJIS" },
+      { name: "Stephany", slackUserId: "USTE", quoUserId: "USSTE" },
+    ],
+    onCallByCallId: new Map(),
+  };
+  await markPhoneStaffOnCall(firm, {
+    callId: "ACconf1",
+    answeredBy: "USJIS",
+    actorIds: ["USJIS", "USSTE"],
+  });
+  const onCall = onCallSlackUserIds(firm);
+  assert.equal(onCall.has("UJIS"), true);
+  assert.equal(onCall.has("USTE"), true);
+  await clearSlackOnCallStatus(firm, "ACconf1");
+  assert.equal(onCallSlackUserIds(firm).size, 0);
+}
+
+// Active-call sync: Quo says Stephany is on an in-progress call → mark her.
+{
+  const firm = {
+    id: "test",
+    phoneStaff: [
+      { name: "Jissela", slackUserId: "UJIS", quoUserId: "USJIS" },
+      { name: "Stephany", slackUserId: "USTE", quoUserId: "USSTE" },
+    ],
+    onCallByCallId: new Map(),
+  };
+  const result = await syncPhoneStaffOnCallFromQuo(firm, async (_firm, actorId) => {
+    if (actorId !== "USSTE") return [];
+    return [{
+      id: "ACactive1",
+      status: "in-progress",
+      direction: "incoming",
+      answeredBy: "USJIS",
+      participants: [
+        { phoneNumber: "+15125550101", actorId: "USJIS" },
+        { phoneNumber: "+15125550101", actorId: "USSTE" },
+      ],
+    }];
+  });
+  assert.ok(result.marked >= 1);
+  const onCall = onCallSlackUserIds(firm);
+  assert.equal(onCall.has("USTE"), true);
+  assert.equal(onCall.has("UJIS"), true); // also on the same conference payload
 }
 
 console.log("test-phone-staff: ok");

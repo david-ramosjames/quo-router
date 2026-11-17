@@ -7,6 +7,7 @@ This wires Quo call state into Slack so phone staff automatically show **On a ca
 1. **Slack status auto-update** — when a configured phone-staff member is live on a Quo call, their Slack status becomes `:phone: On a call`. When the call ends, the previous status is restored.
    - **Inbound:** waits for Quo's `answeredBy` (inbox `userId` is the line owner, not the answerer).
    - **Outbound:** marks the dialer from `userId` / `initiatedBy` as soon as the outbound leg rings — Quo often never fills `answeredBy` on outbound.
+   - **Conference / add-a-person:** marks every workspace `participants[].actorId` on the call, and before each miss/Sona snapshot re-checks Quo for in-progress calls per phone-staff `actorId` (so a 3rd person joined mid-call is not tagged Available).
 2. **Missed / Sona accountability** — missed-call and Sona Slack posts append who was available at that moment (Slack-active and not already on a call), and @-mention those people.
 3. **Daily report count** — each event is stored so `quo-lead-review` can report how many times phone staff were available but did not answer in the report window.
 

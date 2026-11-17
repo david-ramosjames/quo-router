@@ -569,23 +569,51 @@ export function isOutboundDirection(direction) {
  * outbound). For outbound, `userId` / `initiatedBy` is the dialer — mark them
  * busy immediately. For inbound, `userId` is usually the inbox/line owner, not
  * the person who picked up — only trust `answeredBy` there.
+ *
+ * Conference joins: also return every workspace `participants[].actorId` so a
+ * 3rd person added mid-call is marked busy, not only the original answerer.
  */
 export function resolveLiveOnCallIds(call, { direction } = {}) {
   if (!call || typeof call !== "object") {
-    return { answeredBy: null, userId: null };
+    return { answeredBy: null, userId: null, actorIds: [] };
   }
-  const answeredBy = call.answeredBy || null;
+  const answeredBy = call.answeredBy || call.answeredByUserId || null;
   const dialerId = call.userId || call.initiatedBy || null;
   const outbound = isOutboundDirection(direction ?? call.direction);
+  const actorIds = extractLiveActorIdsFromCall(call, { direction });
 
   if (answeredBy && !isSonaAnsweredBy(answeredBy)) {
-    // Prefer the real answerer; still pass outbound dialer as backup.
-    return { answeredBy, userId: outbound ? dialerId : null };
+    return { answeredBy, userId: outbound ? dialerId : null, actorIds };
   }
   if (outbound && dialerId && !isSonaAnsweredBy(dialerId)) {
-    return { answeredBy: null, userId: dialerId };
+    return { answeredBy: null, userId: dialerId, actorIds };
   }
-  return { answeredBy: null, userId: null };
+  return { answeredBy: null, userId: null, actorIds };
+}
+
+/** Quo user IDs that are live on this call (answerer, outbound dialer, conference actors). */
+export function extractLiveActorIdsFromCall(call, { direction } = {}) {
+  const ids = new Set();
+  if (!call || typeof call !== "object") return [];
+  const outbound = isOutboundDirection(direction ?? call.direction);
+  const answeredBy = call.answeredBy || call.answeredByUserId || null;
+  if (answeredBy && !isSonaAnsweredBy(answeredBy)) ids.add(String(answeredBy));
+  if (outbound) {
+    const dialer = call.userId || call.initiatedBy || null;
+    if (dialer && !isSonaAnsweredBy(dialer)) ids.add(String(dialer));
+  }
+  const parts = call.participants;
+  if (Array.isArray(parts)) {
+    for (const p of parts) {
+      if (!p || typeof p !== "object") continue;
+      const id = p.actorId || p.userId || null;
+      if (!id || isSonaAnsweredBy(id)) continue;
+      const s = String(id);
+      // Workspace users only — external parties have null actorId.
+      if (s.startsWith("US")) ids.add(s);
+    }
+  }
+  return [...ids];
 }
 
 export function findPhoneStaffByQuoUser(firm, quoUserId) {
@@ -599,11 +627,26 @@ export function findPhoneStaffBySlackUser(firm, slackUserId) {
   return (firm.phoneStaff || []).find((p) => p.slackUserId === slackUserId) || null;
 }
 
+/** Normalize callId → Map(slackUserId → entry). Migrates legacy single-entry values. */
+function onCallPeopleForCall(firm, callId) {
+  if (!firm.onCallByCallId) firm.onCallByCallId = new Map();
+  const cur = firm.onCallByCallId.get(callId);
+  if (cur instanceof Map) return cur;
+  const map = new Map();
+  if (cur?.slackUserId) map.set(cur.slackUserId, cur);
+  firm.onCallByCallId.set(callId, map);
+  return map;
+}
+
 /** Slack user IDs currently marked on a call by this router. */
 export function onCallSlackUserIds(firm) {
   const ids = new Set();
-  for (const entry of firm.onCallByCallId?.values() || []) {
-    if (entry?.slackUserId) ids.add(entry.slackUserId);
+  for (const people of firm.onCallByCallId?.values() || []) {
+    if (people instanceof Map) {
+      for (const id of people.keys()) ids.add(id);
+    } else if (people?.slackUserId) {
+      ids.add(people.slackUserId);
+    }
   }
   return ids;
 }
@@ -641,10 +684,20 @@ function blankStatus() {
 }
 
 function otherOnCallEntry(firm, slackUserId, exceptCallId) {
-  for (const [id, entry] of firm.onCallByCallId || []) {
-    if (id !== exceptCallId && entry?.slackUserId === slackUserId) return entry;
+  for (const [id, people] of firm.onCallByCallId || []) {
+    if (id === exceptCallId) continue;
+    if (people instanceof Map) {
+      const entry = people.get(slackUserId);
+      if (entry) return entry;
+    } else if (people?.slackUserId === slackUserId) {
+      return people;
+    }
   }
   return null;
+}
+
+function personStillOnAnotherCall(firm, slackUserId, exceptCallId) {
+  return Boolean(otherOnCallEntry(firm, slackUserId, exceptCallId));
 }
 
 export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
@@ -652,8 +705,10 @@ export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
 
   // Quo is the source of "on a call" for tagging. Mirroring that onto the
   // Slack profile is optional and needs an admin user token.
-  let entry = firm.onCallByCallId?.get(callId);
-  if (!(entry?.slackUserId === slackUserId)) {
+  // Multiple phone-staff can share one callId (conference / add-a-person).
+  const people = onCallPeopleForCall(firm, callId);
+  let entry = people.get(slackUserId);
+  if (!entry) {
     const carried = otherOnCallEntry(firm, slackUserId, callId);
     const profile = (!carried && firm.slackUserToken && !firm.slackStatusWriteBlocked)
       ? await getSlackProfile(firm, slackUserId)
@@ -665,7 +720,6 @@ export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
           status_expiration: profile.status_expiration || 0,
         }
       : blankStatus());
-    if (!firm.onCallByCallId) firm.onCallByCallId = new Map();
     entry = {
       slackUserId,
       previous,
@@ -673,7 +727,7 @@ export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
       slackWritten: false,
       slackWriteAttempted: !!carried,
     };
-    firm.onCallByCallId.set(callId, entry);
+    people.set(slackUserId, entry);
     const person = findPhoneStaffBySlackUser(firm, slackUserId);
     console.log(`[${firm.id}][phone-staff] On a call (from Quo): ${person?.name || slackUserId} (call ${callId})`);
   }
@@ -719,21 +773,19 @@ export async function setSlackOnCallStatus(firm, slackUserId, { callId } = {}) {
   }
 }
 
-export async function clearSlackOnCallStatus(firm, callId) {
-  if (!callId || !firm.onCallByCallId?.has(callId)) return false;
-  const entry = firm.onCallByCallId.get(callId);
-  firm.onCallByCallId.delete(callId);
-
-  // Another live call still owns this user's status — leave it alone.
-  for (const other of firm.onCallByCallId.values()) {
-    if (other.slackUserId === entry.slackUserId) {
-      if (entry.slackWritten && !other.slackWritten) {
+async function clearOneOnCallEntry(firm, callId, entry) {
+  if (!entry?.slackUserId) return false;
+  if (personStillOnAnotherCall(firm, entry.slackUserId, callId)) {
+    for (const [otherId, people] of firm.onCallByCallId || []) {
+      if (otherId === callId) continue;
+      const other = people instanceof Map ? people.get(entry.slackUserId) : null;
+      if (other && entry.slackWritten && !other.slackWritten) {
         other.previous = entry.previous;
         other.slackWritten = true;
       }
-      console.log(`[${firm.id}][phone-staff] ${entry.slackUserId} still on another call — keeping status`);
-      return false;
     }
+    console.log(`[${firm.id}][phone-staff] ${entry.slackUserId} still on another call — keeping status`);
+    return false;
   }
 
   if (!entry.slackWritten || !firm.slackUserToken) {
@@ -764,25 +816,93 @@ export async function clearSlackOnCallStatus(firm, callId) {
   }
 }
 
-export async function markPhoneStaffOnCall(firm, { callId, answeredBy, userId = null }) {
+export async function clearSlackOnCallStatus(firm, callId) {
+  if (!callId || !firm.onCallByCallId?.has(callId)) return false;
+  const people = onCallPeopleForCall(firm, callId);
+  const entries = [...people.values()];
+  firm.onCallByCallId.delete(callId);
+  let any = false;
+  for (const entry of entries) {
+    if (await clearOneOnCallEntry(firm, callId, entry)) any = true;
+  }
+  return any;
+}
+
+export async function markPhoneStaffOnCall(firm, { callId, answeredBy, userId = null, actorIds = null }) {
   if (!callId) return false;
-  const candidate = answeredBy || userId;
-  if (!candidate || isSonaAnsweredBy(candidate)) return false;
   if (!firm.phoneStaff?.length) {
-    console.log(`[${firm.id}][phone-staff] No phoneStaff configured — ignoring answeredBy=${candidate}`);
+    console.log(`[${firm.id}][phone-staff] No phoneStaff configured — ignoring on-call mark`);
     return false;
   }
-  const person = findPhoneStaffByQuoUser(firm, candidate)
-    || findPhoneStaffByQuoUser(firm, answeredBy)
-    || findPhoneStaffByQuoUser(firm, userId);
-  if (!person) {
+  const candidates = new Set();
+  for (const id of actorIds || []) {
+    if (id && !isSonaAnsweredBy(id)) candidates.add(String(id));
+  }
+  if (answeredBy && !isSonaAnsweredBy(answeredBy)) candidates.add(String(answeredBy));
+  if (userId && !isSonaAnsweredBy(userId)) candidates.add(String(userId));
+  if (!candidates.size) return false;
+
+  let any = false;
+  const missing = [];
+  for (const candidate of candidates) {
+    const person = findPhoneStaffByQuoUser(firm, candidate);
+    if (!person) {
+      missing.push(candidate);
+      continue;
+    }
+    if (await setSlackOnCallStatus(firm, person.slackUserId, { callId })) any = true;
+  }
+  if (missing.length && !any) {
     const mapped = (firm.phoneStaff || []).map((p) => `${p.name}:${p.quoUserId || "(no quo id)"}`).join(", ");
     console.log(
-      `[${firm.id}][phone-staff] answeredBy/userId=${candidate} not in phoneStaff [${mapped}] — no Slack status change`,
+      `[${firm.id}][phone-staff] answeredBy/userId/actors=${[...candidates].join(",")} not in phoneStaff [${mapped}] — no Slack status change`,
     );
-    return false;
   }
-  return setSlackOnCallStatus(firm, person.slackUserId, { callId });
+  return any;
+}
+
+/**
+ * Before a miss/Sona snapshot, ask Quo which phone-staff actors are on an
+ * in-progress call (including conference joins where they aren't answeredBy).
+ * `fetchActiveCallsForActor(firm, quoUserId) => Call[]`.
+ */
+export async function syncPhoneStaffOnCallFromQuo(firm, fetchActiveCallsForActor) {
+  if (!firm?.phoneStaff?.length || typeof fetchActiveCallsForActor !== "function") {
+    return { checked: 0, marked: 0 };
+  }
+  const staff = firm.phoneStaff.filter((p) => p.quoUserId);
+  let marked = 0;
+  await Promise.all(staff.map(async (person) => {
+    let calls = [];
+    try {
+      calls = await fetchActiveCallsForActor(firm, person.quoUserId) || [];
+    } catch (err) {
+      console.warn(
+        `[${firm.id}][phone-staff] Active-call lookup failed for ${person.name}:`,
+        err.message,
+      );
+      return;
+    }
+    for (const call of calls) {
+      const callId = call?.id || null;
+      if (!callId) continue;
+      const actors = new Set(extractLiveActorIdsFromCall(call));
+      actors.add(String(person.quoUserId));
+      const ok = await markPhoneStaffOnCall(firm, {
+        callId,
+        actorIds: [...actors],
+        // Keep the queried person even when participants omit them.
+        userId: person.quoUserId,
+      });
+      if (ok) marked += 1;
+    }
+  }));
+  if (marked) {
+    console.log(
+      `[${firm.id}][phone-staff] Quo active-call sync marked ${marked} call/person pair(s) across ${staff.length} staff`,
+    );
+  }
+  return { checked: staff.length, marked };
 }
 
 /** One-line readiness summary for logs / admin. */
@@ -1081,9 +1201,20 @@ export function dutySlackUserIdsFromSnapshot(rows, roster, { enforce = false } =
  * a call, not behind a blocking status, and (by day) on the channel topic roster.
  * Returns { rows, dutyRoster, dutySlackUserIds }.
  */
-export async function snapshotPhoneStaffAvailability(firm, { now = new Date() } = {}) {
+export async function snapshotPhoneStaffAvailability(firm, {
+  now = new Date(),
+  fetchActiveCallsForActor = null,
+} = {}) {
   const staff = firm.phoneStaff || [];
   if (!staff.length) return { rows: [], dutyRoster: null, dutySlackUserIds: [] };
+
+  // Live Quo check: anyone with an in-progress call (including 3rd-person
+  // conference joins) must not be tagged as Available Missed.
+  if (typeof fetchActiveCallsForActor === "function") {
+    await syncPhoneStaffOnCallFromQuo(firm, fetchActiveCallsForActor).catch((err) =>
+      console.warn(`[${firm.id}][phone-staff] active-call sync error:`, err.message),
+    );
+  }
 
   const onCall = onCallSlackUserIds(firm);
   const hoursConfigured = hoursAreConfigured(staff);
@@ -1482,19 +1613,19 @@ export function startAnswerWatch(firm, {
       }
       const status = String(call.status || "").toLowerCase();
       const dir = direction || call.direction || null;
-      const { answeredBy, userId } = resolveLiveOnCallIds(call, { direction: dir });
-      const live = Boolean(answeredBy || userId);
+      const { answeredBy, userId, actorIds } = resolveLiveOnCallIds(call, { direction: dir });
+      const live = Boolean(answeredBy || userId || (actorIds && actorIds.length));
       const inProgress = ["in-progress", "answered"].includes(status);
 
       if (live) {
         sawLiveActor = true;
-        if (onAnswered) await onAnswered({ callId, answeredBy, userId, call });
+        if (onAnswered) await onAnswered({ callId, answeredBy, userId, actorIds, call });
         // Keep watching until the call leaves in-progress so we clear status.
       }
 
       const terminal = ["completed", "no-answer", "busy", "canceled", "failed", "cancelled"].includes(status);
       if (terminal) {
-        if (onEnded) await onEnded({ callId, answeredBy, userId, call, status });
+        if (onEnded) await onEnded({ callId, answeredBy, userId, actorIds, call, status });
         stop();
         return;
       }
@@ -1579,9 +1710,12 @@ export async function attachAvailabilityToNotice(pgPool, firm, text, {
   eventType,
   ringSeconds = null,
   phoneLineLabel = null,
+  fetchActiveCallsForActor = null,
 } = {}) {
   if (!firm.phoneStaff?.length) return { text, snapshot: [] };
-  const { rows: raw, dutySlackUserIds } = await snapshotPhoneStaffAvailability(firm);
+  const { rows: raw, dutySlackUserIds } = await snapshotPhoneStaffAvailability(firm, {
+    fetchActiveCallsForActor,
+  });
   const { accountable } = noticeGroups(raw, ringSeconds, phoneLineLabel);
   const accountableIds = new Set(accountable.map((r) => r.slackUserId));
   const snapshot = raw.map((r) => ({
