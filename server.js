@@ -4113,6 +4113,17 @@ function escalationPicker(lane) {
   return nextLeadCallsAssignees;
 }
 
+/** Re-check Quo/Slack so we do not @ someone who picked up another call. */
+async function refreshEscalationSnapshot(firm, job) {
+  const line = (job.snapshot || []).map((r) => r.phoneLineLabel).find(Boolean) || null;
+  const { rows } = await snapshotPhoneStaffAvailability(firm, { fetchActiveCallsForActor });
+  job.snapshot = (rows || []).map((row) => ({
+    ...row,
+    phoneLineLabel: line,
+  }));
+  return job.snapshot;
+}
+
 async function runCallbackEscalationStep(firm, key) {
   const job = firm.callbackEscalations?.get(key);
   if (!job || job.stopped) return;
@@ -4121,12 +4132,53 @@ async function runCallbackEscalationStep(firm, key) {
     return;
   }
 
+  // The miss/Sona notice freezes who looked free then. Re-sync Quo active calls
+  // before each tag so someone already on another call (e.g. Roman) is skipped.
+  try {
+    await refreshEscalationSnapshot(firm, job);
+  } catch (err) {
+    console.warn(`[${firm.id}][callback-esc] live snapshot refresh failed:`, err.message);
+  }
+
   const picker = escalationPicker(job.lane);
-  const pick = picker(firm, job.snapshot, {
-    usedIds: new Set(job.usedIds || []),
+  let usedIds = new Set(job.usedIds || []);
+  let pick = picker(firm, job.snapshot, {
+    usedIds,
     step: job.step,
     rotation: job.rotation,
   });
+
+  // If anyone slipped through still marked free but is on_call in the live
+  // snapshot, drop them and ask the next person in the same step.
+  while (pick.kind === "request" && pick.people?.length) {
+    const onCallIds = new Set(
+      (job.snapshot || []).filter((r) => r.state === "on_call").map((r) => r.slackUserId),
+    );
+    const live = pick.people.filter((p) => !onCallIds.has(p.slackUserId));
+    if (live.length === pick.people.length) break;
+    for (const p of pick.people) {
+      if (onCallIds.has(p.slackUserId)) {
+        usedIds.add(p.slackUserId);
+        console.log(
+          `[${firm.id}][callback-esc] Skipping ${p.name || p.slackUserId} — on a call`,
+        );
+      }
+    }
+    if (!live.length) {
+      pick = picker(firm, job.snapshot, {
+        usedIds,
+        step: job.step,
+        rotation: job.rotation,
+      });
+      continue;
+    }
+    pick = {
+      ...pick,
+      people: live,
+      usedIds: [...new Set([...usedIds, ...live.map((p) => p.slackUserId)])],
+    };
+    break;
+  }
 
   if (pick.kind === "done") {
     stopCallbackEscalation(firm, { key, reason: "exhausted" });
@@ -4191,6 +4243,8 @@ async function maybeStartCallbackEscalations(firm, {
   laNoteAlreadyPosted = false,
 } = {}) {
   if (!["missed", "menu_hangup", "sona"].includes(eventType)) return;
+  // Sona / missed in #lead-calls still get "Please call back now" even when
+  // Available Missed is skipped (transfer/consult after a staff answer, etc.).
   const hasLead = !!(leadPost?.parentTs && firm.slackLeadCallsChannelId);
   const hasLa = !!(laPost?.parentTs && firm.slackLegalAssistantChannelId && !isKnownBusiness(firm, phone));
 

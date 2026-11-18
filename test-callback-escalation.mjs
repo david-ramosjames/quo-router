@@ -72,6 +72,43 @@ const intakeC = nextLeadCallsAssignees(firm, intakeOutSnap, { step: 0, rotation:
   .people.find((p) => p.role === "intake");
 assert.equal(intakeC.slackUserId, intakeA.slackUserId);
 
+// Intake with lines=Leads,RGV,Intake must not be callback-tagged on Main Line.
+// On-call people must not be tagged either.
+const mainLineSnap = allFree.map((p) => {
+  if (p.slackUserId === "UROM") {
+    return {
+      ...p,
+      ringLineLabels: ["Leads", "RGV", "Intake"],
+      phoneLineLabel: "RJL Main Line",
+      dutySection: "outbound",
+    };
+  }
+  if (p.slackUserId === "UAND") {
+    return {
+      ...p,
+      ringLineLabels: ["Leads", "RGV", "Intake"],
+      phoneLineLabel: "RJL Main Line",
+      state: "on_call",
+      tag: false,
+    };
+  }
+  return { ...p, phoneLineLabel: "RJL Main Line" };
+});
+const mainLead = nextLeadCallsAssignees(firm, mainLineSnap, { step: 0, rotation: 0 });
+assert.equal(mainLead.people.some((p) => p.slackUserId === "UROM"), false);
+assert.equal(mainLead.people.some((p) => p.slackUserId === "UAND"), false);
+assert.ok(mainLead.people.some((p) => p.role === "la"));
+
+// Someone free in the original miss snapshot but now on a call must not be tagged.
+const romanOnCallSnap = allFree.map((p) => (
+  p.slackUserId === "UROM"
+    ? { ...p, state: "on_call", tag: false, phoneLineLabel: "Leads" }
+    : { ...p, phoneLineLabel: "Leads" }
+));
+const skipOnCall = nextLeadCallsAssignees(firm, romanOnCallSnap, { step: 0, rotation: 0 });
+assert.equal(skipOnCall.people.some((p) => p.slackUserId === "UROM"), false);
+assert.ok(skipOnCall.people.some((p) => p.role === "intake" && p.slackUserId === "UAND"));
+
 const noIntakeSnap = allFree.filter((p) => p.role !== "intake");
 const leadNoIntake = nextLeadCallsAssignees(firm, noIntakeSnap, { step: 0, rotation: 0 });
 assert.equal(leadNoIntake.people.length, 2);

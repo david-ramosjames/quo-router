@@ -7,6 +7,7 @@ import {
   DEFAULT_PHONE_STAFF_TZ,
   zonedDayMinutes,
   countsTowardAvailableMissed,
+  personRingsOnLine,
 } from "./phone-staff.js";
 
 export const DEFAULT_ESCALATION_INTERVAL_SECONDS = 50;
@@ -123,10 +124,17 @@ function pickPreferActiveAcrossPools(pools, usedIds, count, rotation) {
 
 function freeFromSnapshot(snapshot) {
   // Active + inactive on duty both escalate; inactive is asked last within each role.
-  // Off-topic / lunch / on-call never enter the tag ladder.
-  return (snapshot || []).filter(
-    (row) => row.state !== "off_topic" && (countsTowardAvailableMissed(row) || row.tag),
-  );
+  // Off-topic / lunch / on-call / wrong inbox never enter the tag ladder.
+  const line = (snapshot || []).map((r) => r.phoneLineLabel).find(Boolean) || null;
+  return (snapshot || []).filter((row) => {
+    if (["off_topic", "on_call", "off_line", "status", "off_shift", "unknown"].includes(row.state)) {
+      return false;
+    }
+    if (!(countsTowardAvailableMissed(row) || row.tag)) return false;
+    // Roman/Andrea lines=Leads,RGV,Intake — do not @ them on Main / Transfers.
+    if (!personRingsOnLine(row, line)) return false;
+    return true;
+  });
 }
 
 function staffByRole(firm, snapshot, role) {
