@@ -170,7 +170,7 @@ For each configured phone-staff member at the moment of a missed or Sona call:
 | 📤 listed under Outbound on today's topic | Yes when free (shown as available, labeled outbound) |
 | ⚖️ listed under Attorney on today's topic | No (shown as attorney today) |
 | 📞 on a call | No |
-| 🚫 Slack status such as lunch, break, translating, huddle, meeting, PTO | No |
+| 🚫 Slack status such as lunch, break, in person, translating, meeting, PTO; or live Slack huddle (`huddle_state`) | No |
 | ⏸️ outside their scheduled hours | No |
 
 Prefer updating Slack status when unavailable, but inactive presence alone is enough to skip tagging. After hours are saved, working-hour staff are never tagged off shift.

@@ -73,6 +73,8 @@ const BLOCKING_EMOJI = new Set([
   "beach_with_umbrella", "face_with_thermometer", "no_entry", "no_entry_sign", "sleeping",
   // Slack huddle / translating often use a speech bubble status emoji.
   "speech_balloon", "speaking_head", "speaking_head_in_silhouette",
+  // Native huddle indicator uses headphones; also catch if set as custom status emoji.
+  "headphones",
 ]);
 
 export function normalizePhoneStaff(config) {
@@ -526,6 +528,7 @@ export function classifyPhoneStaffMember(person, {
   statusText = "",
   statusEmoji = "",
   onCall = false,
+  inHuddle = false,
   now = new Date(),
   officeCovered = false,
   hoursConfigured = false,
@@ -545,6 +548,11 @@ export function classifyPhoneStaffMember(person, {
   const onCallStatus = base.statusText.toLowerCase() === ON_CALL_STATUS_TEXT.toLowerCase()
     || (statusEmoji === ON_CALL_STATUS_EMOJI && /call/i.test(base.statusText));
   if (onCall || onCallStatus) return { ...base, state: "on_call", tag: false };
+
+  // Slack huddle indicator (headphones) — profile.huddle_state === in_a_huddle.
+  if (inHuddle) {
+    return { ...base, state: "status", statusText: "in a huddle", tag: false };
+  }
 
   const blocked = blockingStatusReason(statusText, statusEmoji);
   if (blocked) return { ...base, state: "status", statusText: blocked, tag: false };
@@ -969,7 +977,9 @@ async function getPresence(firm, slackUserId) {
 }
 
 async function getSlackStatus(firm, slackUserId) {
-  if (!firm.slackBotToken || !slackUserId) return { statusText: "", statusEmoji: "" };
+  if (!firm.slackBotToken || !slackUserId) {
+    return { statusText: "", statusEmoji: "", inHuddle: false };
+  }
   try {
     const url = new URL("https://slack.com/api/users.info");
     url.searchParams.set("user", slackUserId);
@@ -979,18 +989,23 @@ async function getSlackStatus(firm, slackUserId) {
     const json = await res.json();
     if (!json.ok) {
       console.warn(`[${firm.id}][phone-staff] users.info failed for ${slackUserId}: ${json.error}`);
-      return { statusText: "", statusEmoji: "" };
+      return { statusText: "", statusEmoji: "", inHuddle: false };
     }
     const profile = json.user?.profile || {};
+    // Live huddles set huddle_state — they do not always change status_text.
+    const inHuddle = String(profile.huddle_state || "").toLowerCase() === "in_a_huddle";
     const expires = Number(profile.status_expiration || 0);
-    if (expires && expires * 1000 <= Date.now()) return { statusText: "", statusEmoji: "" };
+    if (expires && expires * 1000 <= Date.now()) {
+      return { statusText: "", statusEmoji: "", inHuddle };
+    }
     return {
       statusText: profile.status_text || "",
       statusEmoji: profile.status_emoji || "",
+      inHuddle,
     };
   } catch (err) {
     console.warn(`[${firm.id}][phone-staff] users.info error:`, err.message);
-    return { statusText: "", statusEmoji: "" };
+    return { statusText: "", statusEmoji: "", inHuddle: false };
   }
 }
 
@@ -1258,6 +1273,7 @@ export async function snapshotPhoneStaffAvailability(firm, {
       statusText: status.statusText,
       statusEmoji: status.statusEmoji,
       onCall: onCall.has(person.slackUserId),
+      inHuddle: Boolean(status.inHuddle),
       now,
       officeCovered,
       hoursConfigured,

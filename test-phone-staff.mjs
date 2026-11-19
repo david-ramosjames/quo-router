@@ -114,6 +114,22 @@ assert.equal(classifyPhoneStaffMember(andrea, {
   statusText: "",
   statusEmoji: ":speech_balloon:",
 }).state, "status");
+const inHuddle = classifyPhoneStaffMember(andrea, {
+  ...dayOpts,
+  presence: "active",
+  statusText: "",
+  inHuddle: true,
+});
+assert.equal(inHuddle.state, "status");
+assert.equal(inHuddle.statusText, "in a huddle");
+assert.equal(inHuddle.tag, false);
+assert.equal(countsTowardAvailableMissed(inHuddle), false);
+assert.equal(classifyPhoneStaffMember(andrea, {
+  ...dayOpts,
+  presence: "active",
+  statusText: "",
+  statusEmoji: ":headphones:",
+}).state, "status");
 assert.equal(classifyPhoneStaffMember(jackie, { ...dayOpts, presence: "active" }).tag, false);
 assert.equal(classifyPhoneStaffMember(jackie, { ...dayOpts, presence: "active" }).statusText, "after hours only");
 
