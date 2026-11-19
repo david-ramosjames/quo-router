@@ -4241,10 +4241,25 @@ async function maybeStartCallbackEscalations(firm, {
   laPost = null,
   eventType = "missed",
   laNoteAlreadyPosted = false,
+  skipAvailableMissed = false,
+  skipReason = null,
 } = {}) {
   if (!["missed", "menu_hangup", "sona"].includes(eventType)) return;
-  // Sona / missed in #lead-calls still get "Please call back now" even when
-  // Available Missed is skipped (transfer/consult after a staff answer, etc.).
+  // Transfer/consult after staff already answered (or Transfers/forward legs):
+  // do not ask people to call back. Exception: Sona in #lead-calls still needs
+  // a human follow-up tag even when Available Missed is skipped.
+  const transferLeg = skipAvailableMissed && [
+    "transfer_after_answer",
+    "transfer_inbox",
+    "forwarded_leg",
+    "forwarded_status",
+  ].includes(String(skipReason || ""));
+  if (transferLeg && eventType !== "sona") {
+    console.log(
+      `[${firm.id}][callback-esc] Skip ${eventType} tags — ${skipReason} (not a cold miss)`,
+    );
+    return;
+  }
   const hasLead = !!(leadPost?.parentTs && firm.slackLeadCallsChannelId);
   const hasLa = !!(laPost?.parentTs && firm.slackLegalAssistantChannelId && !isKnownBusiness(firm, phone));
 
@@ -4483,6 +4498,8 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
       laPost,
       eventType,
       laNoteAlreadyPosted: !!leadPost,
+      skipAvailableMissed: staff.skipAvailableMissed,
+      skipReason: staff.skipReason,
     });
     await postToCaseChannel(firm, text, from, to);
   } else if (isAnswered) {
@@ -4530,6 +4547,8 @@ async function handleUnresolvedCall(firm, callId, cachedFrom, cachedTo, cachedDi
         laPost,
         eventType: "sona",
         laNoteAlreadyPosted: !!leadPost,
+        skipAvailableMissed: staff.skipAvailableMissed,
+        skipReason: staff.skipReason,
       });
     }
     // Sona answered (AI) — LA still needs to follow up. Human-answered was
@@ -5382,6 +5401,8 @@ async function handleCalls(firm, req, res) {
       laPost,
       eventType: availabilityEvent,
       laNoteAlreadyPosted: !!leadPost,
+      skipAvailableMissed: staff.skipAvailableMissed,
+      skipReason: staff.skipReason,
     });
 
     await postToCaseChannel(firm, text, from, to);
@@ -5790,6 +5811,8 @@ async function handleCallSummary(firm, req, res) {
         laPost,
         eventType: "sona",
         laNoteAlreadyPosted: !!(leadPost || threadedInLeads),
+        skipAvailableMissed: staff.skipAvailableMissed,
+        skipReason: staff.skipReason,
       });
     }
 
