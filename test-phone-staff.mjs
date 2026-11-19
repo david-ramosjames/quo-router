@@ -27,6 +27,7 @@ import {
   syncPhoneStaffOnCallFromQuo,
   shouldSkipAvailableMissed,
   isTransferInboxLabel,
+  countsTowardAvailableMissed,
 } from "./phone-staff.js";
 
 const staff = normalizePhoneStaff({
@@ -96,6 +97,14 @@ assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "away" }).
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", onCall: true }).tag, false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).state, "status");
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Lunch" }).tag, false);
+const inPerson = classifyPhoneStaffMember(andrea, {
+  ...dayOpts,
+  presence: "active",
+  statusText: "in person",
+});
+assert.equal(inPerson.state, "status");
+assert.equal(inPerson.tag, false);
+assert.equal(countsTowardAvailableMissed(inPerson), false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Translating" }).state, "status");
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "Translating" }).tag, false);
 assert.equal(classifyPhoneStaffMember(andrea, { ...dayOpts, presence: "active", statusText: "In a huddle" }).state, "status");

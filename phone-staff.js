@@ -65,6 +65,7 @@ const BLOCKING_STATUS = [
   /\btranslat(?:e|ing|ion)\b/i,
   /\bhuddle\b/i,
   /\bin a huddle\b/i,
+  /\bin[\s-]?person\b/i,
 ];
 
 const BLOCKING_EMOJI = new Set([
