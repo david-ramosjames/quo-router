@@ -1655,8 +1655,35 @@ async function intakeNotify(firm, msg, { threadTs = null, phone = null } = {}) {
 function taggableOwner(name) {
   const text = String(name || "").trim();
   if (!text) return null;
-  if (/^(sona|human|attorney(?:\s*\d+)?|legal assistant|referred|unassigned|intake(?: specialist)?|paralegal(?:\s*\d+)?|unknown|n\/a|na)$/i.test(text)) return null;
+  if (/^(sona|human|attorney(?:\s*\d+)?|legal assistant|referred|unassigned|intake(?: specialist)?|paralegal(?:\s*\d+)?|unknown|n\/a|na|returning)$/i.test(text)) return null;
   return text;
+}
+
+/** Prefer the Quo seat; when it is a shared label, use a staff intro from the transcript. */
+async function resolveStaffHandlerName(firm, { handlerId = null, handlerName = null, transcript = null } = {}) {
+  const fromQuo = taggableOwner(resolveCallHandlerName(firm, { handlerId, handlerName }));
+  if (fromQuo) return fromQuo;
+  if (!transcript) return null;
+  const staff = await loadStaffDirectory(firm).catch(() => []);
+  if (!staff.length) return null;
+  const heard = matchHandlerFromTranscript(transcript, staff.map((person) => person.name));
+  if (!heard) return null;
+  return matchStaff(heard, staff)?.name || taggableOwner(heard);
+}
+
+/** Fill blank Screening / Intake only — never overwrite a person staff already chose. */
+async function stampLeadHandlers(client, leadId, { screenBy = null, intakeBy = null } = {}) {
+  const screen = taggableOwner(screenBy);
+  const intake = taggableOwner(intakeBy);
+  if (!leadId || (!screen && !intake)) return;
+  await client.query(
+    `update public.leads set
+       screen_by = coalesce(screen_by, $2),
+       intake_by = coalesce(intake_by, $3)
+     where id = $1
+       and lead_status not in ('Signed', 'Promoted', 'Lost', 'Referred')`,
+    [leadId, screen, intake],
+  );
 }
 
 function consultationSource(summary, transcript) {
@@ -1916,11 +1943,11 @@ async function recordClassifiedCall(firm, {
           `insert into public.leads (
              lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
              summary, quo_link, intake_call_id, owner_name, slack_permalink,
-             grade, grade_reason, grade_source, follow_up, close_suggestion
+             grade, grade_reason, grade_source, follow_up, close_suggestion, screen_by
            ) values (
              current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
              $4, $5, $6, $7, $8,
-             'C', $9, 'quo-router', true, 'decline'
+             'C', $9, 'quo-router', true, 'decline', $7
            )
            on conflict (intake_call_id) do nothing
            returning id`,
@@ -2013,11 +2040,11 @@ async function recordClassifiedCall(firm, {
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, quo_link, intake_call_id, owner_name, slack_permalink,
-         grade_reason, follow_up, close_suggestion
+         grade_reason, follow_up, close_suggestion, screen_by
        ) values (
          current_date, $1, $2, 'Call', 'Call', 'New', 'needs_info', $3,
          $4, $5, $6, $7, $8,
-         $9, true, 'not_a_lead'
+         $9, true, 'not_a_lead', $7
        )
        on conflict (intake_call_id) do nothing
        returning id`,
@@ -2052,11 +2079,11 @@ async function recordLeadDecision(firm, {
     await recordClassifiedCall(firm, {
       phone, bucket, summary, quoLink, callId, handledBy, arrival, slackPermalink, outbound,
     });
-    return;
+    return null;
   }
-  if (!firm.caseDbUrl) return;
+  if (!firm.caseDbUrl) return null;
   const phoneE164 = leadPhoneE164(phone);
-  if (!phoneE164 && !callId) return;
+  if (!phoneE164 && !callId) return null;
 
   let score = null;
   const sourceText = String(summary || "").trim();
@@ -2173,7 +2200,7 @@ Reasons are one short sentence each. Do not invent facts.`,
 
     if (existing) {
       if (existing.signed_case || existing.case_id || ["Lost", "Referred", "Promoted", "Signed"].includes(existing.lead_status)) {
-        return;
+        return existing.id;
       }
       await client.query(
         `update public.leads set
@@ -2203,12 +2230,16 @@ Reasons are one short sentence each. Do not invent facts.`,
              else 'quo-router'
            end,
            desired_case = case when $16::boolean then true else desired_case end,
-           desired_source = case when $16::boolean and desired_source is null then 'contract' else desired_source end
+           desired_source = case when $16::boolean and desired_source is null then 'contract' else desired_source end,
+           screen_by = coalesce(screen_by, $17),
+           intake_by = coalesce(intake_by, $18)
          where id = $1`,
         [
           existing.id, kind, arrival || null, summaryText, quoLink || null, handledBy || null,
           slackPermalink || null, grade, gradeReason, sentiment, score?.sentiment_reason || null,
           sequence, detailLine, closeNow, newConsultDate, markDesired,
+          // $17 / $18: first known screener, and intake when this call was the consult.
+          handledBy || null, thisConsult ? (handledBy || null) : null,
         ],
       );
       await suggestPriority(existing.id);
@@ -2238,19 +2269,20 @@ Reasons are one short sentence each. Do not invent facts.`,
         ],
       );
       console.log(`[${firm.id}][lead] Revised lead ${existing.id} grade=${grade || "unchanged"} sentiment=${sentiment || "unchanged"}${thisConsult ? " consultation" : ""}${closeNow ? " not_a_lead" : ""}`);
-      return;
+      return existing.id;
     }
 
     if (await phoneSignedRecently(client, phoneE164) && !looksLikeNewOrAdditionalAccident(sourceText)) {
       console.log(`[${firm.id}][lead] Skipped a new lead for ${phoneE164}; that phone signed within 30 days`);
-      return;
+      return null;
     }
     const inserted = await client.query(
       `insert into public.leads (
          lead_date, phone, phone_e164, source_type, source_channel, lead_status, kind, arrival,
          summary, case_detail, sequence, quo_link, intake_call_id, owner_name, slack_permalink,
          grade, grade_reason, grade_source, sentiment, sentiment_reason, sentiment_source, follow_up,
-         close_reason, consultation_date, consultation, desired_case, desired_source
+         close_reason, consultation_date, consultation, desired_case, desired_source,
+         screen_by, intake_by
        ) values (
          current_date, $1, $2, 'Call', 'Call', case when $16 then 'Lost' else 'New' end, $3, $4,
          $5, $14, $15, $6, $7, $8, $9,
@@ -2260,7 +2292,8 @@ Reasons are one short sentence each. Do not invent facts.`,
          case when $16 then 'not_a_lead' else null end,
          $17, case when $17::date is null then null else 'quo-router' end,
          case when $18::boolean then true else null end,
-         case when $18::boolean then 'contract' else null end
+         case when $18::boolean then 'contract' else null end,
+         $19, $20
        )
        on conflict (intake_call_id) do nothing
        returning id`,
@@ -2269,10 +2302,11 @@ Reasons are one short sentence each. Do not invent facts.`,
         handledBy || null, slackPermalink || null, grade, gradeReason,
         sentiment, score?.sentiment_reason || null, detailLine, sequence, closeNow,
         newConsultDate, markDesired,
+        handledBy || null, thisConsult ? (handledBy || null) : null,
       ],
     );
     const id = inserted.rows[0]?.id;
-    if (!id) return;
+    if (!id) return null;
     await suggestPriority(id);
     if (suggestion) {
       await client.query(
@@ -2293,8 +2327,10 @@ Reasons are one short sentence each. Do not invent facts.`,
       ],
     );
     console.log(`[${firm.id}][lead] Opened lead ${id} kind=${kind} grade=${grade || "none"}${thisConsult ? " consultation" : ""}${closeNow ? " not_a_lead" : ""}`);
+    return id;
   } catch (err) {
     console.error(`[${firm.id}][lead] Could not record the decision:`, err.message);
+    return null;
   } finally {
     if (client) { try { await client.end(); } catch { /* ignore */ } }
   }
@@ -5534,8 +5570,13 @@ reason is one or two sentences on why the scores landed where they did. Do not i
   const letter = letterForCallScore(overallNumeric);
   const screenLetter = screenNumeric != null ? letterForCallScore(screenNumeric) : null;
   const intakeLetter = intakeNumeric != null ? letterForCallScore(intakeNumeric) : null;
-  // Only the Quo user on the call — never transcript guesses or line labels.
-  const quoHandler = handler !== "Unknown" ? handler : null;
+  // Quo seat first; shared "Legal Assistant" seats can resolve from the transcript intro.
+  const staffHandler = await resolveStaffHandlerName(firm, {
+    handlerId,
+    handlerName: handler !== "Unknown" ? handler : handlerName,
+    transcript: text,
+  });
+  const quoHandler = staffHandler || (handler !== "Unknown" && taggableOwner(handler) ? handler : null);
   const screenHandler = jobs === "screen" || jobs === "both" ? quoHandler : null;
   const intakeHandler = jobs === "intake" || jobs === "both" ? quoHandler : null;
   const primaryHandler = intakeHandler || screenHandler || quoHandler || "Unknown";
@@ -5543,6 +5584,20 @@ reason is one or two sentences on why the scores landed where they did. Do not i
   let client;
   try {
     client = await connectCaseDb(firm);
+    const phoneE164 = leadPhoneE164(phone);
+    let resolvedLeadId = leadId || null;
+    if (!resolvedLeadId) {
+      const found = await client.query(
+        `select id from public.leads
+         where ($1::text is not null and intake_call_id = $1)
+            or ($2::text is not null and phone_e164 = $2
+                and lead_status not in ('Lost', 'Referred'))
+         order by case when intake_call_id = $1 then 0 else 1 end, created_at desc
+         limit 1`,
+        [callId || null, phoneE164],
+      );
+      resolvedLeadId = found.rows[0]?.id || null;
+    }
     await client.query(
       `insert into public.call_grades
          (call_id, lead_id, phone_e164, handler_id, handler_name, grade, score, reason, track, jobs,
@@ -5552,8 +5607,8 @@ reason is one or two sentences on why the scores landed where they did. Do not i
        on conflict (call_id) do nothing`,
       [
         callId,
-        leadId || null,
-        leadPhoneE164(phone),
+        resolvedLeadId,
+        phoneE164,
         handlerId || null,
         primaryHandler,
         letter,
@@ -5571,6 +5626,10 @@ reason is one or two sentences on why the scores landed where they did. Do not i
         quoLink || null,
       ],
     );
+    await stampLeadHandlers(client, resolvedLeadId, {
+      screenBy: screenHandler,
+      intakeBy: intakeHandler,
+    });
     console.log(`[${firm.id}][call-grade] ${callId} ${jobs} ${letter} (${overallNumeric}) screen=${screenHandler || "—"} intake=${intakeHandler || "—"}`);
   } catch (err) {
     console.error(`[${firm.id}][call-grade] Could not save ${callId}:`, err.message);
@@ -5859,11 +5918,19 @@ async function handleCallSummary(firm, req, res) {
     // lead, but never open a New row. Outbound firm dials never open a new lead.
     const externalPhone = firm.phoneLines[from] ? to : from;
     const transcript = await fetchCallTranscript(firm, callId);
+    const handlerIdForCall = isInbound
+      ? (cached?.answeredBy || cached?.userId || null)
+      : (cached?.userId || cached?.answeredBy || null);
     const handledBy = sona
-      ? "Sona"
-      : (getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId) || null);
+      ? null
+      : await resolveStaffHandlerName(firm, {
+          handlerId: handlerIdForCall,
+          handlerName: getQuoUserName(firm, cached?.answeredBy) || getQuoUserName(firm, cached?.userId),
+          transcript,
+        });
+    let recordedLeadId = null;
     if (isLead && isInbound) {
-      await recordLeadDecision(firm, {
+      recordedLeadId = await recordLeadDecision(firm, {
         phone: externalPhone,
         isQualified,
         summary: summaryText,
@@ -5877,7 +5944,10 @@ async function handleCallSummary(firm, req, res) {
         holdExclusion: leadLabel === "No Contact",
         outbound: false,
         callDurationSeconds,
-      }).catch((err) => console.error(`[${firm.id}][lead] Error:`, err.message));
+      }).catch((err) => {
+        console.error(`[${firm.id}][lead] Error:`, err.message);
+        return null;
+      });
     } else if (bucket) {
       await recordClassifiedCall(firm, {
         phone: externalPhone,
@@ -5894,19 +5964,16 @@ async function handleCallSummary(firm, req, res) {
     const matter = await findClientMatter(firm, externalPhone);
     // Insurance, vendors, medical offices, and existing-client calls are not intake leads.
     if (!sona && isLead) {
-      const handlerId = isInbound
-        ? (cached?.answeredBy || cached?.userId || null)
-        : (cached?.userId || cached?.answeredBy || null);
       const firmPhone = firm.phoneLines[from] ? from : (firm.phoneLines[to] ? to : null);
       await gradeIntakeCall(firm, {
         callId,
         transcript,
-        handlerId,
-        handlerName: getQuoUserName(firm, handlerId),
+        handlerId: handlerIdForCall,
+        handlerName: handledBy || getQuoUserName(firm, handlerIdForCall),
         direction: isInbound ? "inbound" : "outbound",
         quoLink: deepLink,
         phone: externalPhone,
-        leadId: matter?.leadId || null,
+        leadId: recordedLeadId || matter?.leadId || null,
         firmPhone,
       }).catch((err) => console.error(`[${firm.id}][call-grade] Error:`, err.message));
     }
